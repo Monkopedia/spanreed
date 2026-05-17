@@ -150,4 +150,17 @@ v1 implementation is complete in code:
 
 CLI binary smoke-tested end-to-end (register → list round-trip with `SPANREED_STATE_ROOT` to a tmp dir).
 
-**Remaining: manual end-to-end smoke test in real Claude Code** — install the plugin via `--plugin-dir plugins/spanreed`, start two sessions in different repos, verify the cross-session round-trip works as it did in the experiment with file-stub plugins. Until this happens, the implementation is "working in unit/integration tests" but not "verified in vivo."
+**End-to-end smoke test in real Claude Code: ✅ PASSED.**
+
+Setup: `uv tool install --editable .` to put `spanreed` and `spanreed-mcp` on PATH, then `--plugin-dir plugins/spanreed` in two terminals, one in `~/git/spanreed` and one in `~/git/konstructor`.
+
+Prompt in the spanreed-side session: *"List the other agents on the bus, then send the one in konstructor a message asking what files are in their repo root."*
+
+What happened:
+1. spanreed-side called `list_agents` via MCP, discovered konstructor.
+2. spanreed-side called `send_message` to konstructor.
+3. konstructor-side's Monitor woke Claude with the inbox notification.
+4. konstructor-side correctly judged the request as autonomously answerable, ran the listing, and replied via `send_message` with `in_reply_to`.
+5. spanreed-side's Monitor woke Claude with the reply; she summarized it for the user — including unprompted helpful context ("It's a Gradle multi-module Kotlin project with modules: protocol, lib, frontend, backend, e2e").
+
+Everything we proved with the file-stub experiments (Tests 1–4) carried through to the real implementation. The bus is doing real work.
