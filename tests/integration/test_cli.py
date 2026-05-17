@@ -214,3 +214,36 @@ class TestInboxPath:
         rc, out = _run(capsys, ["inbox-path", "agent-alice"])
         assert rc == 0
         assert out.strip().endswith("/inboxes/agent-alice.jsonl")
+
+
+# ---------------------------------------------------------------- session-start
+
+
+class TestSessionStart:
+    def test_session_start_registers_and_emits_hook_json(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc, out = _run(capsys, ["session-start"])
+        assert rc == 0
+        payload = json.loads(out)
+        hook = payload["hookSpecificOutput"]
+        assert hook["hookEventName"] == "SessionStart"
+        context = hook["additionalContext"]
+        assert "Spanreed inter-agent message bus" in context
+        # The agent should also now appear in the registry.
+        _, list_out = _run(capsys, ["list"])
+        agents = json.loads(list_out)
+        assert any(a["working_dir"] == str(cli_env) for a in agents)
+
+    def test_session_start_context_includes_identity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        cli_env: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
+        rc, out = _run(capsys, ["session-start"])
+        assert rc == 0
+        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "agent-alice" in context
+        assert "alice" in context

@@ -2,11 +2,13 @@
 
 An inter-agent message bus for local Claude Code sessions. Run one Claude session per repo; let them coordinate.
 
-> **Status**: pre-implementation. The architecture and primitives are validated (see [`docs/findings.md`](docs/findings.md)); the real plugin and MCP server are being scaffolded.
+> **Status**: alpha. The architecture and primitives are validated (see [`docs/findings.md`](docs/findings.md)) and a working implementation is in place — pending end-to-end manual smoke test in real Claude Code. Not yet published to PyPI or the official marketplace.
 
 Named after the [spanreed](https://stormlightarchive.fandom.com/wiki/Spanreed): a paired magical writing tool from the Stormlight Archive that transmits text across vast distances. One side writes, the other side reads.
 
 ## Install
+
+Once published (not yet on PyPI):
 
 ```bash
 uv tool install spanreed-bus
@@ -14,7 +16,16 @@ claude /plugin marketplace add Monkopedia/spanreed
 claude /plugin install spanreed@spanreed
 ```
 
-(`pipx install spanreed-bus` also works if you don't have `uv`.)
+For now, from a local clone:
+
+```bash
+git clone git@github.com:Monkopedia/spanreed.git
+cd spanreed
+uv tool install --editable .
+claude /plugin install $(pwd)/plugins/spanreed --scope user
+```
+
+The MCP server (`spanreed-mcp`) and CLI (`spanreed`) need to be on `$PATH` for the plugin to find them — `uv tool install` handles this.
 
 ## Quickstart
 

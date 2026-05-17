@@ -139,4 +139,15 @@ All four load-bearing primitives are validated:
 | (Bonus) PushNotification escalation when user is away | 3 | ✅ |
 | Two real sessions exchange messages with reasoning across the bus | 4 | ✅ |
 
-Validation phase complete. Next milestone is the implementation design — see [open-questions.md](open-questions.md) for the decisions still on the table before writing the real MCP server + plugin.
+## Implementation status
+
+v1 implementation is complete in code:
+
+- **StateStore** (`src/spanreed/store.py`) — registry / inboxes / cursors / wait_for_reply; 30 unit tests.
+- **MCP server** (`src/spanreed/mcp_server.py`) — 6 FastMCP tools wrapping the store; 8 integration tests.
+- **CLI** (`src/spanreed/cli.py`) — 9 commands (`agent-id`, `inbox-path`, `register`, `deregister`, `list`, `send`, `recv`, `inbox-watch`, `session-start`); 17 integration tests.
+- **Plugin** (`plugins/spanreed/`) — manifest, `.mcp.json` referencing `spanreed-mcp`, SessionStart hook running `spanreed session-start`, Monitor running `spanreed inbox-watch`.
+
+CLI binary smoke-tested end-to-end (register → list round-trip with `SPANREED_STATE_ROOT` to a tmp dir).
+
+**Remaining: manual end-to-end smoke test in real Claude Code** — install the plugin via `--plugin-dir plugins/spanreed`, start two sessions in different repos, verify the cross-session round-trip works as it did in the experiment with file-stub plugins. Until this happens, the implementation is "working in unit/integration tests" but not "verified in vivo."

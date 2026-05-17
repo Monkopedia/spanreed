@@ -48,14 +48,39 @@ Plain text file containing the last-delivered `msg_id` for this session. Used on
 
 ## MCP tool surface
 
-*(To be specified as the server is implemented. Planned tools:)*
+Implemented in `src/spanreed/mcp_server.py` via FastMCP:
 
-- `register_agent(name?, working_dir?) -> {agent_id, name}`
-- `deregister_agent(agent_id) -> {ok}`
-- `list_agents() -> [Agent, ...]`
-- `send_message(to_agent, body, in_reply_to?) -> {msg_id}`
-- `recv_messages(since?) -> [Message, ...]`
-- `wait_for_reply(msg_id, timeout_s) -> Message | null`
+- `register_agent(name, working_dir, pid, agent_id?) -> Agent` — upsert by id if supplied.
+- `deregister_agent(agent_id) -> {ok: true}`
+- `list_agents(include_stale=false) -> [Agent, ...]`
+- `send_message(from_agent, to_agent, body, in_reply_to?) -> Message`
+- `recv_messages(agent_id, since_msg_id?) -> [Message, ...]`
+- `wait_for_reply(agent_id, in_reply_to, timeout_s) -> Message | null` — blocks up to `timeout_s`.
+
+## Identity model
+
+Agents are addressed by `agent_id`. The id is **deterministic per session**:
+
+- Default: `agent_id = "agent-" + sha256(absolute_cwd)[:8]`. Display name = basename of cwd.
+- Override: `SPANREED_AGENT_NAME` env var → `agent_id = "agent-<name>"`, display name = `<name>`.
+
+Both the SessionStart hook and the Monitor compute identity the same way, so they coordinate without needing to persist state between them. v1 limitation: two Claude Code sessions running in the same cwd share an agent — fine for the typical one-session-per-repo workflow.
+
+## CLI surface
+
+The `spanreed` CLI wraps the same operations for shell/script use and is what the plugin's hook + monitor invoke:
+
+| Command | Purpose |
+|---|---|
+| `spanreed agent-id` | Print this session's deterministic agent_id |
+| `spanreed inbox-path AGENT` | Print the inbox file path for an id |
+| `spanreed register [...]` | Upsert this session into the registry |
+| `spanreed deregister AGENT` | Remove an agent |
+| `spanreed list` | List registered agents (JSON) |
+| `spanreed send --to AGENT --body BODY [--from F] [--in-reply-to ID]` | Post a message |
+| `spanreed recv AGENT [--since ID]` | Dump an agent's inbox |
+| `spanreed inbox-watch` | `tail -F` this session's inbox (plugin Monitor) |
+| `spanreed session-start` | Register + emit SessionStart hook JSON (plugin hook) |
 
 ## Trust model
 
