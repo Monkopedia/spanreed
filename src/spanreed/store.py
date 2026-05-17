@@ -302,21 +302,23 @@ class StateStore:
         *,
         poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     ) -> Message | None:
-        """Block until a message replying to ``in_reply_to`` lands in the agent's inbox.
+        """Block until a message replying to ``in_reply_to`` is in the agent's inbox.
 
-        Returns the reply, or ``None`` on timeout. Only considers messages that
-        arrive *after* this call starts — pre-existing matching messages are
-        ignored. Polls at ``poll_interval_s`` (default 100ms).
+        Returns the matching reply, or ``None`` on timeout. Considers *all*
+        messages in the inbox — pre-existing matches are returned immediately,
+        not skipped. (Skipping pre-existing was a footgun: any reply landing
+        between the caller's ``send_message`` and ``wait_for_reply`` was
+        silently missed.) Collision risk is essentially zero — msg_ids are
+        random and in_reply_to matches exactly.
+
+        Polls at ``poll_interval_s`` (default 100ms) until a match arrives or
+        the deadline expires.
         """
         deadline = time.monotonic() + timeout_s
-        existing = self.recv_messages(agent_id)
-        seen_count = len(existing)
         while True:
-            messages = self.recv_messages(agent_id)
-            for msg in messages[seen_count:]:
+            for msg in self.recv_messages(agent_id):
                 if msg.in_reply_to == in_reply_to:
                     return msg
-            seen_count = len(messages)
             if time.monotonic() >= deadline:
                 return None
             time.sleep(poll_interval_s)

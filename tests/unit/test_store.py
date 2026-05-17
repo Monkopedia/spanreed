@@ -326,18 +326,23 @@ class TestWaitForReply:
         )
         assert result is None
 
-    def test_ignores_existing_matching_messages(self, store: StateStore) -> None:
-        """wait_for_reply only considers messages that arrive *after* the call starts."""
+    def test_returns_existing_matching_message_immediately(self, store: StateStore) -> None:
+        """wait_for_reply should find a matching reply already in the inbox.
+
+        This is the fix for the race where a reply lands between the caller's
+        send_message and wait_for_reply calls.
+        """
         m1 = store.send_message(from_agent="A", to_agent="B", body="ping")
-        # Pre-existing reply already in A's inbox.
-        store.send_message(from_agent="B", to_agent="A", body="old", in_reply_to=m1.msg_id)
+        reply = store.send_message(
+            from_agent="B", to_agent="A", body="already-there", in_reply_to=m1.msg_id
+        )
         result = store.wait_for_reply(
             agent_id="A",
             in_reply_to=m1.msg_id,
             timeout_s=0.2,
             poll_interval_s=0.05,
         )
-        assert result is None
+        assert result == reply
 
     def test_ignores_unrelated_messages(self, store: StateStore) -> None:
         m1 = store.send_message(from_agent="A", to_agent="B", body="ping")
