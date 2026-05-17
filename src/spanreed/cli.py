@@ -1,20 +1,189 @@
-"""``spanreed`` CLI for ops and debugging.
+"""``spanreed`` CLI for ops, debugging, and plugin glue.
 
-Intentionally separate from the MCP server. Useful for inspecting the bus
-state from a shell without going through Claude:
+The plugin's SessionStart hook and Monitor both call into this CLI, so the
+plugin scripts stay simple shell. The same commands are useful manually for
+inspecting bus state from a terminal.
 
-- ``spanreed list``          — show currently registered agents
-- ``spanreed inbox <agent>`` — dump an agent's inbox
-- ``spanreed send <to> <body>`` — post a message (for manual testing)
+Identity model (v1): the agent_id is derived deterministically from the
+session's working directory (``SPANREED_AGENT_NAME`` env var overrides).
+This means two sessions in the same cwd will share an id — acceptable for
+v1, since the typical pattern is one Claude Code session per repo.
 """
 
 from __future__ import annotations
 
+import argparse
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
 
-def main() -> None:
-    """Entry point for the ``spanreed`` console script."""
-    raise NotImplementedError("CLI not yet implemented")
+from spanreed.store import StateStore, default_state_root
+
+# ---------------------------------------------------------------- identity
+
+
+def derive_agent_identity(working_dir: Path | None = None) -> tuple[str, str]:
+    """Compute (agent_id, name) for a session.
+
+    ``SPANREED_AGENT_NAME`` env var overrides both: id becomes ``agent-<name>``
+    and the display name is the override verbatim. Otherwise:
+
+    - name = basename of working dir (or ``"unknown"`` if empty)
+    - id   = ``"agent-" + sha256(absolute_path)[:8]``
+    """
+    override = os.environ.get("SPANREED_AGENT_NAME")
+    if override:
+        return f"agent-{override}", override
+    wd = (working_dir or Path.cwd()).resolve()
+    name = wd.name or "unknown"
+    digest = hashlib.sha256(str(wd).encode()).hexdigest()[:8]
+    return f"agent-{digest}", name
+
+
+# ---------------------------------------------------------------- commands
+
+
+def _cmd_agent_id(_args: argparse.Namespace) -> int:
+    agent_id, _ = derive_agent_identity()
+    print(agent_id)
+    return 0
+
+
+def _cmd_inbox_path(args: argparse.Namespace) -> int:
+    agent_id: str = args.agent_id
+    print(default_state_root() / "inboxes" / f"{agent_id}.jsonl")
+    return 0
+
+
+def _cmd_register(args: argparse.Namespace) -> int:
+    wd = Path(args.working_dir) if args.working_dir else Path.cwd()
+    if args.agent_id or args.name:
+        agent_id = args.agent_id or derive_agent_identity(wd)[0]
+        name = args.name or derive_agent_identity(wd)[1]
+    else:
+        agent_id, name = derive_agent_identity(wd)
+    pid = args.pid if args.pid is not None else os.getppid()
+    agent = StateStore().register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
+    json.dump(agent.model_dump(mode="json"), sys.stdout, indent=2)
+    print()
+    return 0
+
+
+def _cmd_deregister(args: argparse.Namespace) -> int:
+    StateStore().deregister_agent(args.agent_id)
+    return 0
+
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    agents = StateStore().list_agents(include_stale=args.include_stale)
+    json.dump([a.model_dump(mode="json") for a in agents], sys.stdout, indent=2)
+    print()
+    return 0
+
+
+def _cmd_send(args: argparse.Namespace) -> int:
+    from_agent = args.from_agent or derive_agent_identity()[0]
+    msg = StateStore().send_message(
+        from_agent=from_agent,
+        to_agent=args.to,
+        body=args.body,
+        in_reply_to=args.in_reply_to,
+    )
+    json.dump(msg.model_dump(mode="json"), sys.stdout, indent=2)
+    print()
+    return 0
+
+
+def _cmd_recv(args: argparse.Namespace) -> int:
+    msgs = StateStore().recv_messages(agent_id=args.agent_id, since_msg_id=args.since)
+    json.dump([m.model_dump(mode="json") for m in msgs], sys.stdout, indent=2)
+    print()
+    return 0
+
+
+def _cmd_inbox_watch(_args: argparse.Namespace) -> int:
+    """tail -F this session's inbox file. Used by the plugin Monitor.
+
+    Replaces the Python process with ``tail`` via ``execvp`` — no subprocess
+    bookkeeping, no buffering issues, signal handling delegated to ``tail``.
+    """
+    agent_id, _ = derive_agent_identity()
+    inbox = default_state_root() / "inboxes" / f"{agent_id}.jsonl"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.touch(exist_ok=True)
+    os.execvp("tail", ["tail", "-n", "0", "-F", str(inbox)])
+    # execvp does not return.
+
+
+# ---------------------------------------------------------------- argparse
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="spanreed", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("agent-id", help="Print this session's deterministic agent_id")
+
+    p_path = sub.add_parser("inbox-path", help="Print the inbox file path for an agent_id")
+    p_path.add_argument("agent_id")
+
+    p_reg = sub.add_parser("register", help="Register this session on the bus")
+    p_reg.add_argument("--agent-id", help="Override derived agent_id")
+    p_reg.add_argument("--name", help="Override derived display name")
+    p_reg.add_argument("--working-dir", help="Working directory (default: cwd)")
+    p_reg.add_argument("--pid", type=int, help="PID to record (default: PPID)")
+
+    p_dereg = sub.add_parser("deregister", help="Remove an agent from the registry by id")
+    p_dereg.add_argument("agent_id")
+
+    p_list = sub.add_parser("list", help="List registered agents")
+    p_list.add_argument(
+        "--include-stale",
+        action="store_true",
+        help="Include agents whose PID is dead or last_seen is past TTL",
+    )
+
+    p_send = sub.add_parser("send", help="Send a message to another agent")
+    p_send.add_argument("--to", required=True, dest="to", help="Recipient agent_id")
+    p_send.add_argument("--body", required=True, help="Message body")
+    p_send.add_argument(
+        "--from",
+        dest="from_agent",
+        help="Sender agent_id (default: this session's derived id)",
+    )
+    p_send.add_argument("--in-reply-to", help="msg_id this message responds to (optional)")
+
+    p_recv = sub.add_parser("recv", help="Read an agent's inbox")
+    p_recv.add_argument("agent_id")
+    p_recv.add_argument("--since", help="Only return messages after this msg_id")
+
+    sub.add_parser(
+        "inbox-watch",
+        help="tail -F this session's inbox file (used by the plugin Monitor)",
+    )
+    return parser
+
+
+_DISPATCH = {
+    "agent-id": _cmd_agent_id,
+    "inbox-path": _cmd_inbox_path,
+    "register": _cmd_register,
+    "deregister": _cmd_deregister,
+    "list": _cmd_list,
+    "send": _cmd_send,
+    "recv": _cmd_recv,
+    "inbox-watch": _cmd_inbox_watch,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point. Returns the process exit code."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return _DISPATCH[args.cmd](args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
