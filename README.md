@@ -1,31 +1,61 @@
 # Spanreed
 
-An inter-agent message bus for Claude Code instances running on the same machine. Multiple interactive Claude Code sessions register themselves with the bus, can discover each other, and exchange messages — so a coordinator session (e.g. one that watches PR review comments) can dispatch work to the right worker session in the right repo.
+An inter-agent message bus for local Claude Code sessions. Run one Claude session per repo; let them coordinate.
 
-> **Status**: Experimental. Validating that the underlying Claude Code primitives (plugin Monitor + MCP) can support the design. See [docs/findings.md](docs/findings.md) for what's been proven.
+> **Status**: pre-implementation. The architecture and primitives are validated (see [`docs/findings.md`](docs/findings.md)); the real plugin and MCP server are being scaffolded.
 
-Named after the [spanreed](https://stormlightarchive.fandom.com/wiki/Spanreed) from the Stormlight Archive: a pair of magical writing tools that transmit text across vast distances. One side writes, the other side reads.
+Named after the [spanreed](https://stormlightarchive.fandom.com/wiki/Spanreed): a paired magical writing tool from the Stormlight Archive that transmits text across vast distances. One side writes, the other side reads.
 
-## Why
-
-Coding workflows often span multiple repos and ongoing PRs. Running one Claude Code session per repo is natural, but those sessions can't talk to each other. The use case that drove this design: leave review comments on a PR, have the right Claude Code instance see them and address them, without having to juggle terminals or copy-paste between sessions.
-
-## Architecture (sketch)
-
-- **MCP server** — the bus API: `register_agent`, `list_agents`, `send_message`, `recv_messages`. State on disk under `~/.claude/spanreed/`.
-- **Claude Code plugin** — wires up the MCP server, registers the session on start, and runs a [Monitor](https://code.claude.com/docs/en/plugins#add-background-monitors-to-your-plugin) that signals Claude when a new message arrives in her inbox.
-- **Trust split** — monitor `description` carries the trusted policy; monitor stdout is an untrusted poke; the actual message body is data Claude reads and reasons about.
-
-See [docs/architecture.md](docs/architecture.md) for the full design and [docs/open-questions.md](docs/open-questions.md) for what's still unresolved.
-
-## Scope
-
-Interactive Claude Code sessions only. Background / headless workers have other handles (Claude Code's Remote Control and `claude -p` cover those separately).
-
-## Try the current experiments
+## Install
 
 ```bash
-claude --plugin-dir ./experiments/bus-test
+uv tool install spanreed-bus
+claude /plugin marketplace add Monkopedia/spanreed
+claude /plugin install spanreed@spanreed
 ```
 
-The `bus-test` plugin is a minimal probe used to validate the underlying primitives — not the real bus. The actual MCP server and plugin haven't been built yet.
+(`pipx install spanreed-bus` also works if you don't have `uv`.)
+
+## Quickstart
+
+Open two terminals, each in a different repo:
+
+```bash
+# Terminal A
+cd ~/projects/repo-a && claude
+
+# Terminal B
+cd ~/projects/repo-b && claude
+```
+
+In terminal A, ask Claude to talk to the other session:
+
+> Ask agent at repo-b what version of Node it's using.
+
+Claude in repo-A discovers the peer, sends the question, the peer answers, the answer comes back. The conversation is visible in both transcripts.
+
+## How it works
+
+Two layers on Claude Code primitives:
+
+- **MCP server** (`spanreed-mcp`, per-session) exposes the bus API as typed tools: register, send, recv, list, `wait_for_reply` with timeout.
+- **Plugin** (auto-loaded) wires up a SessionStart hook for bus context, a Monitor for inbound wakeups, and points Claude at the MCP server.
+
+State lives under `~/.claude/spanreed/` (registry + per-agent inboxes + per-session cursors). No central daemon — each session's MCP server is local and coordinates through shared files.
+
+Read the full design in [`docs/architecture.md`](docs/architecture.md). Wire-format spec in [`docs/protocol.md`](docs/protocol.md).
+
+## Update
+
+```bash
+uv tool upgrade spanreed-bus
+claude /plugin update spanreed@spanreed
+```
+
+## Development
+
+See [`docs/development.md`](docs/development.md) for environment setup, running tests, and contribution conventions. The [`CLAUDE.md`](CLAUDE.md) at the root captures the discipline rules — Claude sessions working on this repo should read it.
+
+## License
+
+[Apache-2.0](LICENSE).

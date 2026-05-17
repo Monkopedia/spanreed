@@ -17,6 +17,10 @@ venv/
 *.egg-info/
 build/
 dist/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+.python-version.local
 
 # Node
 node_modules/

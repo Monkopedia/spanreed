@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "spanreed",
+  "description": "Spanreed inter-agent message bus for local Claude Code sessions",
+  "owner": {
+    "name": "Jason Monk",
+    "email": "monkopedia@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "spanreed",
+      "description": "Inter-agent message bus: register sessions, exchange messages, escalate to user when needed.",
+      "source": "./plugins/spanreed",
+      "category": "productivity",
+      "homepage": "https://github.com/Monkopedia/spanreed"
+    }
+  ]
+}
