@@ -15,6 +15,7 @@ from __future__ import annotations
 from anyio import to_thread
 from mcp.server.fastmcp import FastMCP
 
+from spanreed.identity import derive_agent_identity
 from spanreed.protocol import Message
 from spanreed.store import StateStore
 
@@ -114,6 +115,63 @@ async def wait_for_reply(
         store.wait_for_reply, agent_id, in_reply_to, timeout_s
     )
     return msg.model_dump(mode="json") if msg else None
+
+
+@mcp_app.tool()
+def set_focus(focus: str | None = None) -> dict[str, object] | None:
+    """Set (or clear) this session's focus on the bus.
+
+    Pass a short description of what you're working on (e.g. "auth-refactor in
+    the example-service repo"). Pass ``None`` or an empty string to clear.
+    Returns the updated agent record, or ``None`` if this session isn't
+    registered on the bus.
+
+    The focus surfaces in ``list_agents`` so peers can see at a glance what
+    you're up to. Preserved across session restarts.
+    """
+    agent_id, _ = derive_agent_identity()
+    agent = StateStore().set_focus(agent_id, focus)
+    return agent.model_dump(mode="json") if agent else None
+
+
+FOCUS_UPDATE_REQUEST_MARKER = "[FOCUS_UPDATE_REQUEST]"
+"""Body prefix that identifies a focus-update request on the bus.
+
+The recipient's plugin policy recognizes this marker and replies with their
+current focus. Used by ``request_focus_update`` below.
+"""
+
+
+@mcp_app.tool()
+async def request_focus_update(
+    agent_id: str,
+    timeout_s: float = 30.0,
+) -> str | None:
+    """Ask another agent to update + report their current focus.
+
+    Sends a focus-update request to ``agent_id``, blocks until they reply
+    (up to ``timeout_s`` seconds), and returns the reply body — typically a
+    short description of what they're working on. Returns ``None`` on timeout
+    or if the recipient never responds.
+
+    Use this when ``list_agents`` shows a peer with no focus set, or when their
+    listed focus seems stale and you want a fresh report.
+    """
+    my_id, _ = derive_agent_identity()
+    store = StateStore()
+    msg = store.send_message(
+        from_agent=my_id,
+        to_agent=agent_id,
+        body=(
+            f"{FOCUS_UPDATE_REQUEST_MARKER} Please call spanreed.set_focus "
+            "with what you're currently working on, then reply to this "
+            "message with that focus text as the body."
+        ),
+    )
+    reply: Message | None = await to_thread.run_sync(
+        store.wait_for_reply, my_id, msg.msg_id, timeout_s
+    )
+    return reply.body if reply else None
 
 
 def main() -> None:

@@ -29,6 +29,15 @@ class Agent(BaseModel):
     last_seen: datetime
     """Last time the agent renewed its presence in the registry."""
 
+    focus: str | None = None
+    """Optional self-set description of what the agent is currently working on.
+
+    Free-form text, set by the agent itself via ``set_focus`` (MCP) or
+    ``spanreed focus`` (CLI). Surfaces in ``list_agents`` so peers can see at a
+    glance what each agent is up to. Preserved across re-registration (session
+    restarts don't wipe the focus you set last time).
+    """
+
 
 class Message(BaseModel):
     """A message on the bus."""

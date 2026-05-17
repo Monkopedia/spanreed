@@ -20,7 +20,9 @@ from spanreed.mcp_server import (
     list_agents,
     recv_messages,
     register_agent,
+    request_focus_update,
     send_message,
+    set_focus,
     wait_for_reply,
 )
 
@@ -118,3 +120,73 @@ async def test_wait_for_reply_times_out(mcp_env: None) -> None:
     m1 = send_message(from_agent="A", to_agent="B", body="ping")
     reply = await wait_for_reply(agent_id="A", in_reply_to=str(m1["msg_id"]), timeout_s=0.2)
     assert reply is None
+
+
+# ----------------------------------------------------------------- focus
+
+
+def test_set_focus_on_self(mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """set_focus uses the derived identity of the calling session."""
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
+    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    result = set_focus(focus="working on the auth refactor")
+    assert result is not None
+    assert result["focus"] == "working on the auth refactor"
+
+
+def test_set_focus_appears_in_list_agents(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
+    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    set_focus(focus="the focus")
+    agents = list_agents()
+    matching = [a for a in agents if a["agent_id"] == "agent-alice"]
+    assert matching[0]["focus"] == "the focus"
+
+
+def test_set_focus_returns_none_when_not_registered(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "unregistered")
+    assert set_focus(focus="something") is None
+
+
+async def test_request_focus_update_returns_reply_body(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Simulate the recipient replying to the focus-update request."""
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
+    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    register_agent(name="bob", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-bob")
+
+    async def respond() -> None:
+        # Wait for the request to land in bob's inbox, then reply to alice.
+        await anyio.sleep(0.1)
+        msgs = recv_messages(agent_id="agent-bob")
+        # Find the focus-update request (most recent).
+        request = msgs[-1]
+        send_message(
+            from_agent="agent-bob",
+            to_agent="agent-alice",
+            body="refactoring the API gateway",
+            in_reply_to=str(request["msg_id"]),
+        )
+
+    result_holder: list[str | None] = []
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(respond)
+        result_holder.append(await request_focus_update(agent_id="agent-bob", timeout_s=2.0))
+
+    assert result_holder == ["refactoring the API gateway"]
+
+
+async def test_request_focus_update_times_out(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
+    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    register_agent(name="bob", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-bob")
+    result = await request_focus_update(agent_id="agent-bob", timeout_s=0.2)
+    assert result is None

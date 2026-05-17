@@ -98,6 +98,66 @@ class TestRegistry:
         assert matching[0].working_dir == "/y"
         assert matching[0].last_seen > first.last_seen
 
+
+# ----------------------------------------------------------------- focus
+
+
+class TestFocus:
+    def test_set_focus_returns_updated_agent(self, store: StateStore) -> None:
+        agent = store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        updated = store.set_focus(agent.agent_id, "working on auth refactor")
+        assert updated is not None
+        assert updated.focus == "working on auth refactor"
+
+    def test_set_focus_persists_in_list(self, store: StateStore) -> None:
+        store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        store.set_focus("agent-alice", "the focus")
+        listed = next(a for a in store.list_agents() if a.agent_id == "agent-alice")
+        assert listed.focus == "the focus"
+
+    def test_set_focus_on_unknown_returns_none(self, store: StateStore) -> None:
+        assert store.set_focus("agent-does-not-exist", "something") is None
+
+    def test_set_focus_empty_string_clears(self, store: StateStore) -> None:
+        store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        store.set_focus("agent-alice", "the focus")
+        cleared = store.set_focus("agent-alice", "")
+        assert cleared is not None
+        assert cleared.focus is None
+
+    def test_set_focus_none_clears(self, store: StateStore) -> None:
+        store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        store.set_focus("agent-alice", "the focus")
+        cleared = store.set_focus("agent-alice", None)
+        assert cleared is not None
+        assert cleared.focus is None
+
+    def test_focus_preserved_across_reregister(self, store: StateStore) -> None:
+        store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        store.set_focus("agent-alice", "the focus")
+        # Re-register the same agent_id (as the SessionStart hook would on restart).
+        store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        after = next(a for a in store.list_agents() if a.agent_id == "agent-alice")
+        assert after.focus == "the focus"
+
+    def test_register_does_not_set_focus_by_default(self, store: StateStore) -> None:
+        agent = store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        assert agent.focus is None
+
     def test_registry_persists_across_store_instances(self, state_root: Path) -> None:
         s1 = StateStore(root=state_root)
         agent = s1.register_agent(name="alice", working_dir="/x", pid=os.getpid())

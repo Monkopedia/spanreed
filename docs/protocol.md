@@ -50,12 +50,25 @@ Plain text file containing the last-delivered `msg_id` for this session. Used on
 
 Implemented in `src/spanreed/mcp_server.py` via FastMCP:
 
-- `register_agent(name, working_dir, pid, agent_id?) -> Agent` — upsert by id if supplied.
+- `register_agent(name, working_dir, pid, agent_id?) -> Agent` — upsert by id if supplied; preserves existing `focus` on upsert.
 - `deregister_agent(agent_id) -> {ok: true}`
-- `list_agents(include_stale=false) -> [Agent, ...]`
+- `list_agents(include_stale=false) -> [Agent, ...]` — Agent records include `focus` field.
 - `send_message(from_agent, to_agent, body, in_reply_to?) -> Message`
 - `recv_messages(agent_id, since_msg_id?) -> [Message, ...]`
 - `wait_for_reply(agent_id, in_reply_to, timeout_s) -> Message | null` — blocks up to `timeout_s`.
+- `set_focus(focus) -> Agent | null` — set/clear the calling session's focus (uses derived identity); `null` if not registered. Empty string clears.
+- `request_focus_update(agent_id, timeout_s=30) -> str | null` — send a `[FOCUS_UPDATE_REQUEST]` message to a peer, wait for their reply, return the reply body. Convention: the recipient's policy says to call `set_focus` with their current focus and reply with that text.
+
+## Focus
+
+Agents may set an optional `focus` field describing what they're currently working on. Free-form text, no length cap. Self-set only — agents control their own focus.
+
+- Set by the agent: via `set_focus` (MCP) or `spanreed focus "..."` (CLI).
+- Cleared by passing empty string / `None` / `--clear`.
+- Surfaces in `list_agents` so peers see it at a glance.
+- **Preserved across re-registration** — restarting Claude Code doesn't wipe the focus the agent set last session.
+
+For pull-mode queries (e.g., a peer's listed focus seems stale or absent), use `request_focus_update` to ping them. The convention message body begins with `[FOCUS_UPDATE_REQUEST]`; the plugin's monitor description teaches Claude how to respond.
 
 ## Identity model
 

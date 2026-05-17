@@ -123,8 +123,9 @@ class StateStore:
         If ``agent_id`` is supplied and already present, the existing entry is
         replaced (upsert) — used by the plugin so the SessionStart hook and the
         Monitor can coordinate on a deterministic id without needing to persist
-        it between them. If ``agent_id`` is omitted, a fresh random one is
-        generated.
+        it between them. ``focus`` is preserved across upserts (session restarts
+        don't wipe what the agent set last time). If ``agent_id`` is omitted, a
+        fresh random one is generated.
         """
         agent = Agent(
             agent_id=agent_id if agent_id is not None else _new_id("agent"),
@@ -137,12 +138,30 @@ class StateStore:
             agents = self._read_registry_unlocked()
             for i, existing in enumerate(agents):
                 if existing.agent_id == agent.agent_id:
+                    # Preserve focus across re-registration — describes
+                    # what the agent is working on, not session state.
+                    agent.focus = existing.focus
                     agents[i] = agent
                     break
             else:
                 agents.append(agent)
             self._write_registry_unlocked(agents)
         return agent
+
+    def set_focus(self, agent_id: str, focus: str | None) -> Agent | None:
+        """Update an agent's focus. Returns the updated Agent, or ``None`` if not registered.
+
+        Empty string ``focus`` is normalized to ``None`` (cleared).
+        """
+        normalized = focus if focus else None
+        with self._registry_lock():
+            agents = self._read_registry_unlocked()
+            for agent in agents:
+                if agent.agent_id == agent_id:
+                    agent.focus = normalized
+                    self._write_registry_unlocked(agents)
+                    return agent
+            return None
 
     def deregister_agent(self, agent_id: str) -> None:
         """Remove an agent from the registry. No-op if not present."""

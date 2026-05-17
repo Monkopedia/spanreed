@@ -247,3 +247,71 @@ class TestSessionStart:
         context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
         assert "agent-alice" in context
         assert "alice" in context
+
+    def test_session_start_mentions_focus_capabilities(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _, out = _run(capsys, ["session-start"])
+        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "set_focus" in context
+        assert "request_focus_update" in context
+        assert "FOCUS_UPDATE_REQUEST" in context
+
+
+# ---------------------------------------------------------------- focus
+
+
+class TestFocus:
+    def test_focus_show_when_unset_prints_nothing(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["register"])
+        rc, out = _run(capsys, ["focus"])
+        assert rc == 0
+        assert out.strip() == ""
+
+    def test_focus_set_then_show(self, cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        _run(capsys, ["register"])
+        rc, _ = _run(capsys, ["focus", "implementing auth refactor"])
+        assert rc == 0
+        _, out = _run(capsys, ["focus"])
+        assert out.strip() == "implementing auth refactor"
+
+    def test_focus_clear(self, cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        _run(capsys, ["register"])
+        _run(capsys, ["focus", "the focus"])
+        rc, _ = _run(capsys, ["focus", "--clear"])
+        assert rc == 0
+        _, out = _run(capsys, ["focus"])
+        assert out.strip() == ""
+
+    def test_focus_appears_in_list_output(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["register"])
+        _run(capsys, ["focus", "the focus"])
+        _, out = _run(capsys, ["list"])
+        agents = json.loads(out)
+        assert agents[0]["focus"] == "the focus"
+
+    def test_focus_set_auto_registers_if_missing(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Calling `focus` before `register` shouldn't fail — it auto-registers."""
+        rc, _ = _run(capsys, ["focus", "initial focus"])
+        assert rc == 0
+        _, out = _run(capsys, ["list"])
+        agents = json.loads(out)
+        assert len(agents) == 1
+        assert agents[0]["focus"] == "initial focus"
+
+    def test_focus_preserved_across_session_start(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Re-running session-start (as the hook does on restart) preserves focus."""
+        _run(capsys, ["session-start"])
+        _run(capsys, ["focus", "the focus"])
+        # Simulate session restart by re-running session-start.
+        _run(capsys, ["session-start"])
+        _, out = _run(capsys, ["focus"])
+        assert out.strip() == "the focus"
