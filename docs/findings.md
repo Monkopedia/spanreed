@@ -104,9 +104,32 @@ Observations:
 4. **Bonus — escalation discovery**: Claude autonomously called `PushNotification` to alert the user. The system correctly suppressed it with `"Not sent because you're active in this terminal."` This means the bus has a **built-in escalation mechanism**: worker agents can flag for human attention via PushNotification, and the harness handles the "is the user actually watching this terminal" check. Worth bundling this into the trust-framing policy explicitly: *"if status is needs-user-attention, also call PushNotification."*
 5. **Tool choice**: she used `Bash` with `printf` rather than the `Write` tool. Both work; would consider specifying `Write` in the policy for cleaner audit trails.
 
+## Test 4: Two real Claude sessions exchanging messages
+
+**Result: ✅ YES.** Full bidirectional round-trip works.
+
+Setup: `experiments/cross-session/` — two plugins (`spanreed-alice`, `spanreed-bob`), each with a `SessionStart` hook that injects bus topology (identity, inbox path, known peers, send mechanism) and a Monitor that `tail -F`s its own inbox file under `/tmp/spanreed-test/`. Each line appended to an inbox is one JSON message.
+
+User prompt in alice's terminal: *"Send a message to bob asking what version of TypeScript his repo is using."*
+
+What happened:
+1. **Alice originated correctly**: `bash echo '{"from":"alice","to":"bob","body":"..."}' >> /tmp/spanreed-test/bob-inbox.txt`
+2. **Bob woke spontaneously** on the new inbox line via his monitor.
+3. **Bob exercised judgment**: instead of fabricating a TypeScript version or refusing, he correctly recognized his cwd is a parent dir of many projects and there's no single "his repo" — and formulated a clarifying question.
+4. **Bob replied** by appending JSON to alice's inbox.
+5. **Alice's monitor woke her** on the reply, she summarized for the user, and asked which repo to specify.
+
+Multi-turn exchange continued cleanly. The bus is carrying real reasoning across sessions, not just messages.
+
+### Observations
+
+- **SessionStart hook is necessary**: the monitor description only enters context when a notification fires. Before adding the SessionStart hook, alice interpreted "send a message to bob" as a request to email a human. Topology has to be injected up front.
+- **Verbose monitor descriptions appearing in the transcript every notification is intentionally not a bug.** User stance: visibility over hiding — token cost is acceptable for letting the human follow agent-to-agent reasoning. Real plugin should keep this design.
+- **Process hygiene matters**: stale `tail -F` processes from prior failed attempts caused confusion (two alice tails, no bob). Reset script: `pkill -f "tail -n 0 -F /tmp/spanreed-test" ; rm -rf /tmp/spanreed-test`.
+
 ## Summary
 
-All three load-bearing primitives are validated:
+All four load-bearing primitives are validated:
 
 | Capability | Test | Result |
 |---|---|---|
@@ -114,5 +137,6 @@ All three load-bearing primitives are validated:
 | Trusted description steers fetch on untrusted signal | 2 | ✅ |
 | Claude can judge, format, and "send" a structured reply | 3 | ✅ |
 | (Bonus) PushNotification escalation when user is away | 3 | ✅ |
+| Two real sessions exchange messages with reasoning across the bus | 4 | ✅ |
 
-Next milestone is building the real MCP server + plugin to replace the file-based stubs.
+Validation phase complete. Next milestone is the implementation design — see [open-questions.md](open-questions.md) for the decisions still on the table before writing the real MCP server + plugin.
