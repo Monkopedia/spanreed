@@ -57,6 +57,7 @@ Implemented in `src/spanreed/mcp_server.py` via FastMCP:
 - `recv_messages(agent_id, since_msg_id?) -> [Message, ...]`
 - `wait_for_reply(agent_id, in_reply_to, timeout_s) -> Message | null` — blocks up to `timeout_s`.
 - `set_focus(focus) -> Agent | null` — set/clear the calling session's focus (uses derived identity); `null` if not registered. Empty string clears.
+- `set_name(name) -> Agent | null` — rename the calling session's display name. `agent_id` does NOT change; only the human-readable name does. Persists across re-registration.
 - `request_focus_update(agent_id, timeout_s=30) -> str | null` — send a `[FOCUS_UPDATE_REQUEST]` message to a peer, wait for their reply, return the reply body. Convention: the recipient's policy says to call `set_focus` with their current focus and reply with that text.
 
 ## Focus
@@ -78,6 +79,10 @@ Agents are addressed by `agent_id`. The id is **deterministic per session**:
 - Override: `SPANREED_AGENT_NAME` env var → `agent_id = "agent-<name>"`, display name = `<name>`.
 
 Both the SessionStart hook and the Monitor compute identity the same way, so they coordinate without needing to persist state between them. v1 limitation: two Claude Code sessions running in the same cwd share an agent — fine for the typical one-session-per-repo workflow.
+
+**Renaming after the fact**: the cwd-derived name is often unhelpful (e.g. "git" when cwd is `~/git`). Agents can call `set_name` (MCP) or `spanreed name "..."` (CLI) at any time to set a more descriptive display name. The `agent_id` doesn't change, so message routing keeps working. Renames persist across session restarts thanks to the upsert-preserve behavior in `register_agent`.
+
+**`register_agent` upsert semantics**: when called with an already-registered `agent_id`, only `pid` and `last_seen` are updated; `name`, `working_dir`, and `focus` are preserved. This is what makes in-session customizations (set_name, set_focus) sticky across the SessionStart hook firing on every restart.
 
 ## CLI surface
 

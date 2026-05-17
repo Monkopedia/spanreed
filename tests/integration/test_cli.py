@@ -315,3 +315,52 @@ class TestFocus:
         _run(capsys, ["session-start"])
         _, out = _run(capsys, ["focus"])
         assert out.strip() == "the focus"
+
+
+# ---------------------------------------------------------------- name
+
+
+class TestName:
+    def test_name_show_when_registered(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["register"])
+        rc, out = _run(capsys, ["name"])
+        assert rc == 0
+        assert out.strip() == cli_env.name  # basename of the session cwd
+
+    def test_name_set_then_show(self, cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        _run(capsys, ["register"])
+        rc, _ = _run(capsys, ["name", "main-coordinator"])
+        assert rc == 0
+        _, out = _run(capsys, ["name"])
+        assert out.strip() == "main-coordinator"
+
+    def test_name_appears_in_list_output(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["register"])
+        _run(capsys, ["name", "main-coordinator"])
+        _, out = _run(capsys, ["list"])
+        agents = json.loads(out)
+        assert agents[0]["name"] == "main-coordinator"
+
+    def test_name_preserved_across_session_start(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Re-running session-start preserves a manual rename."""
+        _run(capsys, ["session-start"])
+        _run(capsys, ["name", "renamed"])
+        _run(capsys, ["session-start"])
+        _, out = _run(capsys, ["name"])
+        assert out.strip() == "renamed"
+
+    def test_name_set_auto_registers_if_missing(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc, _ = _run(capsys, ["name", "fresh-name"])
+        assert rc == 0
+        _, out = _run(capsys, ["list"])
+        agents = json.loads(out)
+        assert len(agents) == 1
+        assert agents[0]["name"] == "fresh-name"

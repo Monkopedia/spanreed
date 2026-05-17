@@ -118,6 +118,23 @@ async def wait_for_reply(
 
 
 @mcp_app.tool()
+def set_name(name: str) -> dict[str, object] | None:
+    """Rename this session's display name on the bus.
+
+    Useful when the default cwd-derived name (e.g. "git" when cwd is
+    ``~/git``) isn't descriptive. Only changes the display name — the
+    underlying ``agent_id`` stays the same, so existing message references
+    keep working. Persists across session restarts.
+
+    Returns the updated agent record, or ``None`` if this session isn't
+    registered on the bus.
+    """
+    agent_id, _ = derive_agent_identity()
+    agent = StateStore().set_name(agent_id, name)
+    return agent.model_dump(mode="json") if agent else None
+
+
+@mcp_app.tool()
 def set_focus(focus: str | None = None) -> dict[str, object] | None:
     """Set (or clear) this session's focus on the bus.
 

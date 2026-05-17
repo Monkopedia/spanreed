@@ -23,6 +23,7 @@ from spanreed.mcp_server import (
     request_focus_update,
     send_message,
     set_focus,
+    set_name,
     wait_for_reply,
 )
 
@@ -57,7 +58,9 @@ def test_register_with_explicit_id_upserts(mcp_env: None) -> None:
     assert second["agent_id"] == first["agent_id"]
     matching = [a for a in list_agents() if a["agent_id"] == "agent-fixed"]
     assert len(matching) == 1
-    assert matching[0]["name"] == "alice-new"
+    # Re-register preserves name/working_dir; only pid + last_seen refresh.
+    assert matching[0]["name"] == "alice-old"
+    assert matching[0]["working_dir"] == "/tmp/x"
 
 
 def test_deregister_returns_ok(mcp_env: None) -> None:
@@ -190,3 +193,23 @@ async def test_request_focus_update_times_out(
     register_agent(name="bob", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-bob")
     result = await request_focus_update(agent_id="agent-bob", timeout_s=0.2)
     assert result is None
+
+
+# ----------------------------------------------------------------- name
+
+
+def test_set_name_renames_self(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
+    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    result = set_name(name="main-coordinator")
+    assert result is not None
+    assert result["name"] == "main-coordinator"
+
+
+def test_set_name_returns_none_when_not_registered(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "unregistered")
+    assert set_name(name="anything") is None

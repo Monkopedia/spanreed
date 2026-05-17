@@ -82,20 +82,28 @@ class TestRegistry:
         )
         assert agent.agent_id == "agent-fixed"
 
-    def test_register_upserts_on_existing_id(self, store: StateStore) -> None:
+    def test_register_upsert_refreshes_only_pid_and_last_seen(self, store: StateStore) -> None:
+        """Re-registering an existing agent_id preserves name/working_dir/focus
+        and only refreshes pid + last_seen. This keeps in-session customizations
+        (manual rename, focus) sticky across session restarts."""
         first = store.register_agent(
-            name="alice-old", working_dir="/x", pid=os.getpid(), agent_id="agent-fixed"
+            name="alice-old", working_dir="/x", pid=12345, agent_id="agent-fixed"
         )
         time.sleep(0.01)
         second = store.register_agent(
-            name="alice-new", working_dir="/y", pid=os.getpid(), agent_id="agent-fixed"
+            name="alice-new",
+            working_dir="/y",
+            pid=67890,
+            agent_id="agent-fixed",
         )
         assert second.agent_id == first.agent_id
-        agents = store.list_agents()
-        matching = [a for a in agents if a.agent_id == "agent-fixed"]
+        matching = [a for a in store.list_agents(include_stale=True) if a.agent_id == "agent-fixed"]
         assert len(matching) == 1
-        assert matching[0].name == "alice-new"
-        assert matching[0].working_dir == "/y"
+        # Preserved.
+        assert matching[0].name == "alice-old"
+        assert matching[0].working_dir == "/x"
+        # Refreshed.
+        assert matching[0].pid == 67890
         assert matching[0].last_seen > first.last_seen
 
 
@@ -157,6 +165,42 @@ class TestFocus:
             name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
         )
         assert agent.focus is None
+
+
+# ----------------------------------------------------------------- name
+
+
+class TestSetName:
+    def test_set_name_returns_updated_agent(self, store: StateStore) -> None:
+        store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        updated = store.set_name("agent-alice", "main-coordinator")
+        assert updated is not None
+        assert updated.name == "main-coordinator"
+
+    def test_set_name_persists_in_list(self, store: StateStore) -> None:
+        store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        store.set_name("agent-alice", "renamed")
+        listed = next(a for a in store.list_agents() if a.agent_id == "agent-alice")
+        assert listed.name == "renamed"
+
+    def test_set_name_on_unknown_returns_none(self, store: StateStore) -> None:
+        assert store.set_name("agent-does-not-exist", "whatever") is None
+
+    def test_name_preserved_across_reregister(self, store: StateStore) -> None:
+        store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        store.set_name("agent-alice", "renamed")
+        # Simulate session restart: hook re-registers with derived name.
+        store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-alice"
+        )
+        after = next(a for a in store.list_agents() if a.agent_id == "agent-alice")
+        assert after.name == "renamed"
 
     def test_registry_persists_across_store_instances(self, state_root: Path) -> None:
         s1 = StateStore(root=state_root)

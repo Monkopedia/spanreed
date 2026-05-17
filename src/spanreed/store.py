@@ -121,13 +121,13 @@ class StateStore:
         """Insert or update an agent in the registry. Returns the (refreshed) Agent.
 
         If ``agent_id`` is supplied and already present, the existing entry is
-        replaced (upsert) — used by the plugin so the SessionStart hook and the
-        Monitor can coordinate on a deterministic id without needing to persist
-        it between them. ``focus`` is preserved across upserts (session restarts
-        don't wipe what the agent set last time). If ``agent_id`` is omitted, a
-        fresh random one is generated.
+        refreshed (upsert): **only ``pid`` and ``last_seen`` are updated**.
+        Name, working_dir, and focus are preserved across re-registration —
+        the SessionStart hook fires on every restart and would otherwise wipe
+        any manual rename / focus the agent set last session. If ``agent_id``
+        is omitted, a fresh random one is generated and a new entry is added.
         """
-        agent = Agent(
+        new_entry = Agent(
             agent_id=agent_id if agent_id is not None else _new_id("agent"),
             name=name,
             working_dir=working_dir,
@@ -137,16 +137,31 @@ class StateStore:
         with self._registry_lock():
             agents = self._read_registry_unlocked()
             for i, existing in enumerate(agents):
-                if existing.agent_id == agent.agent_id:
-                    # Preserve focus across re-registration — describes
-                    # what the agent is working on, not session state.
-                    agent.focus = existing.focus
-                    agents[i] = agent
-                    break
-            else:
-                agents.append(agent)
+                if existing.agent_id == new_entry.agent_id:
+                    # Refresh only session-state fields; preserve everything
+                    # the agent may have customized in-session.
+                    existing.pid = new_entry.pid
+                    existing.last_seen = new_entry.last_seen
+                    agents[i] = existing
+                    self._write_registry_unlocked(agents)
+                    return existing
+            agents.append(new_entry)
             self._write_registry_unlocked(agents)
-        return agent
+        return new_entry
+
+    def set_name(self, agent_id: str, name: str) -> Agent | None:
+        """Update an agent's display name. Returns updated Agent, or ``None`` if not registered.
+
+        Persists across re-registration (the SessionStart hook won't overwrite it).
+        """
+        with self._registry_lock():
+            agents = self._read_registry_unlocked()
+            for agent in agents:
+                if agent.agent_id == agent_id:
+                    agent.name = name
+                    self._write_registry_unlocked(agents)
+                    return agent
+            return None
 
     def set_focus(self, agent_id: str, focus: str | None) -> Agent | None:
         """Update an agent's focus. Returns the updated Agent, or ``None`` if not registered.
