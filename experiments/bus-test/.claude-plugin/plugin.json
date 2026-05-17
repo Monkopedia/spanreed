@@ -1,0 +1,8 @@
+{
+  "name": "bus-test",
+  "description": "Tests whether plugin Monitor wakes idle Claude sessions",
+  "version": "0.0.1",
+  "author": {
+    "name": "jmonk"
+  }
+}
