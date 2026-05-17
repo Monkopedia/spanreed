@@ -22,11 +22,20 @@ mcp_app: FastMCP = FastMCP("spanreed")
 
 
 @mcp_app.tool()
-def register_agent(name: str, working_dir: str, pid: int) -> dict[str, object]:
-    """Register this session as an agent on the bus and return the assigned record."""
+def register_agent(
+    name: str,
+    working_dir: str,
+    pid: int,
+    agent_id: str | None = None,
+) -> dict[str, object]:
+    """Register this session as an agent on the bus and return the assigned record.
+
+    If ``agent_id`` is provided and already present, the existing entry is
+    replaced (upsert) — same semantics as the underlying store.
+    """
     return (
         StateStore()
-        .register_agent(name=name, working_dir=working_dir, pid=pid)
+        .register_agent(name=name, working_dir=working_dir, pid=pid, agent_id=agent_id)
         .model_dump(mode="json")
     )
 

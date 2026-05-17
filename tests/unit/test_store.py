@@ -76,6 +76,28 @@ class TestRegistry:
     def test_touch_unknown_is_noop(self, store: StateStore) -> None:
         store.touch_agent("agent-does-not-exist")
 
+    def test_register_with_explicit_id(self, store: StateStore) -> None:
+        agent = store.register_agent(
+            name="alice", working_dir="/x", pid=os.getpid(), agent_id="agent-fixed"
+        )
+        assert agent.agent_id == "agent-fixed"
+
+    def test_register_upserts_on_existing_id(self, store: StateStore) -> None:
+        first = store.register_agent(
+            name="alice-old", working_dir="/x", pid=os.getpid(), agent_id="agent-fixed"
+        )
+        time.sleep(0.01)
+        second = store.register_agent(
+            name="alice-new", working_dir="/y", pid=os.getpid(), agent_id="agent-fixed"
+        )
+        assert second.agent_id == first.agent_id
+        agents = store.list_agents()
+        matching = [a for a in agents if a.agent_id == "agent-fixed"]
+        assert len(matching) == 1
+        assert matching[0].name == "alice-new"
+        assert matching[0].working_dir == "/y"
+        assert matching[0].last_seen > first.last_seen
+
     def test_registry_persists_across_store_instances(self, state_root: Path) -> None:
         s1 = StateStore(root=state_root)
         agent = s1.register_agent(name="alice", working_dir="/x", pid=os.getpid())

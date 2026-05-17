@@ -111,10 +111,23 @@ class StateStore:
         tmp.write_text(_RegistryDoc(agents=agents).model_dump_json(indent=2))
         tmp.replace(self._registry_path)
 
-    def register_agent(self, name: str, working_dir: str, pid: int) -> Agent:
-        """Add a new agent to the registry and return it."""
+    def register_agent(
+        self,
+        name: str,
+        working_dir: str,
+        pid: int,
+        agent_id: str | None = None,
+    ) -> Agent:
+        """Insert or update an agent in the registry. Returns the (refreshed) Agent.
+
+        If ``agent_id`` is supplied and already present, the existing entry is
+        replaced (upsert) — used by the plugin so the SessionStart hook and the
+        Monitor can coordinate on a deterministic id without needing to persist
+        it between them. If ``agent_id`` is omitted, a fresh random one is
+        generated.
+        """
         agent = Agent(
-            agent_id=_new_id("agent"),
+            agent_id=agent_id if agent_id is not None else _new_id("agent"),
             name=name,
             working_dir=working_dir,
             pid=pid,
@@ -122,7 +135,12 @@ class StateStore:
         )
         with self._registry_lock():
             agents = self._read_registry_unlocked()
-            agents.append(agent)
+            for i, existing in enumerate(agents):
+                if existing.agent_id == agent.agent_id:
+                    agents[i] = agent
+                    break
+            else:
+                agents.append(agent)
             self._write_registry_unlocked(agents)
         return agent
 

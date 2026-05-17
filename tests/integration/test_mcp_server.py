@@ -39,6 +39,25 @@ def test_register_then_list(mcp_env: None) -> None:
     assert any(a["agent_id"] == agent["agent_id"] for a in agents)
 
 
+def test_register_with_explicit_id_upserts(mcp_env: None) -> None:
+    first = register_agent(
+        name="alice-old",
+        working_dir="/tmp/x",
+        pid=os.getpid(),
+        agent_id="agent-fixed",
+    )
+    second = register_agent(
+        name="alice-new",
+        working_dir="/tmp/y",
+        pid=os.getpid(),
+        agent_id="agent-fixed",
+    )
+    assert second["agent_id"] == first["agent_id"]
+    matching = [a for a in list_agents() if a["agent_id"] == "agent-fixed"]
+    assert len(matching) == 1
+    assert matching[0]["name"] == "alice-new"
+
+
 def test_deregister_returns_ok(mcp_env: None) -> None:
     agent = register_agent(name="alice", working_dir="/tmp/x", pid=os.getpid())
     result = deregister_agent(agent_id=str(agent["agent_id"]))
