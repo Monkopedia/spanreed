@@ -4,6 +4,7 @@ Things still to test, design, or decide.
 
 ## Behavioral / empirical
 
+- **Monitor exit-warning UX**: a plugin Monitor shows up as "1 monitor still running" in the status line and triggers a "background work in progress" warning on session exit. There's no documented way to mark a monitor as essential infrastructure that should be quietly ignored on exit (no `essential` / `silent` / `quiet` field; no settings override). For an always-on bus, this gets annoying. Options: file `/feedback` asking Anthropic for the flag, or investigate whether MCP server-initiated notifications can replace Monitor as the wake mechanism (avoids the warning entirely, but unclear if Claude Code wakes on them).
 - **Multi-message delivery**: if N messages arrive between Claude's turns, do all N surface or do they coalesce / drop?
 - **Mid-typing behavior**: what happens to a notification fired while the human is mid-typing a prompt?
 - **Stop hook + `additionalContext`**: could a Stop hook surface "you have pending bus messages" at natural turn boundaries as a complement to the Monitor signal?
