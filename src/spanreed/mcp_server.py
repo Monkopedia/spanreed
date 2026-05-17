@@ -12,12 +12,36 @@ environment variable.
 
 from __future__ import annotations
 
+import os
+import traceback
+from datetime import UTC, datetime
+
 from anyio import to_thread
 from mcp.server.fastmcp import FastMCP
 
 from spanreed.identity import derive_agent_identity
 from spanreed.protocol import Message
-from spanreed.store import StateStore
+from spanreed.store import StateStore, default_state_root
+
+
+def _log(event: str, **fields: object) -> None:
+    """Append a single line to ``~/.claude/spanreed/logs/spanreed-mcp.log``.
+
+    Never raises — if logging fails (disk full, permissions, etc.), we'd rather
+    keep the server running than crash for an observability reason.
+    """
+    try:
+        log_dir = default_state_root() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(UTC).isoformat()
+        parts = [f"{ts}", f"pid={os.getpid()}", f"event={event}"]
+        parts.extend(f"{k}={v}" for k, v in fields.items())
+        line = " ".join(parts) + "\n"
+        with (log_dir / "spanreed-mcp.log").open("a") as f:
+            f.write(line)
+    except Exception:
+        pass
+
 
 mcp_app: FastMCP = FastMCP("spanreed")
 
@@ -192,8 +216,31 @@ async def request_focus_update(
 
 
 def main() -> None:
-    """Entry point for the ``spanreed-mcp`` console script."""
-    mcp_app.run()
+    """Entry point for the ``spanreed-mcp`` console script.
+
+    Wraps the FastMCP stdio loop with crash logging so we can tell after the
+    fact whether the process died of its own accord (uncaught exception) or
+    was shut down externally (Claude Code sent EOF / SIGTERM).
+    """
+    _log("startup")
+    try:
+        mcp_app.run()
+    except SystemExit as e:
+        _log("shutdown", reason="SystemExit", code=e.code)
+        raise
+    except KeyboardInterrupt:
+        _log("shutdown", reason="KeyboardInterrupt")
+        raise
+    except BaseException as e:
+        _log(
+            "crash",
+            type=type(e).__name__,
+            message=str(e).replace("\n", "\\n")[:200],
+            traceback=traceback.format_exc().replace("\n", "\\n"),
+        )
+        raise
+    else:
+        _log("shutdown", reason="clean")
 
 
 if __name__ == "__main__":
