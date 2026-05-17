@@ -1,0 +1,6 @@
+{
+  "name": "spanreed-bob",
+  "description": "Cross-session bus test — identifies this Claude Code session as agent 'bob'",
+  "version": "0.0.1",
+  "author": { "name": "jmonk" }
+}
