@@ -8,24 +8,37 @@ Named after the [spanreed](https://stormlightarchive.fandom.com/wiki/Spanreed): 
 
 ## Install
 
-Once published (not yet on PyPI):
+Install the bus tooling from PyPI:
 
 ```bash
 uv tool install spanreed-bus
-claude /plugin marketplace add Monkopedia/spanreed
-claude /plugin install spanreed@spanreed
 ```
 
-For now, from a local clone:
+Then launch `claude` in any directory and run these two slash commands at the prompt:
+
+```
+/plugin marketplace add Monkopedia/spanreed
+/plugin install spanreed@spanreed
+```
+
+The MCP server (`spanreed-mcp`) and CLI (`spanreed`) need to be on `$PATH` for the plugin to find them — `uv tool install` handles this.
+
+### Developing on spanreed
+
+For hacking on spanreed itself, install from a local clone:
 
 ```bash
 git clone git@github.com:Monkopedia/spanreed.git
 cd spanreed
 uv tool install --editable .
-claude /plugin install $(pwd)/plugins/spanreed --scope user
 ```
 
-The MCP server (`spanreed-mcp`) and CLI (`spanreed`) need to be on `$PATH` for the plugin to find them — `uv tool install` handles this.
+Then in Claude Code, point the marketplace at your clone instead of GitHub:
+
+```
+/plugin marketplace add /absolute/path/to/spanreed
+/plugin install spanreed@spanreed
+```
 
 ## Quickstart
 
@@ -58,9 +71,16 @@ Read the full design in [`docs/architecture.md`](docs/architecture.md). Wire-for
 
 ## Update
 
+The Python package and the plugin update independently:
+
 ```bash
 uv tool upgrade spanreed-bus
-claude /plugin update spanreed@spanreed
+```
+
+For the plugin, inside Claude Code:
+
+```
+/plugin update spanreed@spanreed
 ```
 
 ## Development
