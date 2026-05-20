@@ -24,13 +24,18 @@ cursors/<session_id>    per-session "last-seen msg_id" marker
       "name": "...",
       "working_dir": "/path",
       "pid": 12345,
+      "pid_start": 8675309,
       "last_seen": "2026-05-17T15:00:00Z"
     }
   ]
 }
 ```
 
-Rewritten atomically on every change. Stale entries (PID dead OR `last_seen` older than threshold) get pruned on read.
+Rewritten atomically on every change.
+
+**Liveness / staleness.** An agent is *present* iff its `pid` is alive **and** that PID's start-time still matches the `pid_start` captured at registration. Stale entries (PID dead, or PID recycled onto an unrelated process so the start-time no longer matches) get filtered on read and pruned by `prune_stale`. `pid_start` is the process start-time (Linux: clock ticks since boot, from `/proc/<pid>/stat` field 22); it's the guard against PID reuse. When it can't be read (no `/proc`, e.g. macOS) it is `null`, and liveness falls back to a bare PID-alive check.
+
+There is **no `last_seen` TTL**: agents do not heartbeat on a timer (wasteful wakeups), so a live-but-quiet agent is never flagged stale. `last_seen` is retained as informational metadata (when the agent last registered/renewed), not as a liveness signal.
 
 ### `inboxes/<agent_id>.jsonl`
 
@@ -82,7 +87,7 @@ Both the SessionStart hook and the Monitor compute identity the same way, so the
 
 **Renaming after the fact**: the cwd-derived name is often unhelpful (e.g. "git" when cwd is `~/git`). Agents can call `set_name` (MCP) or `spanreed name "..."` (CLI) at any time to set a more descriptive display name. The `agent_id` doesn't change, so message routing keeps working. Renames persist across session restarts thanks to the upsert-preserve behavior in `register_agent`.
 
-**`register_agent` upsert semantics**: when called with an already-registered `agent_id`, only `pid` and `last_seen` are updated; `name`, `working_dir`, and `focus` are preserved. This is what makes in-session customizations (set_name, set_focus) sticky across the SessionStart hook firing on every restart.
+**`register_agent` upsert semantics**: when called with an already-registered `agent_id`, only `pid`, `pid_start`, and `last_seen` are updated; `name`, `working_dir`, and `focus` are preserved. This is what makes in-session customizations (set_name, set_focus) sticky across the SessionStart hook firing on every restart.
 
 ## CLI surface
 

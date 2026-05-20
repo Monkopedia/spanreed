@@ -49,6 +49,8 @@ The plugin also runs:
 - A `SessionStart` hook to register the agent into the bus.
 - A `Stop` hook (or PID-based liveness in the daemon) to deregister.
 
+**Liveness model.** Presence is PID-based, not heartbeat-based: an agent is live iff its registered PID is alive *and* that PID's start-time matches what was captured at registration. The start-time match is what makes "trust the PID" safe — it catches the case where the agent died and the OS recycled its PID onto an unrelated process. We deliberately avoid a `last_seen` TTL / timer-driven heartbeat: waking idle agents just to refresh a timestamp is wasteful, and a quiet-but-alive agent must never be reported as gone. (Start-time is unavailable without `/proc`, e.g. on macOS; there we fall back to a bare PID-alive check and accept the small reuse risk.)
+
 ## Trust model
 
 Critical and non-obvious. Three distinct trust levels in play:

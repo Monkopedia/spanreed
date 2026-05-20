@@ -19,7 +19,7 @@ import os
 import secrets
 import time
 from collections.abc import Generator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -32,11 +32,6 @@ class _RegistryDoc(BaseModel):
 
     agents: list[Agent]
 
-
-STALE_TTL = timedelta(hours=1)
-"""Agents whose ``last_seen`` is older than this are treated as stale even if
-their PID is still alive. Backstop against PID reuse for very long-lived
-listeners that never call ``touch_agent``."""
 
 _DEFAULT_POLL_INTERVAL_S = 0.1
 
@@ -65,11 +60,50 @@ def _is_pid_alive(pid: int) -> bool:
     return True
 
 
-def is_stale(agent: Agent, now: datetime, ttl: timedelta = STALE_TTL) -> bool:
-    """True if the agent should be treated as no longer present on the bus."""
+def pid_start_time(pid: int) -> int | None:
+    """Start-time of ``pid`` (Linux: clock ticks since boot), or ``None``.
+
+    Read from field 22 of ``/proc/<pid>/stat``. Used to distinguish a live
+    agent from an unrelated process that recycled its PID after the agent
+    died. Returns ``None`` when unavailable — the process is already gone, or
+    there's no ``/proc`` (e.g. macOS) — and callers then fall back to a bare
+    PID-alive check.
+    """
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # comm (field 2) is parenthesized and may itself contain spaces or
+    # parens, so split after the FINAL ')'. The remainder begins at field 3
+    # (state), making starttime (field 22) index 19 of the split.
+    try:
+        after = data[data.rindex(")") + 2 :].split()
+        return int(after[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def is_stale(agent: Agent) -> bool:
+    """True if the agent should be treated as no longer present on the bus.
+
+    Liveness is PID-based: an agent is present iff its recorded PID is alive
+    AND that PID's start-time still matches what was captured at registration.
+    The start-time check guards against PID reuse — without it, an unrelated
+    process that recycled a dead agent's PID would read as alive forever.
+
+    There is deliberately NO activity/last_seen TTL: agents don't heartbeat on
+    a timer (wasteful wakeups), so a live-but-quiet agent must not be flagged
+    stale merely for not having sent anything recently.
+
+    When the recorded start-time is ``None`` (couldn't be read at register, as
+    on macOS), we trust the bare PID-alive check and accept the small reuse
+    risk.
+    """
     if not _is_pid_alive(agent.pid):
         return True
-    return now - agent.last_seen > ttl
+    if agent.pid_start is None:
+        return False
+    return pid_start_time(agent.pid) != agent.pid_start
 
 
 class StateStore:
@@ -132,6 +166,7 @@ class StateStore:
             name=name,
             working_dir=working_dir,
             pid=pid,
+            pid_start=pid_start_time(pid),
             last_seen=datetime.now(UTC),
         )
         with self._registry_lock():
@@ -141,6 +176,7 @@ class StateStore:
                     # Refresh only session-state fields; preserve everything
                     # the agent may have customized in-session.
                     existing.pid = new_entry.pid
+                    existing.pid_start = new_entry.pid_start
                     existing.last_seen = new_entry.last_seen
                     agents[i] = existing
                     self._write_registry_unlocked(agents)
@@ -192,15 +228,13 @@ class StateStore:
             agents = self._read_registry_unlocked()
         if include_stale:
             return agents
-        now = datetime.now(UTC)
-        return [a for a in agents if not is_stale(a, now)]
+        return [a for a in agents if not is_stale(a)]
 
     def prune_stale(self) -> int:
         """Permanently remove stale agents from the registry. Returns count removed."""
-        now = datetime.now(UTC)
         with self._registry_lock():
             agents = self._read_registry_unlocked()
-            live = [a for a in agents if not is_stale(a, now)]
+            live = [a for a in agents if not is_stale(a)]
             removed = len(agents) - len(live)
             if removed:
                 self._write_registry_unlocked(live)

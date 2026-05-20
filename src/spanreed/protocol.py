@@ -26,8 +26,20 @@ class Agent(BaseModel):
     pid: int
     """OS process id of the owning Claude Code session, for liveness checks."""
 
+    pid_start: int | None = None
+    """Start-time of ``pid`` captured at registration (Linux: clock ticks since
+    boot, from ``/proc/<pid>/stat``). Used to detect PID reuse — if the agent
+    dies and the OS recycles its PID onto an unrelated process, the start-time
+    won't match, so liveness checks can tell the agent is actually gone.
+
+    ``None`` when the start-time couldn't be read (e.g. no ``/proc``, as on
+    macOS); liveness then falls back to a bare PID-alive check.
+    """
+
     last_seen: datetime
-    """Last time the agent renewed its presence in the registry."""
+    """Last time the agent renewed its presence in the registry (set on
+    register/upsert). Informational only — liveness is PID-based, not
+    last_seen-based, so a quiet-but-alive agent is never flagged stale."""
 
     focus: str | None = None
     """Optional self-set description of what the agent is currently working on.

@@ -6,7 +6,7 @@ import os
 import subprocess
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 from spanreed import store as store_module
@@ -75,6 +75,10 @@ class TestRegistry:
 
     def test_touch_unknown_is_noop(self, store: StateStore) -> None:
         store.touch_agent("agent-does-not-exist")
+
+    def test_register_captures_pid_start(self, store: StateStore) -> None:
+        agent = store.register_agent(name="alice", working_dir="/x", pid=os.getpid())
+        assert agent.pid_start == store_module.pid_start_time(os.getpid())
 
     def test_register_with_explicit_id(self, store: StateStore) -> None:
         agent = store.register_agent(
@@ -209,7 +213,7 @@ class TestSetName:
         assert any(a.agent_id == agent.agent_id for a in s2.list_agents())
 
 
-# ----------------------------------------------------------------- staleness via TTL
+# ----------------------------------------------------------------- staleness via PID identity
 
 
 class TestStaleness:
@@ -219,29 +223,58 @@ class TestStaleness:
             name="x",
             working_dir="/x",
             pid=_dead_pid(),
+            pid_start=store_module.pid_start_time(os.getpid()),
             last_seen=datetime.now(UTC),
         )
-        assert store_module.is_stale(agent, datetime.now(UTC))
+        assert store_module.is_stale(agent)
 
-    def test_stale_if_last_seen_too_old(self) -> None:
+    def test_stale_if_pid_reused(self) -> None:
+        """PID is alive, but the recorded start-time doesn't match — i.e. the
+        original agent died and an unrelated process recycled its PID."""
         agent = Agent(
             agent_id="x",
             name="x",
             working_dir="/x",
             pid=os.getpid(),
-            last_seen=datetime.now(UTC) - timedelta(hours=2),
+            pid_start=1,  # bogus: real start-time is clock-ticks-since-boot, never 1
+            last_seen=datetime.now(UTC),
         )
-        assert store_module.is_stale(agent, datetime.now(UTC))
+        assert store_module.is_stale(agent)
 
-    def test_fresh_with_live_pid(self) -> None:
+    def test_fresh_with_live_pid_matching_start(self) -> None:
         agent = Agent(
             agent_id="x",
             name="x",
             working_dir="/x",
             pid=os.getpid(),
+            pid_start=store_module.pid_start_time(os.getpid()),
             last_seen=datetime.now(UTC),
         )
-        assert not store_module.is_stale(agent, datetime.now(UTC))
+        assert not store_module.is_stale(agent)
+
+    def test_live_pid_without_start_time_is_not_stale(self) -> None:
+        """Degradation path (no /proc, e.g. macOS): trust the bare PID check
+        rather than flagging every agent stale."""
+        agent = Agent(
+            agent_id="x",
+            name="x",
+            working_dir="/x",
+            pid=os.getpid(),
+            pid_start=None,
+            last_seen=datetime.now(UTC),
+        )
+        assert not store_module.is_stale(agent)
+
+    def test_stale_when_no_start_time_and_pid_dead(self) -> None:
+        agent = Agent(
+            agent_id="x",
+            name="x",
+            working_dir="/x",
+            pid=_dead_pid(),
+            pid_start=None,
+            last_seen=datetime.now(UTC),
+        )
+        assert store_module.is_stale(agent)
 
 
 # ----------------------------------------------------------------- inboxes
