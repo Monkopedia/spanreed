@@ -8,12 +8,15 @@ agents mirror across and messages flow in both directions.
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
+from unittest.mock import MagicMock
 
-from spanreed.bridge import Bridge
+from spanreed.bridge import Bridge, reconnect_loop
 from spanreed.store import StateStore
 
 
@@ -118,3 +121,71 @@ def test_bridge_clears_mirrored_agents_on_teardown(tmp_path: Path) -> None:
     ta.join(timeout=2)
     tb.join(timeout=2)
     assert not any(a.agent_id == "agent-bob@hostB" for a in store_a.list_agents(include_stale=True))
+
+
+# ----------------------------------------------- reconnect loop (injected seams)
+
+
+def _fake_proc() -> subprocess.Popen[bytes]:
+    return cast("subprocess.Popen[bytes]", MagicMock())
+
+
+def test_reconnect_loop_respawns_until_max(tmp_path: Path) -> None:
+    store = StateStore(root=tmp_path)
+    spawns: list[list[str]] = []
+    waits: list[float] = []
+
+    def spawn(argv: list[str]) -> subprocess.Popen[bytes]:
+        spawns.append(argv)
+        return _fake_proc()
+
+    def run_once(
+        proc: subprocess.Popen[bytes], label: str, store_: StateStore, holder: list[Bridge | None]
+    ) -> float:
+        return 0.0  # never healthy → backoff keeps growing
+
+    rc = reconnect_loop(
+        ["peer"],
+        "local",
+        store,
+        max_reconnects=3,
+        install_signals=False,
+        spawn=spawn,
+        run_once=run_once,
+        wait=waits.append,
+    )
+    assert rc == 0
+    assert len(spawns) == 3  # respawned up to the cap
+    assert len(waits) == 2  # waited between the three attempts
+    assert waits[1] > waits[0]  # exponential backoff grew
+
+
+def test_reconnect_loop_stops_on_shutdown(tmp_path: Path) -> None:
+    store = StateStore(root=tmp_path)
+    shutdown = threading.Event()
+    spawns: list[list[str]] = []
+
+    def spawn(argv: list[str]) -> subprocess.Popen[bytes]:
+        spawns.append(argv)
+        return _fake_proc()
+
+    def run_once(
+        proc: subprocess.Popen[bytes], label: str, store_: StateStore, holder: list[Bridge | None]
+    ) -> float:
+        shutdown.set()  # simulate SIGTERM landing mid-connection
+        return 0.0
+
+    def no_wait(_d: float) -> None:
+        raise AssertionError("must not back off after shutdown")
+
+    reconnect_loop(
+        ["peer"],
+        "local",
+        store,
+        install_signals=False,
+        shutdown=shutdown,
+        spawn=spawn,
+        run_once=run_once,
+        wait=no_wait,
+    )
+    assert len(spawns) == 1  # broke immediately after the first run

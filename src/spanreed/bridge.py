@@ -9,20 +9,24 @@ persistent duplex pipe (``spanreed conjoin <host>`` spawns ``spanreed conjoin
 - delivers messages arriving over the pipe into local inboxes,
 - mirrors the peer's live agents into the local registry (as ``<id>@<peer>``).
 
-Status: prototype. Point-to-point only; reconnect is not yet implemented
-(EOF on the pipe tears the bridge down cleanly).
+Status: prototype. Point-to-point only. ``conjoin`` reconnects with backoff
+when the pipe dies (foreground command — supervision is the user's job);
+multi-hop routing and peer-host discovery are out of scope for now.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import shlex
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from typing import IO
 
 from spanreed.protocol import Agent, Message
@@ -52,6 +56,7 @@ class Bridge:
         *,
         poll_interval: float = 0.5,
         sync_interval: float = 3.0,
+        recv_timeout: float | None = None,
     ) -> None:
         self._read = read
         self._write = write
@@ -59,9 +64,13 @@ class Bridge:
         self.store = store
         self.poll_interval = poll_interval
         self.sync_interval = sync_interval
+        # Watchdog: if no frame (incl. the peer's pings) arrives within this
+        # window, treat the pipe as dead even if it hasn't surfaced EOF.
+        self.recv_timeout = recv_timeout if recv_timeout is not None else sync_interval * 5
         self.peer_host: str | None = None
         self._stop = threading.Event()
         self._hello = threading.Event()
+        self._last_recv = time.monotonic()
         self._my_pid = os.getpid()
         self._my_pid_start = pid_start_time(self._my_pid)
 
@@ -96,6 +105,7 @@ class Bridge:
                 kind = frame.get("kind")
             except (json.JSONDecodeError, AttributeError):
                 continue
+            self._last_recv = time.monotonic()  # any frame proves the pipe is alive
             if kind == "hello":
                 self.peer_host = str(frame["host"])
                 self._hello.set()
@@ -138,13 +148,16 @@ class Bridge:
         local = [a for a in self.store.list_agents() if "@" not in a.agent_id]
         self._send({"kind": "registry", "agents": [a.model_dump(mode="json") for a in local]})
 
-    def run(self) -> None:
+    def run(self) -> float:
+        """Run until the pipe dies or :meth:`stop` is called. Returns uptime (s)."""
+        started = time.monotonic()
         self._send({"kind": "hello", "host": self.self_host})
         reader = threading.Thread(target=self._reader, daemon=True)
         reader.start()
         if not self._hello.wait(timeout=15.0):
             self._stop.set()
-            return
+            return time.monotonic() - started
+        self._last_recv = time.monotonic()
         self._send_registry()
         last_sync = time.monotonic()
         try:
@@ -155,10 +168,14 @@ class Bridge:
                     self._send_registry()
                     self._send({"kind": "ping"})
                     last_sync = now
+                if now - self._last_recv > self.recv_timeout:
+                    self._stop.set()  # watchdog: peer went silent
+                    break
                 self._stop.wait(timeout=self.poll_interval)
         finally:
             if self.peer_host is not None:
                 self.store.clear_remote_agents(self.peer_host)
+        return time.monotonic() - started
 
 
 def serve(self_host: str | None = None) -> int:
@@ -175,33 +192,128 @@ def connect(
     self_host: str | None = None,
     remote_spanreed: str | None = None,
     exec_cmd: str | None = None,
+    max_reconnects: int | None = None,
 ) -> int:
-    """Run the ``connect`` end: spawn the peer's ``serve`` and bridge to it.
+    """Run the ``connect`` end: bridge to a peer, reconnecting if the pipe dies.
 
-    ``exec_cmd`` overrides how the peer process is launched (used for local
-    testing without SSH). Otherwise the peer is launched over SSH; the remote
+    Runs in the foreground forever (until SIGINT/SIGTERM), re-establishing the
+    SSH pipe with exponential backoff whenever it drops. Supervision (start on
+    boot, restart on crash) is intentionally left to the user — wrap this in
+    systemd/launchd/tmux if you want a service.
+
+    ``exec_cmd`` overrides how the peer process is launched (for local testing
+    without SSH). Otherwise the peer is launched over SSH; the remote
     ``spanreed`` path is given by ``remote_spanreed`` or probed via a login
-    shell.
+    shell. ``max_reconnects`` bounds the retries (``None`` = forever).
     """
     label = self_host or socket.gethostname()
     if exec_cmd is not None:
         argv = ["sh", "-c", exec_cmd]
     else:
         remote = remote_spanreed or _probe_remote_spanreed(host)
-        remote_invocation = f"{shlex.quote(remote)} conjoin --serve"
-        argv = ["ssh", host, remote_invocation]
-    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    assert proc.stdin is not None and proc.stdout is not None
+        argv = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            # Surface a dead/half-open pipe as EOF within ~15s instead of hanging.
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=3",
+            host,
+            f"{shlex.quote(remote)} conjoin --serve",
+        ]
     store = StateStore()
+    return reconnect_loop(argv, label, store, max_reconnects=max_reconnects)
+
+
+_BASE_BACKOFF = 1.0
+_MAX_BACKOFF = 30.0
+_HEALTHY_UPTIME = 30.0  # a connection lasting this long resets the backoff
+
+
+def _spawn_peer(argv: list[str]) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+
+def _run_bridge_once(
+    proc: subprocess.Popen[bytes],
+    label: str,
+    store: StateStore,
+    holder: list[Bridge | None],
+) -> float:
+    """Bridge over one spawned peer process until the pipe dies. Returns uptime."""
+    assert proc.stdin is not None and proc.stdout is not None
+    bridge = Bridge(proc.stdout, proc.stdin, label, store)
+    holder[0] = bridge
     try:
-        Bridge(proc.stdout, proc.stdin, label, store).run()
+        return bridge.run()
     finally:
+        holder[0] = None
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def reconnect_loop(
+    argv: list[str],
+    label: str,
+    store: StateStore,
+    *,
+    max_reconnects: int | None = None,
+    install_signals: bool = True,
+    shutdown: threading.Event | None = None,
+    spawn: Callable[[list[str]], subprocess.Popen[bytes]] | None = None,
+    run_once: Callable[[subprocess.Popen[bytes], str, StateStore, list[Bridge | None]], float]
+    | None = None,
+    wait: Callable[[float], object] | None = None,
+) -> int:
+    """Spawn → bridge → (on death) backoff → respawn, until shutdown.
+
+    The ``spawn``/``run_once``/``wait``/``shutdown`` seams are injectable for
+    testing; the defaults use real subprocesses and a shutdown-interruptible
+    sleep.
+    """
+    spawn = spawn or _spawn_peer
+    run_once = run_once or _run_bridge_once
+    shutdown = shutdown if shutdown is not None else threading.Event()
+    holder: list[Bridge | None] = [None]
+    waiter = wait if wait is not None else shutdown.wait
+
+    if install_signals:
+        _install_signal_handlers(shutdown, holder)
+
+    backoff = _BASE_BACKOFF
+    attempts = 0
+    while not shutdown.is_set():
+        proc = spawn(argv)
+        uptime = run_once(proc, label, store, holder)
+        if shutdown.is_set():
+            break
+        attempts += 1
+        if max_reconnects is not None and attempts >= max_reconnects:
+            break
+        backoff = _BASE_BACKOFF if uptime >= _HEALTHY_UPTIME else min(backoff * 2, _MAX_BACKOFF)
+        waiter(backoff + backoff * 0.5 * random.random())  # jittered
     return 0
+
+
+def _install_signal_handlers(shutdown: threading.Event, holder: list[Bridge | None]) -> None:
+    """Best-effort SIGINT/SIGTERM → clean shutdown. No-op off the main thread."""
+
+    def _handler(_signum: int, _frame: object) -> None:
+        shutdown.set()
+        bridge = holder[0]
+        if bridge is not None:
+            bridge.stop()
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+        signal.signal(signal.SIGTERM, _handler)
+    except ValueError:
+        pass  # not the main thread — caller drives shutdown another way
 
 
 def _probe_remote_spanreed(host: str) -> str:

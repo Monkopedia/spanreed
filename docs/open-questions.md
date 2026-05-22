@@ -31,14 +31,15 @@ Design lives in [`architecture.md`](architecture.md) (SSH bus-bridge) and [`prot
 - **Auth**: key-based / non-interactive SSH required (the bridge reconnects unattended).
 - **Per-host install**: `spanreed` must be installed on every bridged host.
 - **Trust boundary**: SSH access to a host grants full read/write to that host's entire bus (the bridge can inject into any local inbox). Intended under the single-user assumption, but stated explicitly.
+- **Reconnect**: `spanreed conjoin` is a foreground command that re-establishes the pipe with exponential backoff + jitter when it drops. Death is detected via EOF, SSH keepalive (`ServerAliveInterval`), and a receive-side watchdog (no frame within `recv_timeout`). SIGINT/SIGTERM tear down cleanly (clear mirrored entries, kill the SSH child). Supervision (start-on-boot, restart-on-crash) is deliberately **out of scope** — wrap it in systemd/launchd/tmux if you want a service.
+- **Delivery across a drop**: at-least-once. Outbound advances the `*@peer` cursor only after a confirmed send (no loss); `append_message` dedupes by `msg_id` on delivery (no double-delivery on resend). Validated: a serve killed repeatedly drops then re-mirrors its agents as the bridge respawns.
 
 Still open:
 
 - **Multi-hop / transitive routing** (B reaching C through A): deferred. v1 is point-to-point only.
 - **Peer-host discovery**: v1 launches bridges manually per pair. A peer-host config/list is future work.
-- **Reconnect policy**: backoff schedule, and what (if anything) to surface to agents when a peer goes away vs. comes back.
+- **Peer up/down signal to agents**: when a peer connects or drops, should local agents be *notified* (a bus event), or only observe it via `list_agents`? Currently the latter.
 - **Registry-sync cadence**: poll interval / change-detection for the `registry` frame; tradeoff between freshness and chatter.
-- **Cursor semantics on bridge restart**: confirm the `*@peer` inbox cursors give exactly-once-ish forwarding without re-sending the backlog or dropping messages mid-restart.
 - **`@host` UX in `list_agents`**: how qualified ids and "this peer is via bridge" surface to the user (per the visibility-over-hiding principle).
 
 ## Out-of-scope (for now)

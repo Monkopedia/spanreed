@@ -118,6 +118,12 @@ Global identity is `agent-X@homehost`; on its home host the agent is the bare `a
 - The remote `spanreed` is invoked by **absolute path**, because a non-interactive SSH command gets a stripped `$PATH` (`~/.local/bin` is typically added in `.zshrc`, which login/non-interactive shells don't source). The `connect` side discovers the path once via an interactive-shell probe — `ssh host 'zsh -ic "command -v spanreed"'` returns the bare path cleanly — then launches `serve` by that path.
 - **Key-based (non-interactive) auth is required**: the bridge re-establishes itself without a human present, so it can't answer a password prompt.
 
+### Reconnect
+
+`spanreed conjoin <host>` is a long-lived **foreground** command. When the pipe drops it re-establishes it with exponential backoff + jitter (a connection that stays up long enough resets the backoff). A dead pipe is detected three ways: EOF on the SSH child, SSH keepalive (`ServerAliveInterval`), and a receive-side watchdog (no frame — not even the peer's pings — within `recv_timeout`). SIGINT/SIGTERM tear down cleanly: clear the mirrored `@peer` entries and kill the SSH child.
+
+Delivery across a drop is **at-least-once**: the outbound cursor advances only after a confirmed send (nothing lost), and delivery dedupes by `msg_id` (nothing double-delivered on resend). **Supervision is deliberately out of scope** — `conjoin` restarts the *pipe*, not itself. If you want it to survive reboots or crashes, wrap it in systemd/launchd/tmux.
+
 ### Scope (v1)
 
 Point-to-point: two machines, one direct bridge, launched manually per pair. Transitive/multi-hop routing (B reaching C through A) and auto-discovery of peer hosts are deferred — see `open-questions.md`.

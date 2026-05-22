@@ -216,6 +216,7 @@ def _cmd_conjoin(args: argparse.Namespace) -> int:
         self_host=args.label,
         remote_spanreed=args.remote_spanreed,
         exec_cmd=args.exec_cmd,
+        max_reconnects=args.max_reconnects,
     )
 
 
@@ -315,6 +316,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--exec",
         dest="exec_cmd",
         help="Override peer launch command (for local testing; bypasses SSH)",
+    )
+    p_conjoin.add_argument(
+        "--max-reconnects",
+        type=int,
+        default=None,
+        help="Give up after this many reconnect attempts (default: retry forever)",
     )
 
     return parser
