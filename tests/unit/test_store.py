@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from spanreed import store as store_module
-from spanreed.protocol import Agent
+from spanreed.protocol import Agent, Message
 from spanreed.store import StateStore
 
 
@@ -275,6 +275,100 @@ class TestStaleness:
             last_seen=datetime.now(UTC),
         )
         assert store_module.is_stale(agent)
+
+
+# ------------------------------------------------------- cross-host bridge primitives
+
+
+class TestBridgePrimitives:
+    def _msg(
+        self, msg_id: str, to_agent: str = "agent-bob", in_reply_to: str | None = None
+    ) -> Message:
+        return Message(
+            msg_id=msg_id,
+            from_agent="agent-alice@hostA",
+            to_agent=to_agent,
+            body="hi",
+            ts=datetime.now(UTC),
+            in_reply_to=in_reply_to,
+        )
+
+    def test_append_message_preserves_fields(self, store: StateStore) -> None:
+        store.append_message(self._msg("msg-fixed", in_reply_to="msg-prev"))
+        got = store.recv_messages("agent-bob")
+        assert len(got) == 1
+        assert got[0].msg_id == "msg-fixed"
+        assert got[0].from_agent == "agent-alice@hostA"
+        assert got[0].in_reply_to == "msg-prev"
+
+    def test_append_message_dedupes_by_id(self, store: StateStore) -> None:
+        store.append_message(self._msg("msg-dup"))
+        store.append_message(self._msg("msg-dup"))
+        assert len(store.recv_messages("agent-bob")) == 1
+
+    def test_sync_remote_agents_mirrors_with_owner_pid(self, store: StateStore) -> None:
+        remote = Agent(
+            agent_id="agent-x",
+            name="x",
+            working_dir="/r",
+            pid=999_999,  # the remote's pid, meaningless locally
+            last_seen=datetime.now(UTC),
+            focus="doing things",
+        )
+        owner_start = store_module.pid_start_time(os.getpid())
+        store.sync_remote_agents(
+            "hostB", [remote], owner_pid=os.getpid(), owner_pid_start=owner_start
+        )
+        listed = {a.agent_id: a for a in store.list_agents()}
+        assert "agent-x@hostB" in listed
+        # Mirrored entry rides the bridge's pid, so it's live while the bridge is.
+        assert listed["agent-x@hostB"].pid == os.getpid()
+        assert listed["agent-x@hostB"].focus == "doing things"
+
+    def test_sync_remote_agents_replaces_previous_snapshot(self, store: StateStore) -> None:
+        a = Agent(
+            agent_id="agent-a",
+            name="a",
+            working_dir="/r",
+            pid=os.getpid(),
+            last_seen=datetime.now(UTC),
+        )
+        b = Agent(
+            agent_id="agent-b",
+            name="b",
+            working_dir="/r",
+            pid=os.getpid(),
+            last_seen=datetime.now(UTC),
+        )
+        start = store_module.pid_start_time(os.getpid())
+        store.sync_remote_agents("hostB", [a], os.getpid(), start)
+        store.sync_remote_agents("hostB", [b], os.getpid(), start)
+        ids = {ag.agent_id for ag in store.list_agents()}
+        assert "agent-b@hostB" in ids
+        assert "agent-a@hostB" not in ids  # departed remote agent dropped
+
+    def test_clear_remote_agents_removes_only_that_host(self, store: StateStore) -> None:
+        start = store_module.pid_start_time(os.getpid())
+        b = Agent(
+            agent_id="agent-b",
+            name="b",
+            working_dir="/r",
+            pid=os.getpid(),
+            last_seen=datetime.now(UTC),
+        )
+        c = Agent(
+            agent_id="agent-c",
+            name="c",
+            working_dir="/r",
+            pid=os.getpid(),
+            last_seen=datetime.now(UTC),
+        )
+        store.sync_remote_agents("hostB", [b], os.getpid(), start)
+        store.sync_remote_agents("hostC", [c], os.getpid(), start)
+        store.clear_remote_agents("hostB")
+        ids = {ag.agent_id for ag in store.list_agents()}
+        assert "agent-b@hostB" not in ids
+        assert "agent-c@hostC" in ids
 
 
 # ----------------------------------------------------------------- inboxes

@@ -72,6 +72,52 @@ Discovered in test #3: Claude can call the `PushNotification` tool to alert the 
 Background / headless workers have other handles — Claude Code's Remote Control, `claude -p`, scheduled triggers. Spanreed targets the case where a human is actively using a Claude session and another agent needs to interject.
 
 Out-of-scope explicitly:
-- Cross-host messaging (single machine only for now)
 - Persistence across machine reboots
 - Authentication / authorization between agents (single-user assumption)
+
+(Cross-host messaging was previously out-of-scope; it is now an in-design feature — see below.)
+
+## Cross-host: the SSH bus-bridge
+
+Single-host spanreed coordinates through a shared local filesystem with no daemon. Cross-host can't share that filesystem safely (`flock` and append-atomicity don't hold over network FS) and the PID-based liveness model is local by definition. Rather than introduce a network broker or a shared mount, we **bridge two independent local buses over a persistent SSH duplex pipe**. SSH gives us authenticated, encrypted transport for free and makes "you can reach the box" the authorization model — which matches the single-user trust assumption exactly.
+
+### Shape
+
+A symmetric **bridge process** runs on each machine, connected by one long-lived SSH connection. One side initiates:
+
+```
+hostA:  spanreed conjoin hostB
+            └─ ssh hostB <abs-path>/spanreed conjoin --serve
+               (the ssh child's stdin/stdout IS the duplex pipe)
+```
+
+Both ends run identical bridge logic. `connect` owns the SSH process and the reconnect loop; `serve` speaks the pipe over its own stdin/stdout. This is the `git`-over-SSH / `rsync --server` pattern. The bridge is dedicated infrastructure — it is *not* a Claude session and never wakes one on a timer.
+
+### The core trick: reuse inboxes as the outbound queue
+
+The bridge **mirrors the peer's live agents into the local registry**, qualified by host (`agent-X@hostB`) and owned by the bridge's own PID. Everything else falls out of the existing primitives with no MCP changes:
+
+- A local agent sends to `agent-X@hostB` → ordinary `send_message` → lands in `inboxes/agent-X@hostB.jsonl` locally.
+- The bridge tails every `*@hostB` inbox and forwards new lines over the pipe.
+- On hostB, the bridge appends the message to the *real* local `inboxes/agent-X.jsonl`. hostB's agent-X monitor (`tail -F`) fires exactly as for a local message.
+
+Replies are symmetric: agent-X replies to `agent-Y@hostA`, which lands in hostB's `inboxes/agent-Y@hostA.jsonl`, which hostB's bridge tails and forwards back. Purely-local traffic never touches the bridge (it lands in bare inboxes, not `*@peer` ones).
+
+### Identity rewriting
+
+Global identity is `agent-X@homehost`; on its home host the agent is the bare `agent-X`, on a foreign host it's `agent-X@home`. The **sending** bridge rewrites addresses into the *receiver's* namespace before putting a frame on the pipe (`to` = bare local id on the receiver; `from` = qualified with the sender's host), so the receiving bridge just appends. See `protocol.md` for the exact rules.
+
+### Properties that fall out for free
+
+- **No cross-host heartbeat.** Remote-agent liveness is just "present in the peer's latest registry snapshot," which the peer computes with the local PID + start-time check. The bridge's own PID backs the mirrored entries, so if the pipe dies the remote agents correctly vanish from `list_agents`.
+- **Store-and-forward across disconnects.** If the pipe is down, outbound messages accumulate durably in the `*@peer` inbox files; on reconnect the bridge resumes from its saved cursor (the existing `cursors/` mechanism) and drains the backlog.
+
+### Launch and prerequisites (empirically settled)
+
+- `spanreed` must be installed on each bridged host.
+- The remote `spanreed` is invoked by **absolute path**, because a non-interactive SSH command gets a stripped `$PATH` (`~/.local/bin` is typically added in `.zshrc`, which login/non-interactive shells don't source). The `connect` side discovers the path once via an interactive-shell probe — `ssh host 'zsh -ic "command -v spanreed"'` returns the bare path cleanly — then launches `serve` by that path.
+- **Key-based (non-interactive) auth is required**: the bridge re-establishes itself without a human present, so it can't answer a password prompt.
+
+### Scope (v1)
+
+Point-to-point: two machines, one direct bridge, launched manually per pair. Transitive/multi-hop routing (B reaching C through A) and auto-discovery of peer hosts are deferred — see `open-questions.md`.

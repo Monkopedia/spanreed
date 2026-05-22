@@ -22,9 +22,27 @@ Things still to test, design, or decide.
 - **Skill vs. description-as-policy**: which is the more robust home for trusted bus policy? Description is simpler; a skill is more discoverable and reusable.
 - **Daemon lifecycle**: does the MCP server run per-user as a long-lived daemon (systemd / launchd) or spawn-on-demand from the first plugin connection?
 
+## Cross-host bridge (in design)
+
+Design lives in [`architecture.md`](architecture.md) (SSH bus-bridge) and [`protocol.md`](protocol.md) (wire-format). Resolved so far:
+
+- **Transport**: persistent duplex SSH pipe between two symmetric bridge processes; no broker, no shared filesystem.
+- **Remote launch**: invoke the remote `spanreed` by **absolute path**, discovered once via an interactive-shell probe (`ssh host 'zsh -ic "command -v spanreed"'`), because non-interactive SSH gets a stripped `$PATH`.
+- **Auth**: key-based / non-interactive SSH required (the bridge reconnects unattended).
+- **Per-host install**: `spanreed` must be installed on every bridged host.
+- **Trust boundary**: SSH access to a host grants full read/write to that host's entire bus (the bridge can inject into any local inbox). Intended under the single-user assumption, but stated explicitly.
+
+Still open:
+
+- **Multi-hop / transitive routing** (B reaching C through A): deferred. v1 is point-to-point only.
+- **Peer-host discovery**: v1 launches bridges manually per pair. A peer-host config/list is future work.
+- **Reconnect policy**: backoff schedule, and what (if anything) to surface to agents when a peer goes away vs. comes back.
+- **Registry-sync cadence**: poll interval / change-detection for the `registry` frame; tradeoff between freshness and chatter.
+- **Cursor semantics on bridge restart**: confirm the `*@peer` inbox cursors give exactly-once-ish forwarding without re-sending the backlog or dropping messages mid-restart.
+- **`@host` UX in `list_agents`**: how qualified ids and "this peer is via bridge" surface to the user (per the visibility-over-hiding principle).
+
 ## Out-of-scope (for now)
 
-- Cross-host messaging (multi-machine mesh)
 - Persistence across machine reboots
 - Authentication / authorization between agents (single-user assumption)
 - Streaming / long-form message bodies (current model is single-shot JSON messages)

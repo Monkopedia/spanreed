@@ -104,6 +104,60 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed recv AGENT [--since ID]` | Dump an agent's inbox |
 | `spanreed inbox-watch` | `tail -F` this session's inbox (plugin Monitor) |
 | `spanreed session-start` | Register + emit SessionStart hook JSON (plugin hook) |
+| `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
+
+## Cross-host bridge wire-format
+
+The SSH bus-bridge (design rationale in [`architecture.md`](architecture.md)) connects two local buses over one persistent duplex pipe. This section specifies the on-the-wire details.
+
+### Host-qualified agent ids
+
+Global identity is `agent-X@homehost`. On its **home** host the agent keeps its bare `agent-X` id (unchanged — local traffic and the existing tools are untouched). On a **foreign** host it appears as `agent-X@home`. The `@` separator is not otherwise legal in a generated `agent_id` (those are `agent-<hex>`), so it unambiguously marks "remote, routed via the bridge." `@` is filesystem-safe, so `inboxes/agent-X@home.jsonl` is a normal inbox file.
+
+### Mirrored registry entries
+
+For each live agent on the peer, the bridge writes a registry entry on the local host:
+
+```json
+{
+  "agent_id": "agent-X@hostB",
+  "name": "...",
+  "working_dir": "...",
+  "pid": <bridge's own pid>,
+  "pid_start": <bridge's own start-time>,
+  "focus": "..."
+}
+```
+
+`pid`/`pid_start` are the **bridge's**, not the remote process's (whose PID is meaningless locally). So `is_stale` treats a mirrored entry as live exactly while the bridge is alive — if the pipe/bridge dies, every mirrored entry goes stale and remote agents drop out of `list_agents`. The bridge refreshes the set on each registry sync from the peer (adding new agents, removing departed ones).
+
+### Inbox-as-outbound-queue
+
+A message addressed to `agent-X@hostB` is delivered by the normal `send_message` path into `inboxes/agent-X@hostB.jsonl` on the local host. The bridge tails all `*@<peer>` inboxes (tracking position with a `cursors/` marker per inbox, so a restart resumes without re-sending) and forwards new lines over the pipe.
+
+### Pipe frames
+
+The pipe carries newline-delimited JSON frames, each with a `kind`:
+
+```json
+{"kind": "msg", "message": { <Message, addresses in RECEIVER's namespace> }}
+{"kind": "registry", "agents": [ <Agent, ...> ]}
+{"kind": "ping"}
+```
+
+- `msg` — a forwarded bus message. The receiving bridge appends `message` verbatim to `inboxes/<message.to_agent>.jsonl`.
+- `registry` — the sender's current set of live local agents (bare ids, home = sender). The receiver mirrors them per "Mirrored registry entries" above. Sent on connect and whenever the local set changes.
+- `ping` — keepalive; lets each side detect a dead pipe and lets `connect` trigger reconnect.
+
+### Address rewriting (done by the sending bridge)
+
+The sender rewrites so the receiver can stay dumb (just append). For a message leaving host `H` toward peer `P`, read from `inboxes/<to>@P.jsonl`:
+
+- `to_agent`: strip `@P` → bare `agent-X` (it is local on `P`).
+- `from_agent`: if bare (`agent-Y`, home `H`) → qualify to `agent-Y@H`; if already `agent-Z@Q` (a relayed third party) → leave as-is (but note multi-hop is out of scope for v1, so in practice `from` is always a local agent being qualified).
+- `in_reply_to` is an opaque msg_id and is never rewritten.
+
+The inverse holds on receipt: addresses arrive already in the local namespace, so the receiving bridge appends without translation.
 
 ## Trust model
 

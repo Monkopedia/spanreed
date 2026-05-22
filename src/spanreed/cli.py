@@ -202,6 +202,23 @@ def _cmd_focus(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_conjoin(args: argparse.Namespace) -> int:
+    """Conjoin this bus to a peer's over SSH (or serve the remote end)."""
+    from spanreed import bridge
+
+    if args.serve:
+        return bridge.serve(self_host=args.label)
+    if not args.host:
+        print("conjoin: HOST is required (unless --serve)", file=sys.stderr)
+        return 2
+    return bridge.connect(
+        args.host,
+        self_host=args.label,
+        remote_spanreed=args.remote_spanreed,
+        exec_cmd=args.exec_cmd,
+    )
+
+
 def _cmd_session_start(_args: argparse.Namespace) -> int:
     """Register this session and emit the SessionStart hook output to stdout."""
     agent_id, name = derive_agent_identity()
@@ -249,7 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument(
         "--include-stale",
         action="store_true",
-        help="Include agents whose PID is dead or last_seen is past TTL",
+        help="Include agents whose PID is dead or whose start-time no longer matches",
     )
 
     p_send = sub.add_parser("send", help="Send a message to another agent")
@@ -283,6 +300,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_focus.add_argument("text", nargs="?", help="Focus text. Omit to show current focus.")
     p_focus.add_argument("--clear", action="store_true", help="Clear the focus (no text needed)")
 
+    p_conjoin = sub.add_parser(
+        "conjoin", help="Conjoin this bus to a peer host's bus over a persistent SSH bridge"
+    )
+    p_conjoin.add_argument("host", nargs="?", help="SSH target hostname of the peer")
+    p_conjoin.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run the remote (plumbing) end over stdio; invoked by conjoin over SSH",
+    )
+    p_conjoin.add_argument("--label", help="Host label to advertise (default: hostname)")
+    p_conjoin.add_argument("--remote-spanreed", help="Absolute path to spanreed on the peer")
+    p_conjoin.add_argument(
+        "--exec",
+        dest="exec_cmd",
+        help="Override peer launch command (for local testing; bypasses SSH)",
+    )
+
     return parser
 
 
@@ -298,6 +332,7 @@ _DISPATCH = {
     "session-start": _cmd_session_start,
     "focus": _cmd_focus,
     "name": _cmd_name,
+    "conjoin": _cmd_conjoin,
 }
 
 

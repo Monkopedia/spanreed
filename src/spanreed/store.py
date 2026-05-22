@@ -254,6 +254,48 @@ class StateStore:
             if changed:
                 self._write_registry_unlocked(agents)
 
+    def sync_remote_agents(
+        self,
+        home_host: str,
+        remote_agents: list[Agent],
+        owner_pid: int,
+        owner_pid_start: int | None,
+    ) -> None:
+        """Mirror a peer's agents into this registry, qualified by ``@home_host``.
+
+        Used by the cross-host bridge. ``remote_agents`` are the peer's *bare*
+        local agents; each is stored locally as ``<id>@<home_host>`` owned by
+        the bridge's own pid/pid_start, so :func:`is_stale` treats them as live
+        exactly while the bridge is. Replaces any prior ``@home_host`` entries
+        (so departed remote agents drop out).
+        """
+        suffix = f"@{home_host}"
+        now = datetime.now(UTC)
+        mirrored = [
+            Agent(
+                agent_id=f"{a.agent_id}{suffix}",
+                name=a.name,
+                working_dir=a.working_dir,
+                pid=owner_pid,
+                pid_start=owner_pid_start,
+                last_seen=now,
+                focus=a.focus,
+            )
+            for a in remote_agents
+        ]
+        with self._registry_lock():
+            kept = [a for a in self._read_registry_unlocked() if not a.agent_id.endswith(suffix)]
+            self._write_registry_unlocked(kept + mirrored)
+
+    def clear_remote_agents(self, home_host: str) -> None:
+        """Remove all mirrored ``@home_host`` entries (bridge teardown)."""
+        suffix = f"@{home_host}"
+        with self._registry_lock():
+            agents = self._read_registry_unlocked()
+            kept = [a for a in agents if not a.agent_id.endswith(suffix)]
+            if len(kept) != len(agents):
+                self._write_registry_unlocked(kept)
+
     # ------------------------------------------------------------------ inboxes
 
     def _inbox_path(self, agent_id: str) -> Path:
@@ -279,6 +321,24 @@ class StateStore:
         with inbox.open("a") as f:
             f.write(msg.model_dump_json() + "\n")
         return msg
+
+    def append_message(self, msg: Message) -> None:
+        """Append a pre-built message to its recipient's inbox verbatim.
+
+        Unlike :meth:`send_message`, this preserves the message's existing
+        ``msg_id``/``ts``/``in_reply_to`` instead of minting new ones. Used by
+        the cross-host bridge to deliver a message forwarded from a peer
+        without breaking reply threading.
+
+        Idempotent by ``msg_id``: a message already present in the inbox is not
+        appended again, so the bridge's at-least-once resend after a reconnect
+        doesn't double-deliver.
+        """
+        if any(existing.msg_id == msg.msg_id for existing in self.recv_messages(msg.to_agent)):
+            return
+        inbox = self._inbox_path(msg.to_agent)
+        with inbox.open("a") as f:
+            f.write(msg.model_dump_json() + "\n")
 
     def recv_messages(
         self,
