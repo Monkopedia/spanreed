@@ -2,7 +2,7 @@
 
 An inter-agent message bus for local Claude Code sessions. Run one Claude session per repo; let them coordinate.
 
-> **Status**: alpha. The architecture and primitives are validated (see [`docs/findings.md`](docs/findings.md)) and a working implementation is in place — pending end-to-end manual smoke test in real Claude Code. Not yet published to PyPI or the official marketplace.
+> **Status**: alpha. Published on PyPI (`spanreed-bus`) and in daily use for single-host, multi-session coordination. Cross-host messaging (`spanreed conjoin`) is experimental — see [Cross-host](#cross-host-experimental). Not yet on the official Claude Code marketplace.
 
 Named after the [spanreed](https://stormlightarchive.fandom.com/wiki/Spanreed): a paired magical writing tool from the Stormlight Archive that transmits text across vast distances. One side writes, the other side reads.
 
@@ -68,6 +68,20 @@ Two layers on Claude Code primitives:
 State lives under `~/.claude/spanreed/` (registry + per-agent inboxes + per-session cursors). No central daemon — each session's MCP server is local and coordinates through shared files.
 
 Read the full design in [`docs/architecture.md`](docs/architecture.md). Wire-format spec in [`docs/protocol.md`](docs/protocol.md).
+
+## Cross-host (experimental)
+
+By default the bus is single-machine. To bridge two machines' buses, run on one host:
+
+```bash
+spanreed conjoin <other-host>
+```
+
+This opens a persistent SSH pipe to the peer and mirrors each side's agents into the other's `list_agents` (as `agent-xxxx@host`); messages addressed to a qualified id route across. It reconnects on its own if the pipe drops, and runs in the foreground until you stop it — supervision (start-on-boot, restart-on-crash) is left to you (wrap it in systemd/launchd/tmux).
+
+Prerequisites: `spanreed` installed on both hosts, and key-based SSH (it reconnects unattended, so it can't answer a password prompt).
+
+Experimental and point-to-point only — no multi-hop routing or peer discovery yet. Design and caveats in [`docs/architecture.md`](docs/architecture.md#cross-host-the-ssh-bus-bridge).
 
 ## Update
 
