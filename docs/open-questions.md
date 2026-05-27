@@ -19,7 +19,7 @@ Things still to test, design, or decide.
 - **Agent identity**: what makes two sessions "the same agent" vs. distinct? Working directory? Manual name? PID?
 - **Conversation continuity**: can a message reference a thread, and Claude pick up context from prior messages in it?
 - **Self-deregistration on crash**: if a session dies without running the Stop hook, the registry has stale entries. PID-based liveness? TTL? Lease renewal?
-- **Skill vs. description-as-policy**: which is the more robust home for trusted bus policy? Description is simpler; a skill is more discoverable and reusable.
+- **Where the disposition policy lives** (resolved): the full policy is a single constant (`_DISPOSITION_POLICY` in `cli.py`), embedded once in the SessionStart context and written to `<state_root>/disposition-policy.md` at session start. The inbox Monitor's `description` is a one-liner that points at that file — so the ~400-token policy is no longer re-injected on every monitor event (it was both wasteful and redundant with the SessionStart context). Open sub-question: whether to also slim the SessionStart context to a pointer (currently it still embeds the full policy, since that's a once-per-session cost).
 - **Daemon lifecycle**: does the MCP server run per-user as a long-lived daemon (systemd / launchd) or spawn-on-demand from the first plugin connection?
 
 ## Cross-host bridge (in design)

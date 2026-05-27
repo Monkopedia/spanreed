@@ -257,6 +257,17 @@ class TestSessionStart:
         assert "request_focus_update" in context
         assert "FOCUS_UPDATE_REQUEST" in context
 
+    def test_session_start_writes_disposition_policy_file(
+        self, cli_env: Path, state_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc, _ = _run(capsys, ["session-start"])
+        assert rc == 0
+        policy = (state_root / "disposition-policy.md").read_text()
+        # The terse Monitor description points here; the full rules must live in it.
+        assert "recv_messages" in policy
+        assert "FOCUS_UPDATE_REQUEST" in policy
+        assert "PushNotification" in policy
+
 
 # ---------------------------------------------------------------- focus
 
