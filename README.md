@@ -79,9 +79,9 @@ spanreed conjoin <other-host>
 
 This opens a persistent SSH pipe to the peer and mirrors each side's agents into the other's `list_agents` (as `agent-xxxx@host`); messages addressed to a qualified id route across. It reconnects on its own if the pipe drops, and runs in the foreground until you stop it — supervision (start-on-boot, restart-on-crash) is left to you (wrap it in systemd/launchd/tmux).
 
-Prerequisites: `spanreed` installed on both hosts, and key-based SSH (it reconnects unattended, so it can't answer a password prompt).
+Prerequisites: `spanreed-bus` ≥ 0.0.4 on both hosts, and key-based non-interactive SSH (it reconnects unattended, so it can't answer a password prompt). Full setup, the most common SSH gotcha (non-default key name), and how to update `spanreed` on a peer host: [`docs/cross-host.md`](docs/cross-host.md). Design in [`docs/architecture.md`](docs/architecture.md#cross-host-the-ssh-bus-bridge).
 
-Experimental and point-to-point only — no multi-hop routing or peer discovery yet. Design and caveats in [`docs/architecture.md`](docs/architecture.md#cross-host-the-ssh-bus-bridge).
+Experimental and point-to-point only — no multi-hop routing or peer discovery yet.
 
 ## Update
 
