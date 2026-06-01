@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from spanreed.identity import derive_agent_identity
+from spanreed.protocol import Agent
 from spanreed.store import StateStore, default_state_root
 
 # ---------------------------------------------------------------- commands
@@ -153,26 +154,39 @@ restarts.
 {disposition_policy}"""
 
 
+def _self_entry(store: StateStore, agent_id: str) -> Agent | None:
+    """This session's registry entry (stale included), or None if unregistered."""
+    return next((a for a in store.list_agents(include_stale=True) if a.agent_id == agent_id), None)
+
+
+def _ensure_registered(store: StateStore, agent_id: str) -> None:
+    """Register a stub entry for this session so a subsequent set_* takes effect.
+
+    ``set_name``/``set_focus`` no-op on an unknown agent, but these commands can
+    be run before the SessionStart hook has registered — so register first, then
+    the caller retries its set.
+    """
+    _, name = derive_agent_identity()
+    store.register_agent(
+        name=name, working_dir=str(Path.cwd()), pid=os.getppid(), agent_id=agent_id
+    )
+
+
 def _cmd_name(args: argparse.Namespace) -> int:
     """Set or show this session's display name on the bus."""
     agent_id, _ = derive_agent_identity()
     store = StateStore()
 
     if args.text is None:
-        # Show current.
-        for a in store.list_agents(include_stale=True):
-            if a.agent_id == agent_id:
-                print(a.name)
-                return 0
-        return 1  # not registered
+        entry = _self_entry(store, agent_id)
+        if entry is None:
+            return 1
+        print(entry.name)
+        return 0
 
     updated = store.set_name(agent_id, args.text)
     if updated is None:
-        # Not registered yet — register first so set takes effect.
-        wd = Path.cwd()
-        store.register_agent(
-            name=args.text, working_dir=str(wd), pid=os.getppid(), agent_id=agent_id
-        )
+        _ensure_registered(store, agent_id)
         updated = store.set_name(agent_id, args.text)
         if updated is None:
             return 1
@@ -185,25 +199,19 @@ def _cmd_focus(args: argparse.Namespace) -> int:
     agent_id, _ = derive_agent_identity()
     store = StateStore()
 
-    if args.clear:
-        new_focus: str | None = None
-    elif args.text is not None:
-        new_focus = args.text
-    else:
+    if not args.clear and args.text is None:
         # No args → show current focus.
-        for a in store.list_agents(include_stale=True):
-            if a.agent_id == agent_id:
-                if a.focus:
-                    print(a.focus)
-                return 0
-        return 1  # not registered
+        entry = _self_entry(store, agent_id)
+        if entry is None:
+            return 1
+        if entry.focus:
+            print(entry.focus)
+        return 0
 
+    new_focus = None if args.clear else args.text
     updated = store.set_focus(agent_id, new_focus)
     if updated is None:
-        # Not registered yet — register a stub entry so set takes effect.
-        wd = Path.cwd()
-        _, name = derive_agent_identity()
-        store.register_agent(name=name, working_dir=str(wd), pid=os.getppid(), agent_id=agent_id)
+        _ensure_registered(store, agent_id)
         updated = store.set_focus(agent_id, new_focus)
         if updated is None:
             return 1
