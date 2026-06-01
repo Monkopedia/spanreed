@@ -65,17 +65,6 @@ class TestRegistry:
         assert removed == 2
         assert len(store.list_agents(include_stale=True)) == 1
 
-    def test_touch_updates_last_seen(self, store: StateStore) -> None:
-        agent = store.register_agent(name="alice", working_dir="/x", pid=os.getpid())
-        original_seen = agent.last_seen
-        time.sleep(0.01)
-        store.touch_agent(agent.agent_id)
-        refreshed = next(a for a in store.list_agents() if a.agent_id == agent.agent_id)
-        assert refreshed.last_seen > original_seen
-
-    def test_touch_unknown_is_noop(self, store: StateStore) -> None:
-        store.touch_agent("agent-does-not-exist")
-
     def test_register_captures_pid_start(self, store: StateStore) -> None:
         agent = store.register_agent(name="alice", working_dir="/x", pid=os.getpid())
         assert agent.pid_start == store_module.pid_start_time(os.getpid())

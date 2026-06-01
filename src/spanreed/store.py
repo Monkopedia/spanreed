@@ -240,20 +240,6 @@ class StateStore:
                 self._write_registry_unlocked(live)
         return removed
 
-    def touch_agent(self, agent_id: str) -> None:
-        """Update ``last_seen`` for an agent. No-op if not registered."""
-        now = datetime.now(UTC)
-        with self._registry_lock():
-            agents = self._read_registry_unlocked()
-            changed = False
-            for agent in agents:
-                if agent.agent_id == agent_id:
-                    agent.last_seen = now
-                    changed = True
-                    break
-            if changed:
-                self._write_registry_unlocked(agents)
-
     def sync_remote_agents(
         self,
         home_host: str,

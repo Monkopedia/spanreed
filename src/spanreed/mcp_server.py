@@ -76,8 +76,9 @@ def deregister_agent(agent_id: str) -> dict[str, object]:
 def list_agents(include_stale: bool = False) -> list[dict[str, object]]:
     """List agents currently registered on the bus.
 
-    Stale entries (PID dead or last_seen past the TTL) are filtered out by
-    default; pass ``include_stale=True`` to see them.
+    Stale entries (PID dead, or the PID's start-time no longer matches what was
+    recorded — i.e. the agent's process is gone) are filtered out by default;
+    pass ``include_stale=True`` to see them.
     """
     return [
         a.model_dump(mode="json") for a in StateStore().list_agents(include_stale=include_stale)
