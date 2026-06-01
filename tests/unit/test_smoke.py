@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from importlib.metadata import version
 
 from spanreed import __version__
 from spanreed.protocol import Agent, Message
 
 
-def test_version_is_set() -> None:
-    assert __version__
+def test_version_matches_package_metadata() -> None:
+    # __version__ is derived from installed metadata, so it can't drift from the
+    # packaged version the way a hardcoded string did.
+    assert __version__ == version("spanreed-bus")
 
 
 def test_agent_serializes() -> None:
