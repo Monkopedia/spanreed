@@ -154,6 +154,20 @@ restarts.
 {disposition_policy}"""
 
 
+# Appended to the SessionStart context ONLY when status tracking is enabled
+# bus-wide (see _cmd_status_tracking). Kept tight — it costs context tokens
+# whenever it's on.
+_STATUS_INSTRUCTION = """\
+Status tracking is ON for this bus. Keep your status current via set_status so \
+the user and peers can see who needs attention (they read it through \
+list_agents; it does NOT notify anyone). Call set_status with:
+  - working     — when you start actively working a task
+  - needs_input — when you want the user's decision/answer (you may still proceed)
+  - blocked     — when you cannot continue without the user
+  - idle        — when you finish and are no longer working
+Set it as these transitions happen; don't wait to be asked."""
+
+
 def _self_entry(store: StateStore, agent_id: str) -> Agent | None:
     """This session's registry entry (stale included), or None if unregistered."""
     return next((a for a in store.list_agents(include_stale=True) if a.agent_id == agent_id), None)
@@ -220,6 +234,42 @@ def _cmd_focus(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Set or show this session's status on the bus."""
+    agent_id, _ = derive_agent_identity()
+    store = StateStore()
+
+    if args.level is None:
+        # No arg → show current status.
+        entry = _self_entry(store, agent_id)
+        if entry is None:
+            return 1
+        if entry.status:
+            print(entry.status)
+        return 0
+
+    updated = store.set_status(agent_id, args.level)
+    if updated is None:
+        _ensure_registered(store, agent_id)
+        updated = store.set_status(agent_id, args.level)
+        if updated is None:
+            return 1
+    if updated.status:
+        print(updated.status)
+    return 0
+
+
+def _cmd_status_tracking(args: argparse.Namespace) -> int:
+    """Enable/disable bus-wide status tracking, or show the current setting."""
+    store = StateStore()
+    if args.state is None:
+        print("on" if store.get_status_tracking() else "off")
+        return 0
+    store.set_status_tracking(args.state == "on")
+    print("on" if args.state == "on" else "off")
+    return 0
+
+
 def _cmd_conjoin(args: argparse.Namespace) -> int:
     """Conjoin this bus to a peer's over SSH (or serve the remote end)."""
     from spanreed import bridge
@@ -243,7 +293,8 @@ def _cmd_session_start(_args: argparse.Namespace) -> int:
     agent_id, name = derive_agent_identity()
     wd = Path.cwd()
     pid = os.getppid()
-    agent = StateStore().register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
+    store = StateStore()
+    agent = store.register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
     # Write the disposition policy to a stable path so the inbox Monitor's
     # description can be a one-liner that points here instead of re-injecting
     # the whole policy on every event.
@@ -255,6 +306,10 @@ def _cmd_session_start(_args: argparse.Namespace) -> int:
         working_dir=agent.working_dir,
         disposition_policy=_DISPOSITION_POLICY,
     )
+    # Status tracking is opt-in: only inject the maintenance instruction when
+    # the bus has it enabled, so an off bus pays zero context tokens for it.
+    if store.get_status_tracking():
+        context += "\n\n" + _STATUS_INSTRUCTION
     output = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -325,6 +380,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_focus.add_argument("text", nargs="?", help="Focus text. Omit to show current focus.")
     p_focus.add_argument("--clear", action="store_true", help="Clear the focus (no text needed)")
 
+    p_status = sub.add_parser("status", help="Set or show this session's status on the bus")
+    p_status.add_argument(
+        "level",
+        nargs="?",
+        choices=["idle", "working", "needs_input", "blocked"],
+        help="New status. Omit to show current.",
+    )
+
+    p_status_tracking = sub.add_parser(
+        "status-tracking", help="Enable/disable bus-wide status tracking, or show the setting"
+    )
+    p_status_tracking.add_argument(
+        "state", nargs="?", choices=["on", "off"], help="Omit to show current setting."
+    )
+
     p_conjoin = sub.add_parser(
         "conjoin", help="Conjoin this bus to a peer host's bus over a persistent SSH bridge"
     )
@@ -363,6 +433,8 @@ _DISPATCH = {
     "session-start": _cmd_session_start,
     "focus": _cmd_focus,
     "name": _cmd_name,
+    "status": _cmd_status,
+    "status-tracking": _cmd_status_tracking,
     "conjoin": _cmd_conjoin,
 }
 

@@ -7,8 +7,22 @@ See docs/protocol.md for the spec these types implement.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel
+
+Status = Literal["idle", "working", "needs_input", "blocked"]
+"""Self-reported agent status, ordered by escalating need for a human:
+
+- ``idle`` — registered but not actively working.
+- ``working`` — actively making progress; no human needed.
+- ``needs_input`` — wants a human decision/answer; may still be proceeding.
+- ``blocked`` — stopped; cannot continue without a human.
+
+The "needs a human" set is ``{needs_input, blocked}`` — a peer or dashboard
+partitions on that. ``idle`` is best-effort: an agent stops running exactly when
+it goes idle, so it can't always report the transition (there's no Stop hook).
+"""
 
 
 class Agent(BaseModel):
@@ -48,6 +62,17 @@ class Agent(BaseModel):
     ``spanreed focus`` (CLI). Surfaces in ``list_agents`` so peers can see at a
     glance what each agent is up to. Preserved across re-registration (session
     restarts don't wipe the focus you set last time).
+    """
+
+    status: Status | None = None
+    """Optional self-reported status (see :data:`Status`). Set via ``set_status``
+    (MCP) or ``spanreed status`` (CLI); surfaces in ``list_agents`` so peers can
+    see who needs a human, without any notification (pull, not push).
+
+    Unlike ``focus``, this is **reset to ``None`` on re-registration** — a fresh
+    session isn't ``blocked`` just because the last one was, and a stale status
+    would mislead the very fleet view this exists to provide. ``None`` means
+    "not reported" (status tracking off, or not yet set this session).
     """
 
 

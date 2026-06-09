@@ -25,13 +25,15 @@ cursors/<session_id>    per-session "last-seen msg_id" marker
       "working_dir": "/path",
       "pid": 12345,
       "pid_start": 8675309,
-      "last_seen": "2026-05-17T15:00:00Z"
+      "last_seen": "2026-05-17T15:00:00Z",
+      "focus": "...",
+      "status": "working"
     }
   ]
 }
 ```
 
-Rewritten atomically on every change.
+Rewritten atomically on every change. `focus` and `status` are omitted/`null` when unset.
 
 **Liveness / staleness.** An agent is *present* iff its `pid` is alive **and** that PID's start-time still matches the `pid_start` captured at registration. Stale entries (PID dead, or PID recycled onto an unrelated process so the start-time no longer matches) get filtered on read and pruned by `prune_stale`. `pid_start` is the process start-time (Linux: clock ticks since boot, from `/proc/<pid>/stat` field 22); it's the guard against PID reuse. When it can't be read (no `/proc`, e.g. macOS) it is `null`, and liveness falls back to a bare PID-alive check.
 
@@ -57,11 +59,12 @@ Implemented in `src/spanreed/mcp_server.py` via FastMCP:
 
 - `register_agent(name, working_dir, pid, agent_id?) -> Agent` — upsert by id if supplied; preserves existing `focus` on upsert.
 - `deregister_agent(agent_id) -> {ok: true}`
-- `list_agents(include_stale=false) -> [Agent, ...]` — Agent records include `focus` field.
+- `list_agents(include_stale=false) -> [Agent, ...]` — Agent records include `focus` and `status` fields.
 - `send_message(from_agent, to_agent, body, in_reply_to?) -> Message`
 - `recv_messages(agent_id, since_msg_id?) -> [Message, ...]`
 - `wait_for_reply(agent_id, in_reply_to, timeout_s) -> Message | null` — blocks up to `timeout_s`.
 - `set_focus(focus) -> Agent | null` — set/clear the calling session's focus (uses derived identity); `null` if not registered. Empty string clears.
+- `set_status(status) -> Agent | null` — set the calling session's status (one of `idle | working | needs_input | blocked`); `null` if not registered. Pull-only (does not notify). Always functional regardless of the `status_tracking` flag.
 - `set_name(name) -> Agent | null` — rename the calling session's display name. `agent_id` does NOT change; only the human-readable name does. Persists across re-registration.
 - `request_focus_update(agent_id, timeout_s=30) -> str | null` — send a `[FOCUS_UPDATE_REQUEST]` message to a peer, wait for their reply, return the reply body. Convention: the recipient's policy says to call `set_focus` with their current focus and reply with that text.
 
@@ -75,6 +78,28 @@ Agents may set an optional `focus` field describing what they're currently worki
 - **Preserved across re-registration** — restarting Claude Code doesn't wipe the focus the agent set last session.
 
 For pull-mode queries (e.g., a peer's listed focus seems stale or absent), use `request_focus_update` to ping them. The convention message body begins with `[FOCUS_UPDATE_REQUEST]`; the plugin's monitor description teaches Claude how to respond.
+
+## Status
+
+Agents may report a `status` describing how much human attention they need — one of (ordered by escalating need):
+
+| status | meaning | needs human? |
+|---|---|---|
+| `idle` | registered, not actively working | no |
+| `working` | actively making progress | no |
+| `needs_input` | wants a human decision/answer; may still proceed | soft |
+| `blocked` | stopped; cannot continue without a human | hard |
+
+"Who needs a human" is `status ∈ {needs_input, blocked}`. Properties:
+
+- Set by the agent via `set_status` (MCP) or `spanreed status <level>` (CLI). Self-set only.
+- **Pull, not push** — setting status writes the registry and surfaces in `list_agents`; it does **not** notify any peer.
+- **Reset to `null` on re-registration** (unlike `focus`, which is preserved) — a fresh session isn't `blocked` just because the last one was; a stale status would mislead the fleet view. `null` = not reported.
+- `idle` is **best-effort**: an agent stops running exactly when it goes idle, so it can't reliably report that transition (there is no Stop hook). The human-need levels (`needs_input`/`blocked`) are reliable because the agent declares them while active.
+
+### `status_tracking` toggle
+
+Status tracking is **off by default** and enabled bus-wide via `spanreed status-tracking on` (persisted in `<state_root>/config.json` as `{"status_tracking": true}`). The flag gates **only** whether `session-start` injects the status-maintenance instruction into agent context — so a bus with tracking off pays zero context tokens for the feature. `set_status` itself always works regardless of the flag; when off, agents simply aren't told to maintain status and `list_agents` shows `status: null`.
 
 ## Identity model
 
@@ -104,6 +129,8 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed recv AGENT [--since ID]` | Dump an agent's inbox |
 | `spanreed inbox-watch` | `tail -F` this session's inbox (plugin Monitor) |
 | `spanreed session-start` | Register + emit SessionStart hook JSON (plugin hook) |
+| `spanreed status [LEVEL]` | Set this session's status (`idle\|working\|needs_input\|blocked`), or show it |
+| `spanreed status-tracking [on\|off]` | Enable/disable bus-wide status tracking, or show the setting |
 | `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
 
 ## Cross-host bridge wire-format

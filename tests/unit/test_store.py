@@ -160,6 +160,69 @@ class TestFocus:
         assert agent.focus is None
 
 
+# ----------------------------------------------------------------- status
+
+
+class TestStatus:
+    def test_set_status_returns_updated_agent(self, store: StateStore) -> None:
+        store.register_agent(name="a", working_dir="/x", pid=os.getpid(), agent_id="agent-a")
+        updated = store.set_status("agent-a", "blocked")
+        assert updated is not None
+        assert updated.status == "blocked"
+
+    def test_set_status_persists_in_list(self, store: StateStore) -> None:
+        store.register_agent(name="a", working_dir="/x", pid=os.getpid(), agent_id="agent-a")
+        store.set_status("agent-a", "needs_input")
+        listed = next(a for a in store.list_agents() if a.agent_id == "agent-a")
+        assert listed.status == "needs_input"
+
+    def test_set_status_on_unknown_returns_none(self, store: StateStore) -> None:
+        assert store.set_status("agent-nope", "working") is None
+
+    def test_register_does_not_set_status_by_default(self, store: StateStore) -> None:
+        agent = store.register_agent(
+            name="a", working_dir="/x", pid=os.getpid(), agent_id="agent-a"
+        )
+        assert agent.status is None
+
+    def test_status_reset_on_reregister(self, store: StateStore) -> None:
+        """Unlike focus, status is NOT preserved across re-registration — a stale
+        status from a prior session would mislead the fleet view."""
+        store.register_agent(name="a", working_dir="/x", pid=os.getpid(), agent_id="agent-a")
+        store.set_status("agent-a", "blocked")
+        store.set_focus("agent-a", "the focus")
+        # Re-register, as the SessionStart hook does on restart.
+        store.register_agent(name="a", working_dir="/x", pid=os.getpid(), agent_id="agent-a")
+        after = next(a for a in store.list_agents() if a.agent_id == "agent-a")
+        assert after.status is None  # reset
+        assert after.focus == "the focus"  # preserved
+
+
+# ----------------------------------------------------------------- status tracking flag
+
+
+class TestStatusTracking:
+    def test_default_is_off(self, store: StateStore) -> None:
+        assert store.get_status_tracking() is False
+
+    def test_enable_then_read(self, store: StateStore) -> None:
+        store.set_status_tracking(True)
+        assert store.get_status_tracking() is True
+
+    def test_disable_then_read(self, store: StateStore) -> None:
+        store.set_status_tracking(True)
+        store.set_status_tracking(False)
+        assert store.get_status_tracking() is False
+
+    def test_flag_persists_across_store_instances(self, state_root: Path) -> None:
+        StateStore(root=state_root).set_status_tracking(True)
+        assert StateStore(root=state_root).get_status_tracking() is True
+
+    def test_malformed_config_reads_as_off(self, store: StateStore) -> None:
+        (store.root / "config.json").write_text("not json{")
+        assert store.get_status_tracking() is False
+
+
 # ----------------------------------------------------------------- name
 
 

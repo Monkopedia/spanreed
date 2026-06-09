@@ -328,6 +328,75 @@ class TestFocus:
         assert out.strip() == "the focus"
 
 
+# ---------------------------------------------------------------- status
+
+
+class TestStatus:
+    def test_status_set_then_show(self, cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        _run(capsys, ["register"])
+        rc, _ = _run(capsys, ["status", "working"])
+        assert rc == 0
+        _, out = _run(capsys, ["status"])
+        assert out.strip() == "working"
+
+    def test_status_appears_in_list(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["register"])
+        _run(capsys, ["status", "blocked"])
+        _, out = _run(capsys, ["list"])
+        assert json.loads(out)[0]["status"] == "blocked"
+
+    def test_status_auto_registers_if_missing(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc, _ = _run(capsys, ["status", "needs_input"])
+        assert rc == 0
+        _, out = _run(capsys, ["list"])
+        assert json.loads(out)[0]["status"] == "needs_input"
+
+    def test_status_rejects_invalid_level(self, cli_env: Path) -> None:
+        # argparse choices → SystemExit(2) on an unknown level.
+        with pytest.raises(SystemExit):
+            cli.main(["status", "bogus"])
+
+    def test_status_reset_across_session_start(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Unlike focus, status is reset when the SessionStart hook re-runs."""
+        _run(capsys, ["session-start"])
+        _run(capsys, ["status", "blocked"])
+        _run(capsys, ["session-start"])
+        _, out = _run(capsys, ["status"])
+        assert out.strip() == ""
+
+
+class TestStatusTracking:
+    def test_default_off_and_toggle(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _, out = _run(capsys, ["status-tracking"])
+        assert out.strip() == "off"
+        _run(capsys, ["status-tracking", "on"])
+        _, out = _run(capsys, ["status-tracking"])
+        assert out.strip() == "on"
+
+    def test_instruction_gated_by_flag(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Off: session-start context must NOT carry the status instruction.
+        _, out = _run(capsys, ["session-start"])
+        ctx_off = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "set_status" not in ctx_off
+
+        # On: it must appear.
+        _run(capsys, ["status-tracking", "on"])
+        _, out = _run(capsys, ["session-start"])
+        ctx_on = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "set_status" in ctx_on
+        assert len(ctx_on) > len(ctx_off)
+
+
 # ---------------------------------------------------------------- name
 
 

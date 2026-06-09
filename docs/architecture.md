@@ -67,6 +67,16 @@ This separation surfaced empirically from test #1: when a signal carried embedde
 
 Discovered in test #3: Claude can call the `PushNotification` tool to alert the human when something needs attention. The harness automatically suppresses the notification when the user is active in the receiving terminal — so worker agents can flag without spamming. The bus policy should bundle this in: when a response status is `needs-user-attention`, also call `PushNotification` so the human gets pulled in even if they're heads-down in a different terminal.
 
+## Agent status (attention-level reporting)
+
+`PushNotification` is the *push* escalation. `status` is the complementary *pull* signal: a self-reported, four-level read on how much human attention an agent needs — `idle` / `working` / `needs_input` / `blocked` — so a human or peer scanning `list_agents` can see at a glance who's stuck without anyone being interrupted. Wire-format and the full semantics are in [`protocol.md`](protocol.md#status); the design choices worth recording here:
+
+- **It's a sibling of `focus`, not new infrastructure.** Same shape: a self-set field on the registry `Agent` record, set via `set_status`, surfaced in `list_agents`. That reuse is deliberate — it kept the feature small and means it inherits focus's properties (per-agent, filesystem-backed, no daemon).
+- **Pull, not push — by design.** Setting status never notifies a peer (no monitor event, no inbox message). A status change waking every peer would be the opposite of the point. You learn a peer's status when you already call `list_agents` (for free — it rides the discovery call you make anyway), so querying costs nothing extra.
+- **Reset on re-registration** (unlike `focus`, which is preserved). A fresh session isn't `blocked` because the last one was; carrying a stale status across a restart would actively mislead the fleet view this exists to provide.
+- **`idle` is best-effort.** An agent goes idle exactly when it stops running, so it can't reliably announce the transition (there's no Stop hook). The human-need levels are the reliable, load-bearing part — the agent declares them *while active*, which is when they matter. We accepted this rather than add a Stop hook for v1.
+- **Token-minimal and opt-in.** The real cost of the feature isn't the one short enum per agent in `list_agents` — it's the per-session instruction teaching agents to maintain status. So it's gated by a bus-wide `status_tracking` flag (off by default): `session-start` injects the instruction only when enabled, so a bus that doesn't want the feature pays zero context tokens for it. The flag gates only the *instruction*; the `set_status` tool itself always works.
+
 ## Scope: interactive mode only
 
 Background / headless workers have other handles — Claude Code's Remote Control, `claude -p`, scheduled triggers. Spanreed targets the case where a human is actively using a Claude session and another agent needs to interject.

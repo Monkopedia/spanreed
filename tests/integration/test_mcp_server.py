@@ -24,6 +24,7 @@ from spanreed.mcp_server import (
     send_message,
     set_focus,
     set_name,
+    set_status,
     wait_for_reply,
 )
 
@@ -153,6 +154,34 @@ def test_set_focus_returns_none_when_not_registered(
 ) -> None:
     monkeypatch.setenv("SPANREED_AGENT_NAME", "unregistered")
     assert set_focus(focus="something") is None
+
+
+# ----------------------------------------------------------------- status
+
+
+def test_set_status_on_self(mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
+    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    result = set_status(status="blocked")
+    assert result is not None
+    assert result["status"] == "blocked"
+
+
+def test_set_status_appears_in_list_agents(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
+    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    set_status(status="needs_input")
+    matching = [a for a in list_agents() if a["agent_id"] == "agent-alice"]
+    assert matching[0]["status"] == "needs_input"
+
+
+def test_set_status_returns_none_when_not_registered(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "unregistered")
+    assert set_status(status="working") is None
 
 
 async def test_request_focus_update_returns_reply_body(

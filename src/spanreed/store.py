@@ -15,16 +15,18 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import os
 import secrets
 import time
 from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from pydantic import BaseModel
 
-from spanreed.protocol import Agent, Message
+from spanreed.protocol import Agent, Message, Status
 
 
 class _RegistryDoc(BaseModel):
@@ -118,6 +120,7 @@ class StateStore:
         self._cursors_dir.mkdir(exist_ok=True)
         self._registry_path = self.root / "registry.json"
         self._registry_lock_path = self.root / "registry.lock"
+        self._config_path = self.root / "config.json"
 
     # ------------------------------------------------------------------ registry
 
@@ -155,11 +158,14 @@ class StateStore:
         """Insert or update an agent in the registry. Returns the (refreshed) Agent.
 
         If ``agent_id`` is supplied and already present, the existing entry is
-        refreshed (upsert): **only ``pid`` and ``last_seen`` are updated**.
-        Name, working_dir, and focus are preserved across re-registration —
-        the SessionStart hook fires on every restart and would otherwise wipe
-        any manual rename / focus the agent set last session. If ``agent_id``
-        is omitted, a fresh random one is generated and a new entry is added.
+        refreshed (upsert): ``pid``/``pid_start``/``last_seen`` are updated and
+        ``status`` is **reset to ``None``**. Name, working_dir, and focus are
+        preserved across re-registration — the SessionStart hook fires on every
+        restart and would otherwise wipe any manual rename / focus the agent set
+        last session. ``status`` is the exception: a fresh session isn't
+        ``blocked`` just because the last one was, so a stale status is reset
+        rather than carried. If ``agent_id`` is omitted, a fresh random one is
+        generated and a new entry is added.
         """
         new_entry = Agent(
             agent_id=agent_id if agent_id is not None else _new_id("agent"),
@@ -173,11 +179,13 @@ class StateStore:
             agents = self._read_registry_unlocked()
             for i, existing in enumerate(agents):
                 if existing.agent_id == new_entry.agent_id:
-                    # Refresh only session-state fields; preserve everything
-                    # the agent may have customized in-session.
+                    # Refresh session-state fields; preserve name/working_dir/
+                    # focus (agent customizations). Reset status — a stale
+                    # status from a prior session would mislead the fleet view.
                     existing.pid = new_entry.pid
                     existing.pid_start = new_entry.pid_start
                     existing.last_seen = new_entry.last_seen
+                    existing.status = None
                     agents[i] = existing
                     self._write_registry_unlocked(agents)
                     return existing
@@ -210,6 +218,21 @@ class StateStore:
             for agent in agents:
                 if agent.agent_id == agent_id:
                     agent.focus = normalized
+                    self._write_registry_unlocked(agents)
+                    return agent
+            return None
+
+    def set_status(self, agent_id: str, status: Status | None) -> Agent | None:
+        """Update an agent's status. Returns the updated Agent, or ``None`` if not registered.
+
+        Pure registry write — does NOT notify any peer (status is pull-queried
+        via ``list_agents``, not pushed). Reset to ``None`` on re-registration.
+        """
+        with self._registry_lock():
+            agents = self._read_registry_unlocked()
+            for agent in agents:
+                if agent.agent_id == agent_id:
+                    agent.status = status
                     self._write_registry_unlocked(agents)
                     return agent
             return None
@@ -371,6 +394,33 @@ class StateStore:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(msg_id)
         tmp.replace(path)
+
+    # ------------------------------------------------------------------ config
+
+    def _read_config(self) -> dict[str, object]:
+        if not self._config_path.exists():
+            return {}
+        try:
+            parsed = json.loads(self._config_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return cast("dict[str, object]", parsed) if isinstance(parsed, dict) else {}
+
+    def get_status_tracking(self) -> bool:
+        """Whether status tracking is enabled bus-wide (default off).
+
+        Gates only whether ``session-start`` injects the status-maintenance
+        instruction into agent context — ``set_status`` itself always works.
+        """
+        return bool(self._read_config().get("status_tracking", False))
+
+    def set_status_tracking(self, enabled: bool) -> None:
+        """Enable/disable status tracking bus-wide (persisted in config.json)."""
+        config = self._read_config()
+        config["status_tracking"] = enabled
+        tmp = self._config_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(config, indent=2))
+        tmp.replace(self._config_path)
 
     # ------------------------------------------------------------------ blocking wait
 

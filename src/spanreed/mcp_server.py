@@ -20,7 +20,7 @@ from anyio import to_thread
 from mcp.server.fastmcp import FastMCP
 
 from spanreed.identity import derive_agent_identity
-from spanreed.protocol import Message
+from spanreed.protocol import Message, Status
 from spanreed.store import StateStore, default_state_root
 
 
@@ -173,6 +173,26 @@ def set_focus(focus: str | None = None) -> dict[str, object] | None:
     """
     agent_id, _ = derive_agent_identity()
     agent = StateStore().set_focus(agent_id, focus)
+    return agent.model_dump(mode="json") if agent else None
+
+
+@mcp_app.tool()
+def set_status(status: Status) -> dict[str, object] | None:
+    """Set this session's status on the bus — how much human attention you need.
+
+    One of:
+      - ``working``     — actively making progress; no human needed.
+      - ``needs_input`` — you want a human decision/answer (may still proceed).
+      - ``blocked``     — stopped; cannot continue without a human.
+      - ``idle``        — not actively working.
+
+    Peers read this via ``list_agents`` ("who needs a human" = status in
+    {needs_input, blocked}). It is pull-only: setting it does NOT notify anyone.
+    Returns the updated agent record, or ``None`` if this session isn't
+    registered on the bus.
+    """
+    agent_id, _ = derive_agent_identity()
+    agent = StateStore().set_status(agent_id, status)
     return agent.model_dump(mode="json") if agent else None
 
 
