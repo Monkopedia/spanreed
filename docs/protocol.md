@@ -101,6 +101,8 @@ Agents may report a `status` describing how much human attention they need — o
 
 Status tracking is **off by default** and enabled bus-wide via `spanreed status-tracking on` (persisted in `<state_root>/config.json` as `{"status_tracking": true}`). The flag gates **only** whether `session-start` injects the status-maintenance instruction into agent context — so a bus with tracking off pays zero context tokens for the feature. `set_status` itself always works regardless of the flag; when off, agents simply aren't told to maintain status and `list_agents` shows `status: null`.
 
+The instruction binds status to actions the agent already takes rather than relying on willpower: it directs the agent to (a) set `working`/`idle` as an explicit **first action on resume** (catching the resumed-mid-work case), (b) set `needs_input`/`blocked` at the same moment it escalates per disposition rule 4, and (c) set `idle` on completion. Auto-inferring status from bus activity was considered and rejected — status is a *semantic* declaration (only the agent knows `blocked` vs `working`), activity-inference can't produce `needs_input`/`blocked` and would mismark an active-but-quiet agent as idle, and every variant reintroduces the timer/wakeup model the liveness design rejected. The complementary lever is the urithiru workflow playbooks, which call `set_status` at their own task transitions.
+
 ## Identity model
 
 Agents are addressed by `agent_id`. The id is **deterministic per session**:

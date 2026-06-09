@@ -83,6 +83,20 @@ def _cmd_recv(args: argparse.Namespace) -> int:
     return 0
 
 
+def _write_disposition_policy() -> None:
+    """Write the disposition policy to ``<state_root>/disposition-policy.md``.
+
+    The inbox Monitor's description points agents at this file, so it must exist
+    whenever the bus is in use. Written by both ``session-start`` and
+    ``inbox-watch`` (the Monitor command) — binding the file's existence to the
+    same mechanism that references it, so it can't go missing for a live monitor
+    regardless of hook ordering or a deleted file. Idempotent (constant content).
+    """
+    root = default_state_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "disposition-policy.md").write_text(_DISPOSITION_POLICY)
+
+
 def _cmd_inbox_watch(_args: argparse.Namespace) -> int:
     """tail -F this session's inbox file. Used by the plugin Monitor.
 
@@ -90,6 +104,9 @@ def _cmd_inbox_watch(_args: argparse.Namespace) -> int:
     bookkeeping, no buffering issues, signal handling delegated to ``tail``.
     """
     agent_id, _ = derive_agent_identity()
+    # The Monitor's description tells agents to read the disposition policy file;
+    # ensure it exists before we exec into tail and never return.
+    _write_disposition_policy()
     inbox = default_state_root() / "inboxes" / f"{agent_id}.jsonl"
     inbox.parent.mkdir(parents=True, exist_ok=True)
     inbox.touch(exist_ok=True)
@@ -158,14 +175,22 @@ restarts.
 # bus-wide (see _cmd_status_tracking). Kept tight — it costs context tokens
 # whenever it's on.
 _STATUS_INSTRUCTION = """\
-Status tracking is ON for this bus. Keep your status current via set_status so \
-the user and peers can see who needs attention (they read it through \
-list_agents; it does NOT notify anyone). Call set_status with:
-  - working     — when you start actively working a task
-  - needs_input — when you want the user's decision/answer (you may still proceed)
-  - blocked     — when you cannot continue without the user
-  - idle        — when you finish and are no longer working
-Set it as these transitions happen; don't wait to be asked."""
+Status tracking is ON for this bus. Your status tells the user and peers who \
+needs attention; they read it through list_agents (it does NOT notify anyone). \
+Keep it bound to what you're actually doing — set it at these transitions, don't \
+wait to be asked:
+
+  - FIRST, right now before anything else: call set_status — `working` if you \
+have an active task in progress (e.g. you resumed mid-work), otherwise `idle`. \
+Don't skip this; a resumed session mid-task that never sets `working` is the \
+main way status goes stale.
+  - `working` — whenever you start actively working a task.
+  - `needs_input` / `blocked` — at the SAME moment you hit disposition rule 4 \
+(needs user judgment → reply needs-user-attention + PushNotification): also \
+set_status `needs_input` (you can still proceed) or `blocked` (you're stopped).
+  - `idle` — when you finish and are no longer working.
+
+set_status values: idle | working | needs_input | blocked."""
 
 
 def _self_entry(store: StateStore, agent_id: str) -> Agent | None:
@@ -297,9 +322,8 @@ def _cmd_session_start(_args: argparse.Namespace) -> int:
     agent = store.register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
     # Write the disposition policy to a stable path so the inbox Monitor's
     # description can be a one-liner that points here instead of re-injecting
-    # the whole policy on every event.
-    policy_path = default_state_root() / "disposition-policy.md"
-    policy_path.write_text(_DISPOSITION_POLICY)
+    # the whole policy on every event. (Also re-written by inbox-watch.)
+    _write_disposition_policy()
     context = _SESSION_START_CONTEXT_TEMPLATE.format(
         agent_id=agent.agent_id,
         name=agent.name,

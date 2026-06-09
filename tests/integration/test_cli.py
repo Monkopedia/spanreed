@@ -268,6 +268,24 @@ class TestSessionStart:
         assert "FOCUS_UPDATE_REQUEST" in policy
         assert "PushNotification" in policy
 
+    def test_inbox_watch_writes_disposition_policy_file(
+        self, cli_env: Path, state_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The Monitor command must ensure the file it points agents at exists,
+        even if session-start never ran. inbox-watch execs tail, so stub execvp."""
+        policy_file = state_root / "disposition-policy.md"
+        assert not policy_file.exists()  # session-start did not run in this test
+
+        captured: list[list[str]] = []
+
+        def fake_execvp(_file: str, args: list[str]) -> None:
+            captured.append(args)
+
+        monkeypatch.setattr(cli.os, "execvp", fake_execvp)
+        cli.main(["inbox-watch"])
+        assert policy_file.read_text()  # written before exec
+        assert captured and captured[0][0] == "tail"
+
 
 # ---------------------------------------------------------------- focus
 
