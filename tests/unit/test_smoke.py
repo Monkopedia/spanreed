@@ -3,17 +3,35 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from datetime import datetime
 from importlib.metadata import version
+from pathlib import Path
 
 from spanreed import __version__
 from spanreed.protocol import Agent, Message
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_version_matches_package_metadata() -> None:
     # __version__ is derived from installed metadata, so it can't drift from the
     # packaged version the way a hardcoded string did.
     assert __version__ == version("spanreed-bus")
+
+
+def test_plugin_version_matches_pyproject() -> None:
+    # The plugin and the PyPI package ship in lockstep — the plugin's MCP server
+    # runs the installed `spanreed` package. Claude Code's `/plugin update` keys
+    # off plugin.json's version, NOT pyproject's, so if these drift the fleet
+    # silently never updates (it once sat at 0.0.1 while the package was 0.0.5).
+    # Pin them together so a release that bumps one must bump the other.
+    pyproject = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
+    pkg_version = pyproject["project"]["version"]
+    plugin = json.loads(
+        (_REPO_ROOT / "plugins" / "spanreed" / ".claude-plugin" / "plugin.json").read_text()
+    )
+    assert plugin["version"] == pkg_version
 
 
 def test_agent_serializes() -> None:

@@ -47,6 +47,37 @@ Pytest is configured with `asyncio_mode = "auto"`, so `async def test_*` functio
 
 GitHub Actions runs `ruff format --check`, `ruff check`, `pyright`, and `pytest` on every push to main and every PR. Local `make check` should match what CI does.
 
+## Releasing
+
+There are **two** version numbers and they move in lockstep:
+
+1. `pyproject.toml` `project.version` — the `spanreed-bus` PyPI package (the MCP
+   server + CLI code).
+2. `plugins/spanreed/.claude-plugin/plugin.json` `version` — the Claude Code
+   plugin (hooks, monitor, `.mcp.json`).
+
+Claude Code's `/plugin update` compares **plugin.json's** version, not the
+package's. If only the package version moves, every other machine sees the same
+plugin version and reports "up to date" — it never re-pulls the plugin files.
+(This is exactly how the plugin sat at `0.0.1` while the package reached `0.0.5`.)
+
+A unit test (`test_plugin_version_matches_pyproject`) and the release workflow
+both assert these match, so a half-bump fails `make check` / the tagged build.
+
+To cut a release:
+
+```bash
+# bump BOTH versions to the new X.Y.Z
+uv lock                      # refresh the lockfile
+make check                   # version-sync test must pass
+git commit -am "release X.Y.Z"
+git tag vX.Y.Z
+git push origin main && git push origin vX.Y.Z   # tag push triggers PyPI publish
+```
+
+Then on each consuming machine: `/plugin update spanreed` inside Claude (picks up
+the new plugin) **and** upgrade the package (`uv tool upgrade spanreed-bus`).
+
 ## Conventions
 
 See [`../CLAUDE.md`](../CLAUDE.md) for the project discipline rules — they apply to humans and Claude sessions alike. The short version:
