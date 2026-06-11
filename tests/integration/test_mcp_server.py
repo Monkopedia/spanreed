@@ -36,6 +36,13 @@ def mcp_env(monkeypatch: pytest.MonkeyPatch, state_root: Path) -> Iterator[None]
     yield
 
 
+@pytest.fixture
+def ab(mcp_env: None) -> None:
+    """Register toy recipients A and B; send_message rejects unknown recipients."""
+    register_agent(name="A", working_dir="/tmp/a", pid=os.getpid(), agent_id="A")
+    register_agent(name="B", working_dir="/tmp/b", pid=os.getpid(), agent_id="B")
+
+
 def test_register_then_list(mcp_env: None) -> None:
     agent = register_agent(name="alice", working_dir="/tmp/x", pid=os.getpid())
     assert agent["name"] == "alice"
@@ -71,7 +78,7 @@ def test_deregister_returns_ok(mcp_env: None) -> None:
     assert not any(a["agent_id"] == agent["agent_id"] for a in list_agents())
 
 
-def test_send_and_recv_round_trip(mcp_env: None) -> None:
+def test_send_and_recv_round_trip(ab: None) -> None:
     msg = send_message(from_agent="A", to_agent="B", body="hello")
     assert msg["body"] == "hello"
     delivered = recv_messages(agent_id="B")
@@ -79,7 +86,20 @@ def test_send_and_recv_round_trip(mcp_env: None) -> None:
     assert delivered[0]["msg_id"] == msg["msg_id"]
 
 
-def test_recv_with_cursor(mcp_env: None) -> None:
+def test_send_to_unknown_recipient_raises(mcp_env: None) -> None:
+    # The tool surfaces the error to the caller instead of silently dropping it.
+    with pytest.raises(ValueError, match="not a registered"):
+        send_message(from_agent="A", to_agent="nobody", body="hello")
+
+
+def test_send_resolves_display_name(mcp_env: None) -> None:
+    register_agent(name="ksrpc", working_dir="/tmp/k", pid=os.getpid(), agent_id="agent-k")
+    msg = send_message(from_agent="A", to_agent="ksrpc", body="hi")
+    assert msg["to_agent"] == "agent-k"
+    assert len(recv_messages(agent_id="agent-k")) == 1
+
+
+def test_recv_with_cursor(ab: None) -> None:
     m1 = send_message(from_agent="A", to_agent="B", body="one")
     m2 = send_message(from_agent="A", to_agent="B", body="two")
     after = recv_messages(agent_id="B", since_msg_id=str(m1["msg_id"]))
@@ -87,7 +107,7 @@ def test_recv_with_cursor(mcp_env: None) -> None:
     assert after[0]["msg_id"] == m2["msg_id"]
 
 
-def test_send_with_in_reply_to(mcp_env: None) -> None:
+def test_send_with_in_reply_to(ab: None) -> None:
     m1 = send_message(from_agent="A", to_agent="B", body="ping")
     m2 = send_message(
         from_agent="B",
@@ -98,7 +118,7 @@ def test_send_with_in_reply_to(mcp_env: None) -> None:
     assert m2["in_reply_to"] == m1["msg_id"]
 
 
-async def test_wait_for_reply_returns_reply(mcp_env: None) -> None:
+async def test_wait_for_reply_returns_reply(ab: None) -> None:
     m1 = send_message(from_agent="A", to_agent="B", body="ping")
 
     async def post_reply() -> None:
@@ -120,7 +140,7 @@ async def test_wait_for_reply_returns_reply(mcp_env: None) -> None:
     assert reply["in_reply_to"] == m1["msg_id"]
 
 
-async def test_wait_for_reply_times_out(mcp_env: None) -> None:
+async def test_wait_for_reply_times_out(ab: None) -> None:
     m1 = send_message(from_agent="A", to_agent="B", body="ping")
     reply = await wait_for_reply(agent_id="A", in_reply_to=str(m1["msg_id"]), timeout_s=0.2)
     assert reply is None

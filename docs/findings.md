@@ -164,3 +164,17 @@ What happened:
 5. spanreed-side's Monitor woke Claude with the reply; she summarized it for the user — including unprompted helpful context ("It's a Gradle multi-module Kotlin project with modules: protocol, lib, frontend, backend, e2e").
 
 Everything we proved with the file-stub experiments (Tests 1–4) carried through to the real implementation. The bus is doing real work.
+
+## Incident: misaddressed messages silently black-holed (2026-06-11)
+
+**Symptom (as first reported):** a peer claimed plain `send_message` didn't reliably *wake* an idle agent, while `request_focus_update` to the same agent replied instantly — framed as a Monitor/wake asymmetry (filed as a GitHub issue).
+
+**Actual root cause: addressing, not wake.** The sender (the konstructor agent) was addressing messages by **display name** (`to_agent="ksrpc"`) instead of `agent_id` (`agent-345940f7`). `send_message` did `inbox.open("a")`, which happily *creates* `inboxes/ksrpc.jsonl` — a file no Monitor tails (the recipient's Monitor watches `inboxes/agent-345940f7.jsonl`). The message was written, `send_message` returned success, and it was never delivered. `wait_for_reply` then timed out with no error. `request_focus_update` "worked" only because it happened to be called with the correct `agent_id`.
+
+Confirmed by inspecting on-disk state: **11 stranded messages** across 5 name-addressed inbox files (`ksrpc.jsonl`, `lsp-kotlin.jsonl`, `spanreed.jsonl`, `main-coordinator.jsonl`, `kodemirror.jsonl`), all from the same sender. (The bug report itself — `konstructor → spanreed` — was one of the lost messages, addressed to the name `spanreed`.) Re-routing them to the correct `agent-<id>` inboxes woke the recipients normally, reconfirming the wake path was never broken.
+
+**Why the wake theory was wrong:** the Monitor is a content-agnostic `tail -F`; `request_focus_update` is literally `send_message` + `wait_for_reply` on the wire, identical on the receiver. There was no mechanism by which body content could change whether the recipient woke — because the failing messages never reached the watched inbox at all.
+
+**Fix:** `send_message` now resolves/validates `to_agent` against the registry (see [protocol.md](protocol.md#mcp-tool-surface)) — unknown recipient raises, a unique display name resolves to its id — so a misaddress becomes an immediate, self-correcting error instead of a silent loss. The cross-host bridge's delivery path (`append_message`) is intentionally exempt: it delivers pre-addressed mail verbatim.
+
+**Lesson:** a "delivery"/"wake" symptom can be an *addressing* bug. The transport silently accepting any recipient string was the real defect; the absence of an error made it present as a flaky wake.

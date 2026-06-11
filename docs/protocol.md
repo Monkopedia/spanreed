@@ -60,7 +60,7 @@ Implemented in `src/spanreed/mcp_server.py` via FastMCP:
 - `register_agent(name, working_dir, pid, agent_id?) -> Agent` — upsert by id if supplied; preserves existing `focus` on upsert.
 - `deregister_agent(agent_id) -> {ok: true}`
 - `list_agents(include_stale=false) -> [Agent, ...]` — Agent records include `focus` and `status` fields.
-- `send_message(from_agent, to_agent, body, in_reply_to?) -> Message`
+- `send_message(from_agent, to_agent, body, in_reply_to?) -> Message` — `to_agent` is **validated against the registry**: a known `agent_id` is used as-is, a unique display *name* resolves to its id, an ambiguous name or an unknown recipient **raises**. This stops a misaddressed message (e.g. sent to a display name) from being silently written to an inbox no monitor tails. Resolution uses the include-stale registry view, so a crashed-but-not-pruned agent stays addressable (mail waits for its restart).
 - `recv_messages(agent_id, since_msg_id?) -> [Message, ...]`
 - `wait_for_reply(agent_id, in_reply_to, timeout_s) -> Message | null` — blocks up to `timeout_s`.
 - `set_focus(focus) -> Agent | null` — set/clear the calling session's focus (uses derived identity); `null` if not registered. Empty string clears.

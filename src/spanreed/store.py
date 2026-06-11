@@ -310,6 +310,40 @@ class StateStore:
     def _inbox_path(self, agent_id: str) -> Path:
         return self._inboxes_dir / f"{agent_id}.jsonl"
 
+    def _resolve_recipient(self, to_agent: str) -> str:
+        """Resolve ``to_agent`` to a registered ``agent_id``, or raise.
+
+        A bare ``inbox.open("a")`` will happily create an inbox for any string,
+        so addressing a message by display *name* (or a typo) silently lands it
+        in a file no monitor tails — the message is lost with no error to the
+        sender. This guards that: the recipient must be in the registry.
+
+        Resolution (registry includes stale entries, so a mid-restart peer still
+        accepts mail that waits for it):
+
+        - ``to_agent`` is a known ``agent_id`` → use it as-is.
+        - ``to_agent`` uniquely matches one agent's display name → resolve to
+          that agent's id (a convenience; ``send_message("ksrpc", ...)`` works).
+        - ``to_agent`` matches several agents' names → ambiguous, raise.
+        - otherwise → unknown recipient, raise.
+        """
+        agents = self.list_agents(include_stale=True)
+        if any(a.agent_id == to_agent for a in agents):
+            return to_agent
+        by_name = [a for a in agents if a.name == to_agent]
+        if len(by_name) == 1:
+            return by_name[0].agent_id
+        if len(by_name) > 1:
+            ids = ", ".join(a.agent_id for a in by_name)
+            raise ValueError(
+                f"{to_agent!r} is a display name shared by multiple agents ({ids}); "
+                "address by agent_id."
+            )
+        raise ValueError(
+            f"{to_agent!r} is not a registered agent_id or display name. "
+            "Call list_agents to find the recipient's agent_id."
+        )
+
     def send_message(
         self,
         from_agent: str,
@@ -317,7 +351,13 @@ class StateStore:
         body: str,
         in_reply_to: str | None = None,
     ) -> Message:
-        """Append a message to the recipient's inbox and return it."""
+        """Append a message to the recipient's inbox and return it.
+
+        ``to_agent`` is resolved against the registry (see
+        :meth:`_resolve_recipient`): an unknown recipient raises rather than
+        silently creating a dead inbox, and a display name resolves to its id.
+        """
+        to_agent = self._resolve_recipient(to_agent)
         msg = Message(
             msg_id=_new_id("msg"),
             from_agent=from_agent,

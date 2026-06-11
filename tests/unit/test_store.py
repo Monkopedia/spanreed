@@ -9,6 +9,8 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from spanreed import store as store_module
 from spanreed.protocol import Agent, Message
 from spanreed.store import StateStore
@@ -19,6 +21,19 @@ def _dead_pid() -> int:
     proc = subprocess.Popen(["true"])
     proc.wait()
     return proc.pid
+
+
+@pytest.fixture
+def ab_registered(store: StateStore) -> StateStore:
+    """Register toy recipients ``A`` and ``B`` in the same store.
+
+    ``send_message`` now rejects unregistered recipients, so the inbox/cursor/
+    wait tests (which post to bare ids) need those ids on the registry first.
+    Depends on ``store`` so a test requesting both gets the one instance.
+    """
+    for aid in ("A", "B"):
+        store.register_agent(name=aid, working_dir="/tmp", pid=os.getpid(), agent_id=aid)
+    return store
 
 
 # ----------------------------------------------------------------- registry
@@ -427,7 +442,9 @@ class TestBridgePrimitives:
 
 
 class TestInboxes:
-    def test_send_creates_inbox_if_missing(self, store: StateStore) -> None:
+    def test_send_creates_inbox_if_missing(
+        self, store: StateStore, ab_registered: StateStore
+    ) -> None:
         msg = store.send_message(from_agent="A", to_agent="B", body="hello")
         assert msg.msg_id.startswith("msg-")
         assert msg.body == "hello"
@@ -436,12 +453,12 @@ class TestInboxes:
     def test_recv_returns_empty_for_unknown_agent(self, store: StateStore) -> None:
         assert store.recv_messages("nobody") == []
 
-    def test_send_then_recv_round_trip(self, store: StateStore) -> None:
+    def test_send_then_recv_round_trip(self, store: StateStore, ab_registered: StateStore) -> None:
         m1 = store.send_message(from_agent="A", to_agent="B", body="one")
         m2 = store.send_message(from_agent="A", to_agent="B", body="two")
         assert store.recv_messages("B") == [m1, m2]
 
-    def test_in_reply_to_round_trip(self, store: StateStore) -> None:
+    def test_in_reply_to_round_trip(self, store: StateStore, ab_registered: StateStore) -> None:
         m1 = store.send_message(from_agent="A", to_agent="B", body="ping")
         m2 = store.send_message(from_agent="B", to_agent="A", body="pong", in_reply_to=m1.msg_id)
         delivered = store.recv_messages("A")
@@ -453,13 +470,17 @@ class TestInboxes:
 
 
 class TestCursors:
-    def test_recv_with_cursor_returns_only_new(self, store: StateStore) -> None:
+    def test_recv_with_cursor_returns_only_new(
+        self, store: StateStore, ab_registered: StateStore
+    ) -> None:
         m1 = store.send_message(from_agent="A", to_agent="B", body="one")
         m2 = store.send_message(from_agent="A", to_agent="B", body="two")
         m3 = store.send_message(from_agent="A", to_agent="B", body="three")
         assert store.recv_messages("B", since_msg_id=m1.msg_id) == [m2, m3]
 
-    def test_recv_with_unknown_cursor_returns_all(self, store: StateStore) -> None:
+    def test_recv_with_unknown_cursor_returns_all(
+        self, store: StateStore, ab_registered: StateStore
+    ) -> None:
         m1 = store.send_message(from_agent="A", to_agent="B", body="one")
         assert store.recv_messages("B", since_msg_id="msg-deadbeef") == [m1]
 
@@ -480,7 +501,7 @@ class TestCursors:
 
 
 class TestWaitForReply:
-    def test_returns_matching_reply(self, store: StateStore) -> None:
+    def test_returns_matching_reply(self, store: StateStore, ab_registered: StateStore) -> None:
         m1 = store.send_message(from_agent="A", to_agent="B", body="ping")
 
         result: list[object] = []
@@ -495,7 +516,7 @@ class TestWaitForReply:
         t.join(timeout=2.0)
         assert result == [reply]
 
-    def test_times_out_when_no_reply(self, store: StateStore) -> None:
+    def test_times_out_when_no_reply(self, store: StateStore, ab_registered: StateStore) -> None:
         m1 = store.send_message(from_agent="A", to_agent="B", body="ping")
         result = store.wait_for_reply(
             agent_id="A",
@@ -505,7 +526,9 @@ class TestWaitForReply:
         )
         assert result is None
 
-    def test_returns_existing_matching_message_immediately(self, store: StateStore) -> None:
+    def test_returns_existing_matching_message_immediately(
+        self, store: StateStore, ab_registered: StateStore
+    ) -> None:
         """wait_for_reply should find a matching reply already in the inbox.
 
         This is the fix for the race where a reply lands between the caller's
@@ -523,7 +546,7 @@ class TestWaitForReply:
         )
         assert result == reply
 
-    def test_ignores_unrelated_messages(self, store: StateStore) -> None:
+    def test_ignores_unrelated_messages(self, store: StateStore, ab_registered: StateStore) -> None:
         m1 = store.send_message(from_agent="A", to_agent="B", body="ping")
         result_holder: list[object] = []
 
@@ -544,3 +567,43 @@ class TestWaitForReply:
         store.send_message(from_agent="C", to_agent="A", body="unrelated")
         t.join(timeout=1.0)
         assert result_holder == [None]
+
+
+# ----------------------------------------------------------- recipient validation
+
+
+class TestRecipientValidation:
+    """send_message must not silently black-hole a message to a dead inbox."""
+
+    def test_unknown_recipient_raises(self, store: StateStore) -> None:
+        with pytest.raises(ValueError, match="not a registered"):
+            store.send_message(from_agent="A", to_agent="ghost", body="x")
+
+    def test_known_id_delivers(self, store: StateStore) -> None:
+        store.register_agent(name="bee", working_dir="/tmp", pid=os.getpid(), agent_id="agent-bee")
+        msg = store.send_message(from_agent="A", to_agent="agent-bee", body="x")
+        assert store.recv_messages("agent-bee") == [msg]
+
+    def test_display_name_resolves_to_id(self, store: StateStore) -> None:
+        # The real-world bug: addressing by name instead of agent_id. Now it
+        # resolves to the id and lands in the inbox the recipient actually tails.
+        store.register_agent(
+            name="ksrpc", working_dir="/tmp", pid=os.getpid(), agent_id="agent-345940f7"
+        )
+        msg = store.send_message(from_agent="A", to_agent="ksrpc", body="hi")
+        assert msg.to_agent == "agent-345940f7"
+        assert store.recv_messages("agent-345940f7") == [msg]
+        assert store.recv_messages("ksrpc") == []  # nothing left in a dead name-inbox
+
+    def test_ambiguous_display_name_raises(self, store: StateStore) -> None:
+        store.register_agent(name="dup", working_dir="/tmp", pid=os.getpid(), agent_id="agent-1")
+        store.register_agent(name="dup", working_dir="/tmp", pid=os.getpid(), agent_id="agent-2")
+        with pytest.raises(ValueError, match="multiple agents"):
+            store.send_message(from_agent="A", to_agent="dup", body="x")
+
+    def test_stale_recipient_still_delivers(self, store: StateStore) -> None:
+        # A crashed-but-not-pruned agent stays addressable; mail waits for its
+        # restart rather than erroring (resolution uses the include-stale view).
+        store.register_agent(name="z", working_dir="/tmp", pid=_dead_pid(), agent_id="agent-z")
+        msg = store.send_message(from_agent="A", to_agent="agent-z", body="x")
+        assert store.recv_messages("agent-z") == [msg]

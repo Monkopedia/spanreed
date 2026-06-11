@@ -94,6 +94,11 @@ def send_message(
 ) -> dict[str, object]:
     """Append a message to ``to_agent``'s inbox and return the posted message.
 
+    ``to_agent`` must be a registered ``agent_id`` (from ``list_agents``). As a
+    convenience a unique display name is accepted and resolved to its id; an
+    unknown recipient raises rather than silently dropping the message into an
+    inbox no one reads.
+
     The ``in_reply_to`` field, if set, threads this message as a response to a
     prior one. ``wait_for_reply`` uses this to match replies to their requests.
     """

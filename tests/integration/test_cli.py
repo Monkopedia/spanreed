@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from spanreed import cli
+from spanreed.store import StateStore
 
 
 @pytest.fixture
@@ -25,6 +26,17 @@ def cli_env(monkeypatch: pytest.MonkeyPatch, state_root: Path, tmp_path: Path) -
     session_cwd.mkdir()
     monkeypatch.chdir(session_cwd)
     yield session_cwd
+
+
+def _register_peer(agent_id: str) -> None:
+    """Put a recipient on the registry so ``send`` accepts it (state root via env).
+
+    ``send_message`` now rejects unregistered recipients to stop messages being
+    silently dropped into an inbox no one reads.
+    """
+    StateStore().register_agent(
+        name=agent_id, working_dir="/tmp", pid=os.getpid(), agent_id=agent_id
+    )
 
 
 def _run(capsys: pytest.CaptureFixture[str], argv: list[str]) -> tuple[int, str]:
@@ -132,6 +144,7 @@ class TestMessages:
     def test_send_outputs_message_json(
         self, cli_env: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        _register_peer("agent-B")
         rc, out = _run(
             capsys,
             ["send", "--from", "agent-A", "--to", "agent-B", "--body", "hello"],
@@ -145,6 +158,7 @@ class TestMessages:
     def test_send_then_recv_round_trip(
         self, cli_env: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        _register_peer("agent-B")
         _run(
             capsys,
             ["send", "--from", "agent-A", "--to", "agent-B", "--body", "one"],
@@ -162,6 +176,7 @@ class TestMessages:
     def test_send_default_from_uses_session_identity(
         self, cli_env: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        _register_peer("agent-B")
         _, id_out = _run(capsys, ["agent-id"])
         my_id = id_out.strip()
         _run(capsys, ["send", "--to", "agent-B", "--body", "hi"])
@@ -170,6 +185,7 @@ class TestMessages:
         assert msgs[0]["from_agent"] == my_id
 
     def test_send_with_in_reply_to(self, cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        _register_peer("agent-B")
         rc, out = _run(
             capsys,
             [
@@ -189,6 +205,7 @@ class TestMessages:
         assert msg["in_reply_to"] == "msg-1"
 
     def test_recv_with_since(self, cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        _register_peer("agent-B")
         _, m1_out = _run(
             capsys,
             ["send", "--from", "agent-A", "--to", "agent-B", "--body", "one"],
