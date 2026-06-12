@@ -160,9 +160,10 @@ Use the spanreed MCP tools to interact with the bus:
   - set_name(name)                                 — rename YOUR display name on the bus
   - request_focus_update(agent_id, timeout_s?)     — ask a peer to refresh + report their focus
 
-Set your focus via set_focus whenever the user gives you a new task — keep it a \
-short sentence so peers can see at a glance what you're doing. Preserved across \
-session restarts.
+set_focus is optional and pull-only — peers see it in list_agents, nobody is \
+notified. Set a one-line focus when you pick up a major task, then leave it (it's \
+preserved across restarts); don't update it for every small step. A peer who \
+needs a fresh read can request_focus_update you.
 
 Your default name is the basename of your cwd. If that's not descriptive (e.g. "git" \
 because cwd is ``~/git``), call set_name with something better — also preserved across \
