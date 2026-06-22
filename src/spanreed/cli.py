@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from spanreed.identity import derive_agent_identity
@@ -296,6 +297,47 @@ def _cmd_status_tracking(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_activity_log(args: argparse.Namespace) -> int:
+    """Enable/disable bus-wide activity logging, or show the current setting."""
+    store = StateStore()
+    if args.state is None:
+        print("on" if store.get_activity_log() else "off")
+        return 0
+    store.set_activity_log(args.state == "on")
+    print("on" if args.state == "on" else "off")
+    return 0
+
+
+def _parse_since(value: str) -> datetime:
+    """Parse a ``--since`` value: a relative age (``24h``/``30m``/``7d``) or ISO-8601.
+
+    Returns a timezone-aware UTC datetime. Raises ``ValueError`` on bad input.
+    """
+    units = {"m": "minutes", "h": "hours", "d": "days"}
+    if len(value) >= 2 and value[-1] in units and value[:-1].isdigit():
+        return datetime.now(UTC) - timedelta(**{units[value[-1]]: int(value[:-1])})
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _cmd_log(args: argparse.Namespace) -> int:
+    """Dump the activity log as JSON lines (one focus/status transition each)."""
+    since = None
+    if args.since is not None:
+        try:
+            since = _parse_since(args.since)
+        except ValueError:
+            print(
+                f"log: invalid --since {args.since!r} (use e.g. 24h, 30m, 7d, or an ISO timestamp)",
+                file=sys.stderr,
+            )
+            return 2
+    records = StateStore().read_activity(since=since, agent=args.agent)
+    for record in records:
+        print(record.model_dump_json())
+    return 0
+
+
 def _cmd_conjoin(args: argparse.Namespace) -> int:
     """Conjoin this bus to a peer's over SSH (or serve the remote end)."""
     from spanreed import bridge
@@ -420,6 +462,21 @@ def build_parser() -> argparse.ArgumentParser:
         "state", nargs="?", choices=["on", "off"], help="Omit to show current setting."
     )
 
+    p_activity_log = sub.add_parser(
+        "activity-log", help="Enable/disable bus-wide activity logging, or show the setting"
+    )
+    p_activity_log.add_argument(
+        "state", nargs="?", choices=["on", "off"], help="Omit to show current setting."
+    )
+
+    p_log = sub.add_parser(
+        "log", help="Dump the activity log (focus/status transitions) as JSON lines"
+    )
+    p_log.add_argument(
+        "--since", help="Only entries newer than this age (e.g. 24h, 30m, 7d) or an ISO timestamp"
+    )
+    p_log.add_argument("--agent", help="Only entries for this agent_id or display name")
+
     p_conjoin = sub.add_parser(
         "conjoin", help="Conjoin this bus to a peer host's bus over a persistent SSH bridge"
     )
@@ -460,6 +517,8 @@ _DISPATCH = {
     "name": _cmd_name,
     "status": _cmd_status,
     "status-tracking": _cmd_status_tracking,
+    "activity-log": _cmd_activity_log,
+    "log": _cmd_log,
     "conjoin": _cmd_conjoin,
 }
 

@@ -22,11 +22,11 @@ import time
 from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from pydantic import BaseModel
 
-from spanreed.protocol import Agent, Message, Status
+from spanreed.protocol import ActivityRecord, Agent, Message, Status
 
 
 class _RegistryDoc(BaseModel):
@@ -121,6 +121,7 @@ class StateStore:
         self._registry_path = self.root / "registry.json"
         self._registry_lock_path = self.root / "registry.lock"
         self._config_path = self.root / "config.json"
+        self._activity_log_path = self.root / "activity-log.jsonl"
 
     # ------------------------------------------------------------------ registry
 
@@ -217,8 +218,11 @@ class StateStore:
             agents = self._read_registry_unlocked()
             for agent in agents:
                 if agent.agent_id == agent_id:
+                    changed = agent.focus != normalized
                     agent.focus = normalized
                     self._write_registry_unlocked(agents)
+                    if changed:
+                        self._append_activity(agent, "focus", normalized)
                     return agent
             return None
 
@@ -232,8 +236,11 @@ class StateStore:
             agents = self._read_registry_unlocked()
             for agent in agents:
                 if agent.agent_id == agent_id:
+                    changed = agent.status != status
                     agent.status = status
                     self._write_registry_unlocked(agents)
+                    if changed:
+                        self._append_activity(agent, "status", status)
                     return agent
             return None
 
@@ -456,11 +463,75 @@ class StateStore:
 
     def set_status_tracking(self, enabled: bool) -> None:
         """Enable/disable status tracking bus-wide (persisted in config.json)."""
+        self._set_config_flag("status_tracking", enabled)
+
+    def get_activity_log(self) -> bool:
+        """Whether activity logging is enabled bus-wide (default off).
+
+        When on, ``set_focus``/``set_status`` append each transition to
+        ``activity-log.jsonl``. When off, nothing is written — zero cost.
+        """
+        return bool(self._read_config().get("activity_log", False))
+
+    def set_activity_log(self, enabled: bool) -> None:
+        """Enable/disable activity logging bus-wide (persisted in config.json)."""
+        self._set_config_flag("activity_log", enabled)
+
+    def _set_config_flag(self, key: str, value: bool) -> None:
         config = self._read_config()
-        config["status_tracking"] = enabled
+        config[key] = value
         tmp = self._config_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(config, indent=2))
         tmp.replace(self._config_path)
+
+    # ------------------------------------------------------------------ activity log
+
+    def _append_activity(
+        self, agent: Agent, kind: Literal["focus", "status"], value: str | None
+    ) -> None:
+        """Append a focus/status transition to the activity log, if enabled.
+
+        No-op when activity logging is off. Called from ``set_focus``/
+        ``set_status`` on a genuine change (callers skip no-op re-sets).
+        """
+        if not self.get_activity_log():
+            return
+        record = ActivityRecord(
+            ts=datetime.now(UTC),
+            agent_id=agent.agent_id,
+            name=agent.name,
+            kind=kind,
+            value=value,
+        )
+        with self._activity_log_path.open("a") as f:
+            f.write(record.model_dump_json() + "\n")
+
+    def read_activity(
+        self,
+        *,
+        since: datetime | None = None,
+        agent: str | None = None,
+    ) -> list[ActivityRecord]:
+        """Read the activity log in chronological order, optionally filtered.
+
+        ``since`` keeps records at or after that time; ``agent`` keeps records
+        whose ``agent_id`` OR ``name`` matches (callers may know either).
+        """
+        if not self._activity_log_path.exists():
+            return []
+        records: list[ActivityRecord] = []
+        with self._activity_log_path.open() as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                record = ActivityRecord.model_validate_json(line)
+                if since is not None and record.ts < since:
+                    continue
+                if agent is not None and agent not in (record.agent_id, record.name):
+                    continue
+                records.append(record)
+        return records
 
     # ------------------------------------------------------------------ blocking wait
 

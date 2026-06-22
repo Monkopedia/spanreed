@@ -607,3 +607,72 @@ class TestRecipientValidation:
         store.register_agent(name="z", working_dir="/tmp", pid=_dead_pid(), agent_id="agent-z")
         msg = store.send_message(from_agent="A", to_agent="agent-z", body="x")
         assert store.recv_messages("agent-z") == [msg]
+
+
+# ----------------------------------------------------------------- activity log
+
+
+class TestActivityLog:
+    def _reg(self, store: StateStore, agent_id: str, name: str) -> None:
+        store.register_agent(name=name, working_dir="/x", pid=os.getpid(), agent_id=agent_id)
+
+    def test_flag_defaults_off_and_roundtrips(self, store: StateStore) -> None:
+        assert store.get_activity_log() is False
+        store.set_activity_log(True)
+        assert store.get_activity_log() is True
+        store.set_activity_log(False)
+        assert store.get_activity_log() is False
+
+    def test_disabled_logs_nothing(self, store: StateStore) -> None:
+        self._reg(store, "agent-a", "a")
+        store.set_focus("agent-a", "doing things")
+        store.set_status("agent-a", "working")
+        assert store.read_activity() == []
+
+    def test_enabled_logs_focus_and_status_changes(self, store: StateStore) -> None:
+        self._reg(store, "agent-a", "kodemirror")
+        store.set_activity_log(True)
+        store.set_focus("agent-a", "vim-scroll cluster")
+        store.set_status("agent-a", "blocked")
+        records = store.read_activity()
+        assert [(r.kind, r.value) for r in records] == [
+            ("focus", "vim-scroll cluster"),
+            ("status", "blocked"),
+        ]
+        assert records[0].agent_id == "agent-a"
+        assert records[0].name == "kodemirror"  # name captured for the digest
+
+    def test_noop_reset_is_not_logged(self, store: StateStore) -> None:
+        self._reg(store, "agent-a", "a")
+        store.set_activity_log(True)
+        store.set_focus("agent-a", "same")
+        store.set_focus("agent-a", "same")  # unchanged → no record
+        store.set_status("agent-a", "working")
+        store.set_status("agent-a", "working")  # unchanged → no record
+        assert [r.kind for r in store.read_activity()] == ["focus", "status"]
+
+    def test_clearing_focus_logs_null(self, store: StateStore) -> None:
+        self._reg(store, "agent-a", "a")
+        store.set_activity_log(True)
+        store.set_focus("agent-a", "x")
+        store.set_focus("agent-a", "")  # clear
+        last = store.read_activity()[-1]
+        assert last.kind == "focus"
+        assert last.value is None
+
+    def test_read_filters_by_since(self, store: StateStore) -> None:
+        self._reg(store, "agent-a", "a")
+        store.set_activity_log(True)
+        store.set_focus("agent-a", "x")
+        assert len(store.read_activity(since=datetime(2000, 1, 1, tzinfo=UTC))) == 1
+        assert store.read_activity(since=datetime(2999, 1, 1, tzinfo=UTC)) == []
+
+    def test_read_filters_by_agent_id_or_name(self, store: StateStore) -> None:
+        self._reg(store, "agent-a", "kodemirror")
+        self._reg(store, "agent-b", "ksrpc")
+        store.set_activity_log(True)
+        store.set_focus("agent-a", "x")
+        store.set_focus("agent-b", "y")
+        assert len(store.read_activity(agent="agent-a")) == 1
+        assert len(store.read_activity(agent="kodemirror")) == 1  # name also matches
+        assert store.read_activity(agent="nobody") == []

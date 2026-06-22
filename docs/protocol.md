@@ -12,6 +12,8 @@ Under `~/.claude/spanreed/` (overridable via `SPANREED_STATE_ROOT`):
 registry.json           current agents
 inboxes/<agent_id>.jsonl    per-agent append-only message log
 cursors/<session_id>    per-session "last-seen msg_id" marker
+config.json             bus-wide flags (status_tracking, activity_log)
+activity-log.jsonl      append-only focus/status transition log (opt-in)
 ```
 
 ### `registry.json`
@@ -103,6 +105,39 @@ Status tracking is **off by default** and enabled bus-wide via `spanreed status-
 
 The instruction binds status to actions the agent already takes rather than relying on willpower: it directs the agent to (a) set `working`/`idle` as an explicit **first action on resume** (catching the resumed-mid-work case), (b) set `needs_input`/`blocked` at the same moment it escalates per disposition rule 4, and (c) set `idle` on completion. Auto-inferring status from bus activity was considered and rejected — status is a *semantic* declaration (only the agent knows `blocked` vs `working`), activity-inference can't produce `needs_input`/`blocked` and would mismark an active-but-quiet agent as idle, and every variant reintroduces the timer/wakeup model the liveness design rejected. The complementary lever is the urithiru workflow playbooks, which call `set_status` at their own task transitions.
 
+## Activity log
+
+An opt-in, append-only timeline of `focus` and `status` transitions, intended to
+be dumped and summarized (e.g. piped into an LLM for a daily "what did my agents
+do" digest). Spanreed only **emits** the log; summarization is the caller's job —
+no LLM dependency lives in the bus.
+
+- **Opt-in**, off by default: `spanreed activity-log on` (persisted in
+  `config.json` as `{"activity_log": true}`). When off, nothing is written — zero
+  cost, same model as `status_tracking`.
+- When on, `set_focus` and `set_status` append one record **per genuine change**
+  (a no-op re-set of the same value is not logged; clearing focus logs `value: null`).
+- Records go to a single fleet-wide `activity-log.jsonl` under the state root —
+  one file to pipe for a whole-fleet digest. One JSON object per line:
+
+```json
+{"ts":"2026-06-22T14:30:01Z","agent_id":"agent-a4d87503","name":"kodemirror","kind":"focus","value":"vim-scroll bug cluster"}
+```
+
+  `kind` is `focus` or `status`; `value` is the new focus text / status (`null`
+  for a cleared focus). `name` is captured at write time so a digest reads
+  "kodemirror did X" rather than a hex id. Schema = the `ActivityRecord` model in
+  `src/spanreed/protocol.py`.
+
+- Read with `spanreed log`, which emits matching records as JSON lines:
+  `--since` takes a relative age (`24h`/`30m`/`7d`) or an ISO-8601 timestamp;
+  `--agent` filters by `agent_id` **or** display name. Example digest pipeline:
+  `spanreed log --since 24h | <llm summarize prompt>`.
+
+Retention/rotation and cross-host replication (whether a conjoined peer's
+transitions appear in the local log) are open — see
+[`open-questions.md`](open-questions.md).
+
 ## Identity model
 
 Agents are addressed by `agent_id`. The id is **deterministic per session**:
@@ -133,6 +168,8 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed session-start` | Register + emit SessionStart hook JSON (plugin hook) |
 | `spanreed status [LEVEL]` | Set this session's status (`idle\|working\|needs_input\|blocked`), or show it |
 | `spanreed status-tracking [on\|off]` | Enable/disable bus-wide status tracking, or show the setting |
+| `spanreed activity-log [on\|off]` | Enable/disable bus-wide activity logging, or show the setting |
+| `spanreed log [--since AGE] [--agent ID\|NAME]` | Dump the activity log as JSON lines |
 | `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
 
 ## Cross-host bridge wire-format

@@ -479,3 +479,59 @@ class TestName:
         agents = json.loads(out)
         assert len(agents) == 1
         assert agents[0]["name"] == "fresh-name"
+
+
+# ---------------------------------------------------------------- activity log
+
+
+class TestActivityLog:
+    def test_activity_log_defaults_off(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc, out = _run(capsys, ["activity-log"])
+        assert rc == 0
+        assert out.strip() == "off"
+
+    def test_activity_log_toggle(self, cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        _run(capsys, ["activity-log", "on"])
+        _, out = _run(capsys, ["activity-log"])
+        assert out.strip() == "on"
+        _run(capsys, ["activity-log", "off"])
+        _, out = _run(capsys, ["activity-log"])
+        assert out.strip() == "off"
+
+    def test_log_empty_when_no_activity(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc, out = _run(capsys, ["log"])
+        assert rc == 0
+        assert out.strip() == ""
+
+    def test_log_dumps_jsonl_when_enabled(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["activity-log", "on"])
+        _run(capsys, ["focus", "vim-scroll cluster"])
+        _run(capsys, ["status", "blocked"])
+        rc, out = _run(capsys, ["log"])
+        assert rc == 0
+        records = [json.loads(line) for line in out.splitlines() if line.strip()]
+        kinds = [(r["kind"], r["value"]) for r in records]
+        assert ("focus", "vim-scroll cluster") in kinds
+        assert ("status", "blocked") in kinds
+
+    def test_log_filters_by_agent(self, cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        _run(capsys, ["activity-log", "on"])
+        _run(capsys, ["focus", "mine"])
+        _, id_out = _run(capsys, ["agent-id"])
+        my_id = id_out.strip()
+        _, out = _run(capsys, ["log", "--agent", my_id])
+        assert len([line for line in out.splitlines() if line.strip()]) == 1
+        _, none_out = _run(capsys, ["log", "--agent", "nobody"])
+        assert none_out.strip() == ""
+
+    def test_log_invalid_since_errors(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc, _ = _run(capsys, ["log", "--since", "5x"])
+        assert rc == 2

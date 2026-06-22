@@ -77,6 +77,15 @@ Discovered in test #3: Claude can call the `PushNotification` tool to alert the 
 - **`idle` is best-effort.** An agent goes idle exactly when it stops running, so it can't reliably announce the transition (there's no Stop hook). The human-need levels are the reliable, load-bearing part — the agent declares them *while active*, which is when they matter. We accepted this rather than add a Stop hook for v1.
 - **Token-minimal and opt-in.** The real cost of the feature isn't the one short enum per agent in `list_agents` — it's the per-session instruction teaching agents to maintain status. So it's gated by a bus-wide `status_tracking` flag (off by default): `session-start` injects the instruction only when enabled, so a bus that doesn't want the feature pays zero context tokens for it. The flag gates only the *instruction*; the `set_status` tool itself always works.
 
+## Activity log (presence history)
+
+`focus` and `status` are *current-state* fields — the registry only ever holds the latest value. The activity log adds the *history*: an opt-in, append-only timeline of focus/status transitions, motivated by a concrete reader — dump it and pipe it into an LLM for a daily "what did my agents do" digest. Wire-format in [`protocol.md`](protocol.md#activity-log); the design choices worth recording:
+
+- **There's a named reader, or it doesn't get built.** A log without a consumer rots. This one exists specifically to feed a summarizer; that's what justifies the category shift from current-state to history.
+- **Spanreed emits, it doesn't summarize.** The bus writes `activity-log.jsonl` and `spanreed log` dumps it; the LLM step is the caller's pipe. Baking an LLM dependency into the bus would be scope creep — the user said "pass it into haiku or something" and owns that step.
+- **Opt-in, zero-cost-when-off**, same `config.json` flag pattern as `status_tracking`. The write piggybacks on `set_focus`/`set_status` (one extra append on a write that already happens), and only on a *genuine* change — a no-op re-set isn't logged, so the log is transitions, not noise. This pairs with the softening of focus to major-task granularity: a sparse log of real transitions is exactly the right grain for a digest.
+- **Single fleet-wide file, human-read-only.** One `activity-log.jsonl` (not per-agent) so a whole-fleet digest is one `cat`/pipe. Deliberately a CLI read, *not* an MCP tool — it's for the human to review, and exposing it to agents would re-introduce the very per-query token cost the pull-only design avoids elsewhere.
+
 ## Scope: interactive mode only
 
 Background / headless workers have other handles — Claude Code's Remote Control, `claude -p`, scheduled triggers. Spanreed targets the case where a human is actively using a Claude session and another agent needs to interject.

@@ -76,6 +76,33 @@ class Agent(BaseModel):
     """
 
 
+class ActivityRecord(BaseModel):
+    """One entry in the activity log — a focus or status transition.
+
+    An append-only timeline of agent presence changes, written only when
+    activity logging is enabled (off by default). Intended to be dumped (e.g.
+    piped into an LLM) for a digest of what the fleet has been doing; spanreed
+    emits the log, the summarization is the caller's to run.
+    """
+
+    ts: datetime
+    """When the transition happened (UTC)."""
+
+    agent_id: str
+    """Agent that changed — its stable routing id."""
+
+    name: str
+    """Display name at the time of the change, so a digest can read
+    "kodemirror did X" rather than a hex id."""
+
+    kind: Literal["focus", "status"]
+    """Which field changed."""
+
+    value: str | None
+    """The new value: focus text, or a :data:`Status`. ``None`` when focus was
+    cleared."""
+
+
 class Message(BaseModel):
     """A message on the bus."""
 
