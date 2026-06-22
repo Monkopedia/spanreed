@@ -1,7 +1,7 @@
 {
   "name": "spanreed",
   "description": "Spanreed inter-agent message bus: discover and exchange messages with other local Claude Code sessions.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "author": {
     "name": "Jason Monk",
     "email": "monkopedia@gmail.com"
