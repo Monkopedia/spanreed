@@ -381,6 +381,7 @@ class TestBridgePrimitives:
             pid=999_999,  # the remote's pid, meaningless locally
             last_seen=datetime.now(UTC),
             focus="doing things",
+            status="blocked",
         )
         owner_start = store_module.pid_start_time(os.getpid())
         store.sync_remote_agents(
@@ -391,6 +392,9 @@ class TestBridgePrimitives:
         # Mirrored entry rides the bridge's pid, so it's live while the bridge is.
         assert listed["agent-x@hostB"].pid == os.getpid()
         assert listed["agent-x@hostB"].focus == "doing things"
+        # status crosses the bridge alongside focus, so "who needs a human" sees
+        # remote agents too.
+        assert listed["agent-x@hostB"].status == "blocked"
 
     def test_sync_remote_agents_replaces_previous_snapshot(self, store: StateStore) -> None:
         a = Agent(
