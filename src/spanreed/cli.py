@@ -40,11 +40,9 @@ def _cmd_inbox_path(args: argparse.Namespace) -> int:
 
 def _cmd_register(args: argparse.Namespace) -> int:
     wd = Path(args.working_dir) if args.working_dir else Path.cwd()
-    if args.agent_id or args.name:
-        agent_id = args.agent_id or derive_agent_identity(wd)[0]
-        name = args.name or derive_agent_identity(wd)[1]
-    else:
-        agent_id, name = derive_agent_identity(wd)
+    derived_id, derived_name = derive_agent_identity(wd)
+    agent_id = args.agent_id or derived_id
+    name = args.name or derived_name
     pid = args.pid if args.pid is not None else os.getppid()
     agent = StateStore().register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
     json.dump(agent.model_dump(mode="json"), sys.stdout, indent=2)
