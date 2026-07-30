@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -535,3 +536,59 @@ class TestActivityLog:
     ) -> None:
         rc, _ = _run(capsys, ["log", "--since", "5x"])
         assert rc == 2
+
+
+# Aliased once so the private stays private: the parser has its own grammar
+# worth pinning directly, and one alias costs a single ignore instead of one
+# per call site.
+_parse_since = cli._parse_since  # pyright: ignore[reportPrivateUsage]
+
+
+class TestParseSince:
+    """The ``--since`` grammar: a relative age, or an ISO-8601 timestamp.
+
+    Colocated with the ``log --since`` CLI case above so all ``--since``
+    behavior reads in one place. ``_parse_since`` is a pure function — no bus
+    state — so these need no ``cli_env``.
+    """
+
+    @pytest.mark.parametrize(
+        ("value", "delta"),
+        [
+            ("30m", timedelta(minutes=30)),
+            ("24h", timedelta(hours=24)),
+            ("7d", timedelta(days=7)),
+            ("90m", timedelta(minutes=90)),
+        ],
+    )
+    def test_relative_age_backs_off_from_now(self, value: str, delta: timedelta) -> None:
+        before = datetime.now(UTC)
+        parsed = _parse_since(value)
+        after = datetime.now(UTC)
+        # Bracket the call rather than assert an exact instant: `now` moves.
+        assert before - delta <= parsed <= after - delta
+
+    def test_iso_with_offset_preserves_instant(self) -> None:
+        parsed = _parse_since("2026-07-27T12:00:00+02:00")
+        assert parsed == datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+
+    def test_iso_naive_is_coerced_to_utc(self) -> None:
+        """A naive timestamp is read as UTC, not as local time."""
+        parsed = _parse_since("2026-07-27T12:00:00")
+        assert parsed.tzinfo is not None
+        assert parsed == datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "5x",  # unknown unit
+            "",  # empty
+            "h",  # unit with no magnitude (len < 2, falls through to ISO)
+            "90",  # magnitude with no unit (falls through to ISO)
+            "-1h",  # non-digit magnitude (falls through to ISO)
+            "1.5h",  # fractional magnitude is not supported
+        ],
+    )
+    def test_malformed_raises_value_error(self, value: str) -> None:
+        with pytest.raises(ValueError):
+            _parse_since(value)
