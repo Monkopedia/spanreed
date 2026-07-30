@@ -114,7 +114,7 @@ Both ends run identical bridge logic. `connect` owns the SSH process and the rec
 
 ### The core trick: reuse inboxes as the outbound queue
 
-The bridge **mirrors the peer's live agents into the local registry**, qualified by host (`agent-X@hostB`) and owned by the bridge's own PID. Everything else falls out of the existing primitives with no MCP changes:
+The bridge **mirrors the peer's live agents into the local registry**, qualified by host (`agent-X@hostB`) and owned by the bridge's own PID. Both self-set presence fields cross the bridge: a mirrored entry carries the remote agent's `focus` *and* its `status`, so the "who needs a human" scan over `list_agents` (`status ∈ {needs_input, blocked}`) sees remote agents exactly as it sees local ones. Everything else falls out of the existing primitives with no MCP changes:
 
 - A local agent sends to `agent-X@hostB` → ordinary `send_message` → lands in `inboxes/agent-X@hostB.jsonl` locally.
 - The bridge tails every `*@hostB` inbox and forwards new lines over the pipe.

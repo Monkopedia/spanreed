@@ -191,9 +191,12 @@ For each live agent on the peer, the bridge writes a registry entry on the local
   "working_dir": "...",
   "pid": <bridge's own pid>,
   "pid_start": <bridge's own start-time>,
-  "focus": "..."
+  "focus": "...",
+  "status": "..."
 }
 ```
+
+Both self-set presence fields are carried through: `focus` and `status` are mirrored from the peer's entry as-is, so a remote agent's `needs_input`/`blocked` is visible to a local `list_agents` scan. They inherit the same bounded staleness as everything else in the snapshot — a change on the peer (including the `status` reset on re-registration) reaches the mirror on the next registry sync.
 
 `pid`/`pid_start` are the **bridge's**, not the remote process's (whose PID is meaningless locally). So `is_stale` treats a mirrored entry as live exactly while the bridge is alive — if the pipe/bridge dies, every mirrored entry goes stale and remote agents drop out of `list_agents`. The bridge refreshes the set on each registry sync from the peer (adding new agents, removing departed ones).
 

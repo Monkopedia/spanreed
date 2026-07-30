@@ -296,6 +296,7 @@ class StateStore:
                 pid_start=owner_pid_start,
                 last_seen=now,
                 focus=a.focus,
+                status=a.status,
             )
             for a in remote_agents
         ]
