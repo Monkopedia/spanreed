@@ -37,6 +37,34 @@ class _RegistryDoc(BaseModel):
 
 _DEFAULT_POLL_INTERVAL_S = 0.1
 
+_DIR_MODE = 0o700
+"""Owner-only on every directory under the state root."""
+
+_FILE_MODE = 0o600
+"""Owner-only on every file under the state root."""
+
+
+def _secure_dir(path: Path) -> None:
+    """Create ``path`` if absent and force owner-only permissions.
+
+    ``mkdir(mode=...)`` only applies its mode when it actually creates the
+    directory, so an existing 0755 state root from an older install keeps its
+    mode forever. Chmod unconditionally so an upgrade tightens in place.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(_DIR_MODE)
+
+
+def _secure_file(path: Path) -> None:
+    """Force owner-only permissions on an existing file. No-op if absent.
+
+    Files reached via ``open("a")`` are created as ``0o666 & ~umask`` — the
+    umask being whatever the Claude Code session happened to inherit, which is
+    not something this package controls. Chmod after the write instead.
+    """
+    with contextlib.suppress(FileNotFoundError):
+        path.chmod(_FILE_MODE)
+
 
 def default_state_root() -> Path:
     """Where state lives by default. Override via ``SPANREED_STATE_ROOT`` env var."""
@@ -113,11 +141,11 @@ class StateStore:
 
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or default_state_root()
-        self.root.mkdir(parents=True, exist_ok=True)
+        _secure_dir(self.root)
         self._inboxes_dir = self.root / "inboxes"
         self._cursors_dir = self.root / "cursors"
-        self._inboxes_dir.mkdir(exist_ok=True)
-        self._cursors_dir.mkdir(exist_ok=True)
+        _secure_dir(self._inboxes_dir)
+        _secure_dir(self._cursors_dir)
         self._registry_path = self.root / "registry.json"
         self._registry_lock_path = self.root / "registry.lock"
         self._config_path = self.root / "config.json"
@@ -129,6 +157,7 @@ class StateStore:
     def _registry_lock(self) -> Generator[None, None, None]:
         """Exclusive advisory lock on the registry (fcntl-based, single-host)."""
         self._registry_lock_path.touch(exist_ok=True)
+        _secure_file(self._registry_lock_path)
         fd = os.open(self._registry_lock_path, os.O_RDONLY)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -148,6 +177,7 @@ class StateStore:
         tmp = self._registry_path.with_suffix(".json.tmp")
         tmp.write_text(_RegistryDoc(agents=agents).model_dump_json(indent=2))
         tmp.replace(self._registry_path)
+        _secure_file(self._registry_path)
 
     def register_agent(
         self,
@@ -377,6 +407,7 @@ class StateStore:
         inbox = self._inbox_path(to_agent)
         with inbox.open("a") as f:
             f.write(msg.model_dump_json() + "\n")
+        _secure_file(inbox)
         return msg
 
     def append_message(self, msg: Message) -> None:
@@ -396,6 +427,7 @@ class StateStore:
         inbox = self._inbox_path(msg.to_agent)
         with inbox.open("a") as f:
             f.write(msg.model_dump_json() + "\n")
+        _secure_file(inbox)
 
     def recv_messages(
         self,
@@ -442,6 +474,7 @@ class StateStore:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(msg_id)
         tmp.replace(path)
+        _secure_file(path)
 
     # ------------------------------------------------------------------ config
 
@@ -484,6 +517,7 @@ class StateStore:
         tmp = self._config_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(config, indent=2))
         tmp.replace(self._config_path)
+        _secure_file(self._config_path)
 
     # ------------------------------------------------------------------ activity log
 
@@ -506,6 +540,7 @@ class StateStore:
         )
         with self._activity_log_path.open("a") as f:
             f.write(record.model_dump_json() + "\n")
+        _secure_file(self._activity_log_path)
 
     def read_activity(
         self,
