@@ -1,6 +1,6 @@
 [project]
 name = "spanreed-bus"
-version = "0.0.8"
+version = "0.0.9"
 description = "Inter-agent message bus for local Claude Code sessions"
 readme = "README.md"
 requires-python = ">=3.12"
