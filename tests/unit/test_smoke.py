@@ -34,6 +34,32 @@ def test_plugin_version_matches_pyproject() -> None:
     assert plugin["version"] == pkg_version
 
 
+async def test_mcp_server_registers_its_tool_surface() -> None:
+    # Guards the dependency boundary, which nothing else did. `mcp` 2.0 removed
+    # `mcp.server.fastmcp`, so an uncapped `mcp>=1.0` resolved to a version whose
+    # import fails — and every existing test passed anyway, because none of them
+    # imported the MCP server. A fresh install shipped a plugin whose bus tools
+    # were simply absent while the CLI kept working.
+    #
+    # Asserting the tool NAMES rather than a count: a rename is a wire-format
+    # break for every peer holding that name, and a count wouldn't notice.
+    from spanreed.mcp_server import mcp_app
+
+    registered = {t.name for t in await mcp_app.list_tools()}
+    assert registered == {
+        "register_agent",
+        "deregister_agent",
+        "list_agents",
+        "send_message",
+        "recv_messages",
+        "wait_for_reply",
+        "set_name",
+        "set_focus",
+        "set_status",
+        "request_focus_update",
+    }
+
+
 def test_agent_serializes() -> None:
     agent = Agent(
         agent_id="agent-abc",
