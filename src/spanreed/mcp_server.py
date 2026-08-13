@@ -17,7 +17,7 @@ import traceback
 from datetime import UTC, datetime
 
 from anyio import to_thread
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from spanreed.identity import derive_agent_identity
 from spanreed.protocol import Message, Status
@@ -43,7 +43,7 @@ def _log(event: str, **fields: object) -> None:
         pass
 
 
-mcp_app: FastMCP = FastMCP("spanreed")
+mcp_app: MCPServer = MCPServer("spanreed")
 
 
 @mcp_app.tool()
@@ -244,7 +244,7 @@ async def request_focus_update(
 def main() -> None:
     """Entry point for the ``spanreed-mcp`` console script.
 
-    Wraps the FastMCP stdio loop with crash logging so we can tell after the
+    Wraps the MCPServer stdio loop with crash logging so we can tell after the
     fact whether the process died of its own accord (uncaught exception) or
     was shut down externally (Claude Code sent EOF / SIGTERM).
     """

@@ -39,7 +39,9 @@ async def test_mcp_server_registers_its_tool_surface() -> None:
     # `mcp.server.fastmcp`, so an uncapped `mcp>=1.0` resolved to a version whose
     # import fails — and every existing test passed anyway, because none of them
     # imported the MCP server. A fresh install shipped a plugin whose bus tools
-    # were simply absent while the CLI kept working.
+    # were simply absent while the CLI kept working (fixed in 0.0.9 by capping,
+    # then by porting to `mcp.server.mcpserver` in 0.1.0). This test is what
+    # makes the next such removal fail here instead of on a user's machine.
     #
     # Asserting the tool NAMES rather than a count: a rename is a wire-format
     # break for every peer holding that name, and a count wouldn't notice.

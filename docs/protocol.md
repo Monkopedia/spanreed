@@ -57,7 +57,7 @@ Plain text file containing the last-delivered `msg_id` for this session. Used on
 
 ## MCP tool surface
 
-Implemented in `src/spanreed/mcp_server.py` via FastMCP:
+Implemented in `src/spanreed/mcp_server.py` via the `mcp` SDK's `MCPServer` (`mcp.server.mcpserver`; this was `FastMCP` in `mcp` 1.x, removed in 2.0):
 
 - `register_agent(name, working_dir, pid, agent_id?) -> Agent` — upsert by id if supplied; preserves existing `focus` on upsert.
 - `deregister_agent(agent_id) -> {ok: true}`
