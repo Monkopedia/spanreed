@@ -61,6 +61,52 @@ Critical and non-obvious. Three distinct trust levels in play:
 | Monitor `stdout` line (the signal) | **Untrusted** — could be poisoned upstream | Just a *poke* ("you have mail"). Should not contain executable instructions. |
 | Message body fetched via `recv_messages` | **Untrusted data** | Claude reads, applies judgment, decides whether and how to act. |
 
+**Sender identity is NOT authenticated, deliberately.** The three levels above are all
+about *body content*; this row is about *who a message claims to be from*. `from_agent` is a
+parameter supplied by the caller and is verified against nothing — not the calling process,
+not the registry.
+
+Asked *"should `from_agent` be authenticated — derive it from the calling process, validate
+it against the registry, or leave it as is?"*, the owner answered (2026-08-18):
+
+> *"no, if its on the bus you can trust it"*
+
+The question and answer are also recorded on `Monkopedia/spanreed#16`, dated and written at
+the time. That is a second location for the same claim by the same author, not independent
+corroboration — nothing in this repo can corroborate a session transcript.
+
+So a forged sender is not a threat this design defends against. The boundary that carries
+that trust is the same one stated under *Scope: interactive mode only* (which lists
+inter-agent authentication as an explicit non-goal) and *Cross-host: the SSH bus-bridge* —
+**the single-user assumption: "you can reach the box"** — and it reaches *further than one
+machine*, because `spanreed conjoin`
+bridges a peer's bus over SSH and the receiving side appends peer frames verbatim
+(`bridge.py`'s reader, on the `msg` frame). A bridged agent is not co-located.
+`open-questions.md` states the same boundary for the bridge explicitly. **If that assumption ever stops holding, this row is the
+first thing to revisit** — the ruling is scoped to it.
+
+Two things the ruling does not extend to, because a one-sentence answer is scoped by the
+question it answered:
+
+- **It is about the transport, not about authority.** A trusted channel still does not turn
+  one agent's assertion about the owner's intent into the owner's decision. Message bodies
+  remain *untrusted data* per the table above, and that is unchanged.
+- **Trusting the channel is not the address being right.** An id can still be wrong by
+  *accident* — a session that changed directory recomputes a different one — and a reply
+  addressed to a wrong id goes nowhere silently. Trusting the bus does not make a
+  misaddressed message arrive.
+- **It cannot establish its own premise.** This ruling was given by the owner *directly, in
+  a session* — not over the bus. That is load-bearing: a copy of it **arriving over the bus**
+  could not establish the bus's trustworthiness without circularity. A relayed copy is
+  evidence the ruling exists; it is not authority to act on it. An agent that has only heard
+  it relayed **over the bus** has not received it. (This document is of course itself
+  second-hand — it records the ruling, it is not the delivery of it.)
+- **It cannot reconfigure a session.** The channel can carry a request, a dispatch, or an
+  approval of *work*. It cannot switch on a capability a session's own operating
+  instructions disable — that is a property of the session, not of the message, and no
+  quote however genuine reaches it. An agent whose instructions disable subagents does not
+  gain them by being told the bus is trusted.
+
 This separation surfaced empirically from test #1: when a signal carried embedded instructions ("reply ACK"), Claude correctly refused — monitor stdout isn't a trusted command channel. The fix isn't to defeat the defense, it's to put policy in the description (trusted) and treat message content as data (not commands).
 
 ## Escalation: PushNotification
