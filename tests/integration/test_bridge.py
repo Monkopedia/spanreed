@@ -7,6 +7,8 @@ agents mirror across and messages flow in both directions.
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import subprocess
 import threading
@@ -16,8 +18,15 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
+import pytest
+
+from spanreed import bridge
 from spanreed.bridge import Bridge, reconnect_loop
 from spanreed.store import StateStore
+
+# Aliased once so the private stays private — same pattern as test_cli.py's
+# `_parse_since`: one alias costs a single ignore instead of one per call site.
+_is_valid_host = bridge._is_valid_host  # pyright: ignore[reportPrivateUsage]
 
 
 def _wait(cond: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -189,3 +198,113 @@ def test_reconnect_loop_stops_on_shutdown(tmp_path: Path) -> None:
         wait=no_wait,
     )
     assert len(spawns) == 1  # broke immediately after the first run
+
+
+class TestPeerHostValidation:
+    """The peer chooses its own host label; we interpolate it into ``Path.glob``.
+
+    A ``*`` there is a wildcard, not a name — ``*@*.jsonl`` matches every
+    host-qualified inbox, so a peer claiming ``host: "*"`` is handed mail queued
+    for unrelated hosts. The same string is compared as a *literal* suffix in
+    three other places (``_strip_peer``, ``sync_remote_agents``,
+    ``clear_remote_agents``), so one field is read two different ways.
+    """
+
+    @pytest.mark.parametrize(
+        "host",
+        ["kaladin", "adolin.lan", "host-1", "my_box", "a", "A1.b-c_d.example.com"],
+    )
+    def test_plausible_hostnames_are_accepted(self, host: str) -> None:
+        assert _is_valid_host(host)
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "*",  # the leak: glob matches every host-qualified inbox
+            "?",  # single-char wildcard
+            "[abc]",  # character class
+            "a*b",  # embedded wildcard
+            "",  # empty -> "*@.jsonl"
+            "..",  # path traversal shape
+            "a/b",  # separator
+            "a b",  # whitespace
+            "-lead",  # must start alphanumeric
+            "trail-",  # must end alphanumeric
+            "x" * 254,  # over the length cap
+        ],
+    )
+    def test_metacharacters_and_malformed_are_rejected(self, host: str) -> None:
+        assert not _is_valid_host(host)
+
+    def test_peer_claiming_star_gets_no_third_host_mail(self, tmp_path: Path) -> None:
+        """The reproduction this fix exists for, driven end to end.
+
+        Before validation this forwarded both inboxes to a peer entitled to
+        neither.
+        """
+        store = StateStore(root=tmp_path / "local")
+        _register_live(store, "agent-local", "local")
+        for host in ("thirdhost", "adolin"):
+            (store.root / "inboxes" / f"agent-zzz@{host}.jsonl").write_text(
+                json.dumps(
+                    {
+                        "msg_id": f"private-{host}",
+                        "from_agent": "agent-local",
+                        "to_agent": f"agent-zzz@{host}",
+                        "body": f"MAIL PRIVATE TO {host}",
+                        "ts": "2026-01-01T00:00:00Z",
+                        "in_reply_to": None,
+                    }
+                )
+                + "\n"
+            )
+
+        peer_r, peer_w = os.pipe()
+        sent = io.BytesIO()
+        bridge = Bridge(
+            os.fdopen(peer_r, "rb"),
+            sent,
+            "kaladin",
+            store,
+            poll_interval=0.05,
+            sync_interval=10,
+            recv_timeout=60,
+        )
+        thread = threading.Thread(target=bridge.run, daemon=True)
+        thread.start()
+        with os.fdopen(peer_w, "wb") as peer:
+            peer.write((json.dumps({"kind": "hello", "host": "*"}) + "\n").encode())
+            peer.flush()
+            thread.join(timeout=5.0)
+
+        assert not thread.is_alive(), "bridge should refuse and exit, not hang"
+        assert bridge.peer_host is None, "an invalid host must never be assigned"
+
+        frames = [json.loads(x) for x in sent.getvalue().decode().splitlines() if x.strip()]
+        bodies = [f["message"]["body"] for f in frames if f.get("kind") == "msg"]
+        assert bodies == [], f"forwarded mail to a peer claiming '*': {bodies}"
+
+    def test_valid_host_still_connects(self, tmp_path: Path) -> None:
+        """Positive control: the rejection above is the validator firing, not the
+        harness failing to connect."""
+        store = StateStore(root=tmp_path / "local")
+        _register_live(store, "agent-local", "local")
+        peer_r, peer_w = os.pipe()
+        bridge = Bridge(
+            os.fdopen(peer_r, "rb"),
+            io.BytesIO(),
+            "kaladin",
+            store,
+            poll_interval=0.05,
+            sync_interval=10,
+            recv_timeout=60,
+        )
+        thread = threading.Thread(target=bridge.run, daemon=True)
+        thread.start()
+        with os.fdopen(peer_w, "wb") as peer:
+            peer.write((json.dumps({"kind": "hello", "host": "adolin"}) + "\n").encode())
+            peer.flush()
+            _wait(lambda: bridge.peer_host == "adolin")
+            bridge.stop()
+            thread.join(timeout=5.0)
+        assert bridge.peer_host == "adolin"

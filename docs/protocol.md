@@ -216,6 +216,7 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
 
 - `msg` — a forwarded bus message. The receiving bridge appends `message` verbatim to `inboxes/<message.to_agent>.jsonl`.
 - `registry` — the sender's current set of live local agents (bare ids, home = sender). The receiver mirrors them per "Mirrored registry entries" above. Sent on connect and whenever the local set changes.
+- `hello` — the sender's own host label, which becomes the `@host` suffix for every id it owns. **Validated on receipt**: alphanumeric at both ends, `.`/`-`/`_` inside, at most 253 characters. A label failing that is refused and the bridge exits rather than routing on it — the receiver interpolates this value into a filesystem glob when selecting outbound inboxes, so a metacharacter is a wildcard rather than a name.
 - `ping` — keepalive; lets each side detect a dead pipe and lets `connect` trigger reconnect.
 
 ### Address rewriting (done by the sending bridge)

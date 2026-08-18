@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shlex
 import signal
 import socket
@@ -31,6 +32,23 @@ from typing import IO
 
 from spanreed.protocol import Agent, Message
 from spanreed.store import StateStore, pid_start_time
+
+_HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+"""A plausible host label: alphanumeric ends, dots/hyphens/underscores inside.
+
+Deliberately permissive about what a hostname may contain — an SSH target can be
+an alias from ``~/.ssh/config`` rather than a DNS name — and strict about what it
+may NOT: no glob metacharacters, no ``/``, no whitespace, not empty.
+"""
+
+
+def _is_valid_host(host: str) -> bool:
+    """True if ``host`` is safe to use as a routing suffix and a glob literal.
+
+    The peer chooses this string and we interpolate it into ``Path.glob`` and
+    into ``@``-suffix comparisons. A ``*`` there is a wildcard, not a name.
+    """
+    return len(host) <= 253 and _HOST_RE.fullmatch(host) is not None
 
 
 def _qualify_from(from_agent: str, self_host: str) -> str:
@@ -107,7 +125,19 @@ class Bridge:
                 continue
             self._last_recv = time.monotonic()  # any frame proves the pipe is alive
             if kind == "hello":
-                self.peer_host = str(frame["host"])
+                host = str(frame["host"])
+                if not _is_valid_host(host):
+                    # Refuse the connection rather than routing on it. This value
+                    # reaches Path.glob(); "*" there matches every host-qualified
+                    # inbox, including mail queued for an unrelated peer.
+                    print(
+                        f"spanreed: peer declared an invalid host {host!r}; refusing bridge",
+                        file=sys.stderr,
+                    )
+                    self._stop.set()
+                    self._hello.set()  # unblock run()'s wait so it exits promptly
+                    return
+                self.peer_host = host
                 self._hello.set()
             elif kind == "msg":
                 self.store.append_message(Message.model_validate(frame["message"]))
