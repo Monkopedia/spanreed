@@ -42,10 +42,12 @@ class TestDerivedId:
 
         Recomputing the digest in the test (as the case below does) pins the
         format only against a change to the *implementation*. It does not survive
-        a co-edit: ``sed -i 's/hashlib.sha256/hashlib.md5/'`` across both files
-        leaves the suite green while every agent id changes and every inbox is
-        orphaned — and a co-edit is the likely shape when the same pass that
-        changes the code also fixes the tests it reddens.
+        a co-edit. Before this test existed, ``sed -i
+        's/hashlib.sha256/hashlib.md5/'`` applied to **both** files left the whole
+        suite green while every agent id changed and every inbox was orphaned;
+        that same command now reddens this test and only this test. A co-edit is
+        the likely shape whenever the pass that changes the code also repairs the
+        tests it reddens.
 
         A literal has no expression to rewrite. The path is absolute and need not
         exist, so ``.resolve()`` is a no-op on it and the value is stable across
