@@ -318,3 +318,69 @@ class TestPeerHostValidation:
             conn.stop()
             thread.join(timeout=5.0)
         assert conn.peer_host == "adolin"
+
+    def test_eof_after_a_valid_hello_still_tears_down_mirrored_entries(
+        self, tmp_path: Path
+    ) -> None:
+        """The refusal guard must key on ``peer_host``, not on ``_stop``.
+
+        ``_stop`` is set by a plain EOF too, and an EOF can land *after* a valid
+        hello — a peer that says hello, sends its registry, then closes. That
+        path has mirrored entries to clean up. Keyed on ``_stop``, the early
+        return skips ``clear_remote_agents`` and leaves them behind.
+
+        The race is one the main thread normally wins, so the wait is slowed
+        harness-side to make the ordering deterministic rather than lucky.
+        """
+        store = StateStore(root=tmp_path / "local")
+        _register_live(store, "agent-local", "local")
+
+        peer_r, peer_w = os.pipe()
+        conn = Bridge(
+            os.fdopen(peer_r, "rb"),
+            io.BytesIO(),
+            "kaladin",
+            store,
+            poll_interval=0.05,
+            sync_interval=10,
+            recv_timeout=60,
+        )
+        real_wait = conn._hello.wait  # pyright: ignore[reportPrivateUsage]
+
+        def slow_wait(timeout: float | None = None) -> bool:
+            result = real_wait(timeout)
+            time.sleep(0.3)  # let the reader hit EOF and set _stop before we proceed
+            return result
+
+        conn._hello.wait = slow_wait  # type: ignore[method-assign]
+
+        with os.fdopen(peer_w, "wb") as peer:
+            peer.write((json.dumps({"kind": "hello", "host": "adolin"}) + "\n").encode())
+            peer.write(
+                (
+                    json.dumps(
+                        {
+                            "kind": "registry",
+                            "agents": [
+                                {
+                                    "agent_id": "agent-remote",
+                                    "name": "remote",
+                                    "working_dir": "/tmp",
+                                    "pid": os.getpid(),
+                                    "pid_start": None,
+                                    "last_seen": "2026-01-01T00:00:00Z",
+                                }
+                            ],
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            peer.flush()
+        thread = threading.Thread(target=conn.run, daemon=True)
+        thread.start()
+        thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        mirrored = [a.agent_id for a in store.list_agents(include_stale=True) if "@" in a.agent_id]
+        assert mirrored == [], f"EOF after a valid hello left mirrored entries behind: {mirrored}"

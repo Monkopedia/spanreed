@@ -134,11 +134,15 @@ class Bridge:
                     # reaches Path.glob(); "*" there matches every host-qualified
                     # inbox, including mail queued for an unrelated peer.
                     print(
-                        f"spanreed: peer declared an invalid host label {host!r}; "
-                        "refusing the bridge. A label must be alphanumeric at both "
-                        "ends with only '.', '-' or '_' inside, at most 253 chars. "
-                        "Override the peer's advertised label with "
-                        "`spanreed conjoin --serve --label <name>`.",
+                        f"spanreed: the peer advertised an invalid host label {host!r}; "
+                        "refusing the bridge. A label must be alphanumeric at both ends "
+                        "with only '.', '-' or '_' inside, and at most 253 characters. "
+                        "The label belongs to the OTHER end, so it has to be fixed "
+                        "there: pass --label to whichever `spanreed conjoin` runs on "
+                        "that machine, or change its hostname. Caveat: `conjoin <host>` "
+                        "launches the remote end with no way to pass --label, so a peer "
+                        "on the serve side may have no remedy but its hostname "
+                        "(spanreed#27).",
                         file=sys.stderr,
                     )
                     self._stop.set()
