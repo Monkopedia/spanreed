@@ -322,12 +322,23 @@ class TestPeerHostValidation:
     def test_eof_after_a_valid_hello_still_tears_down_mirrored_entries(
         self, tmp_path: Path
     ) -> None:
-        """The refusal guard must key on ``peer_host``, not on ``_stop``.
+        """An EOF after a *valid* hello must still tear down mirrored entries.
 
-        ``_stop`` is set by a plain EOF too, and an EOF can land *after* a valid
-        hello — a peer that says hello, sends its registry, then closes. That
-        path has mirrored entries to clean up. Keyed on ``_stop``, the early
-        return skips ``clear_remote_agents`` and leaves them behind.
+        ``_stop`` is set by a plain EOF, not only by a refusal, so it can be set
+        here with a perfectly good ``peer_host`` — a peer that says hello, sends
+        its registry, then closes. That path has mirrored entries to clean up.
+
+        What this pins is the property, not an explanation of it. Measured as a
+        2x2 over the guard's predicate and the ``return``'s placement, exactly
+        one combination fails::
+
+            peer_host + inside try   green      _stop + inside try   green
+            peer_host + outside try  green      _stop + outside try  RED
+
+        So *either* change alone closes it, and this test does not distinguish
+        which — the shipped code keeps both because they fix it by different
+        mechanisms: ``peer_host`` makes the branch not apply, inside-``try``
+        makes it harmless.
 
         The race is one the main thread normally wins, so the wait is slowed
         harness-side to make the ordering deterministic rather than lucky.

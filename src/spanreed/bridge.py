@@ -206,10 +206,22 @@ class Bridge:
                 # directories, pids and focus text, and a peer we just hung up
                 # on must not get it.
                 #
-                # Keyed on peer_host rather than _stop because _stop is also set
-                # by a plain EOF, which can land here after a VALID hello — and
-                # that case has mirrored entries to tear down. Inside the try so
-                # the finally runs either way.
+                # Two independent properties here, and it is worth not
+                # confusing them:
+                #
+                # Inside the `try` so the `finally` runs. `_stop` is also set by
+                # a plain EOF, which can land here after a VALID hello, and that
+                # case has mirrored entries to tear down; an early return above
+                # the `try` skipped `clear_remote_agents` for it.
+                #
+                # Keyed on `peer_host` because that is what the branch is
+                # actually about — "we never accepted this peer" — where `_stop`
+                # only means "stop". Either change alone closes the teardown
+                # hole; both are kept because the predicate is the honest one
+                # and the placement is the robust one. They do diverge: an
+                # external stop() between the hello and this guard sets `_stop`
+                # with a valid peer_host, and only the `peer_host` form still
+                # advertises the registry. Neither is wrong; they are different.
                 return time.monotonic() - started
             self._last_recv = time.monotonic()
             self._send_registry()
