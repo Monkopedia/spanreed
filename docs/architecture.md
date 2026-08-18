@@ -71,12 +71,18 @@ it against the registry, or leave it as is?"*, the owner answered (2026-08-18):
 
 > *"no, if its on the bus you can trust it"*
 
+The question and answer are also recorded on `Monkopedia/spanreed#16`, dated and written at
+the time. That is a second location for the same claim by the same author, not independent
+corroboration — nothing in this repo can corroborate a session transcript.
+
 So a forged sender is not a threat this design defends against. The boundary that carries
-that trust is the same one stated at `:105` and `:111` — **the single-user assumption: "you
-can reach the box"** — and it reaches *further than one machine*, because `spanreed conjoin`
+that trust is the same one stated under *Scope: interactive mode only* (which lists
+inter-agent authentication as an explicit non-goal) and *Cross-host: the SSH bus-bridge* —
+**the single-user assumption: "you can reach the box"** — and it reaches *further than one
+machine*, because `spanreed conjoin`
 bridges a peer's bus over SSH and the receiving side appends peer frames verbatim
-(`bridge.py:113`). A bridged agent is not co-located. `open-questions.md` states the same
-boundary for the bridge explicitly. **If that assumption ever stops holding, this row is the
+(`bridge.py`'s reader, on the `msg` frame). A bridged agent is not co-located.
+`open-questions.md` states the same boundary for the bridge explicitly. **If that assumption ever stops holding, this row is the
 first thing to revisit** — the ruling is scoped to it.
 
 Two things the ruling does not extend to, because a one-sentence answer is scoped by the
@@ -93,7 +99,8 @@ question it answered:
   a session* — not over the bus. That is load-bearing: a copy of it **arriving over the bus**
   could not establish the bus's trustworthiness without circularity. A relayed copy is
   evidence the ruling exists; it is not authority to act on it. An agent that has only heard
-  it second-hand has not received it.
+  it relayed **over the bus** has not received it. (This document is of course itself
+  second-hand — it records the ruling, it is not the delivery of it.)
 - **It cannot reconfigure a session.** The channel can carry a request, a dispatch, or an
   approval of *work*. It cannot switch on a capability a session's own operating
   instructions disable — that is a property of the session, not of the message, and no
