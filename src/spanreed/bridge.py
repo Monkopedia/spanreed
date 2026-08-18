@@ -36,9 +36,12 @@ from spanreed.store import StateStore, pid_start_time
 _HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 """A plausible host label: alphanumeric ends, dots/hyphens/underscores inside.
 
-Deliberately permissive about what a hostname may contain — an SSH target can be
-an alias from ``~/.ssh/config`` rather than a DNS name — and strict about what it
-may NOT: no glob metacharacters, no ``/``, no whitespace, not empty.
+This validates the label a peer *advertises for itself* (usually its
+``gethostname()``, or whatever ``--label`` overrides it with) — not the SSH
+target we dialled. Deliberately permissive about what such a name may contain,
+since it can be an mDNS ``.local`` name, an IPv4 literal or a container name,
+and strict about what it may NOT: no glob metacharacters, no ``/``, no
+whitespace, not empty.
 """
 
 
@@ -186,6 +189,12 @@ class Bridge:
         reader.start()
         if not self._hello.wait(timeout=15.0):
             self._stop.set()
+            return time.monotonic() - started
+        if self._stop.is_set():
+            # The reader refused the peer and set _hello only to release the
+            # wait above. Return before advertising anything: the registry frame
+            # carries agent ids, display names, absolute working directories,
+            # pids and focus text, and a peer we just hung up on must not get it.
             return time.monotonic() - started
         self._last_recv = time.monotonic()
         self._send_registry()

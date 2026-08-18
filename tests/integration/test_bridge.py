@@ -261,7 +261,7 @@ class TestPeerHostValidation:
 
         peer_r, peer_w = os.pipe()
         sent = io.BytesIO()
-        bridge = Bridge(
+        conn = Bridge(
             os.fdopen(peer_r, "rb"),
             sent,
             "kaladin",
@@ -270,19 +270,29 @@ class TestPeerHostValidation:
             sync_interval=10,
             recv_timeout=60,
         )
-        thread = threading.Thread(target=bridge.run, daemon=True)
+        thread = threading.Thread(target=conn.run, daemon=True)
         thread.start()
         with os.fdopen(peer_w, "wb") as peer:
             peer.write((json.dumps({"kind": "hello", "host": "*"}) + "\n").encode())
             peer.flush()
             thread.join(timeout=5.0)
 
-        assert not thread.is_alive(), "bridge should refuse and exit, not hang"
-        assert bridge.peer_host is None, "an invalid host must never be assigned"
-
+        # Leak assertions FIRST. Ordered deliberately: with the liveness check
+        # first, a regression that hangs reddens this test before the leak
+        # assertions are ever evaluated, so the test would report the wrong
+        # failure and the leak coverage would be silently unreachable.
         frames = [json.loads(x) for x in sent.getvalue().decode().splitlines() if x.strip()]
         bodies = [f["message"]["body"] for f in frames if f.get("kind") == "msg"]
         assert bodies == [], f"forwarded mail to a peer claiming '*': {bodies}"
+
+        kinds = [f.get("kind") for f in frames]
+        assert "registry" not in kinds, (
+            f"advertised the registry to a peer we refused: {kinds}. The frame carries "
+            "agent ids, names, absolute working directories, pids and focus text."
+        )
+
+        assert not thread.is_alive(), "bridge should refuse and exit, not hang"
+        assert conn.peer_host is None, "an invalid host must never be assigned"
 
     def test_valid_host_still_connects(self, tmp_path: Path) -> None:
         """Positive control: the rejection above is the validator firing, not the
@@ -290,7 +300,7 @@ class TestPeerHostValidation:
         store = StateStore(root=tmp_path / "local")
         _register_live(store, "agent-local", "local")
         peer_r, peer_w = os.pipe()
-        bridge = Bridge(
+        conn = Bridge(
             os.fdopen(peer_r, "rb"),
             io.BytesIO(),
             "kaladin",
@@ -299,12 +309,12 @@ class TestPeerHostValidation:
             sync_interval=10,
             recv_timeout=60,
         )
-        thread = threading.Thread(target=bridge.run, daemon=True)
+        thread = threading.Thread(target=conn.run, daemon=True)
         thread.start()
         with os.fdopen(peer_w, "wb") as peer:
             peer.write((json.dumps({"kind": "hello", "host": "adolin"}) + "\n").encode())
             peer.flush()
-            _wait(lambda: bridge.peer_host == "adolin")
-            bridge.stop()
+            _wait(lambda: conn.peer_host == "adolin")
+            conn.stop()
             thread.join(timeout=5.0)
-        assert bridge.peer_host == "adolin"
+        assert conn.peer_host == "adolin"
