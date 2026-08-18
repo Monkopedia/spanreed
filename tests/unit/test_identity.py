@@ -14,12 +14,19 @@ one agent). Only the ``agent-`` prefix was pinned, by two incidental
 So these assert the derivation *by value*, not by shape. `docs/protocol.md`
 documents the id as ``"agent-" + sha256(absolute_cwd)[:8]``, which makes it
 wire-format: a second implementation has to agree with it byte for byte.
+
+One caveat found in review, worth stating because it is not obvious: a test that
+*recomputes* the digest pins the format only against a change to `identity.py`
+alone. It does not survive a **co-edit** — the same `sed` applied to both files
+leaves the suite green — and a co-edit is the likely shape when whatever changes
+the implementation also repairs the tests it reddens. `docs/protocol.md` does not
+rescue it either; nothing executes prose. That is what `test_frozen_vector`
+is for, and it is the only assertion here a rename cannot move.
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
 
 import pytest
@@ -30,10 +37,27 @@ from spanreed.identity import derive_agent_identity
 class TestDerivedId:
     """The cwd-derived form: ``agent-<sha256(abspath)[:8]>``."""
 
+    def test_frozen_vector(self) -> None:
+        """One hard-coded id for one fixed path — the assertion a rename cannot move.
+
+        Recomputing the digest in the test (as the case below does) pins the
+        format only against a change to the *implementation*. It does not survive
+        a co-edit: ``sed -i 's/hashlib.sha256/hashlib.md5/'`` across both files
+        leaves the suite green while every agent id changes and every inbox is
+        orphaned — and a co-edit is the likely shape when the same pass that
+        changes the code also fixes the tests it reddens.
+
+        A literal has no expression to rewrite. The path is absolute and need not
+        exist, so ``.resolve()`` is a no-op on it and the value is stable across
+        machines; the uppercase letters also pin that the hashed input is
+        case-sensitive, which nothing else here does.
+        """
+        assert derive_agent_identity(Path("/spanreed-test/Fixture-Repo"))[0] == "agent-6ef4f0e5"
+
     def test_id_is_sha256_of_the_absolute_path_truncated_to_eight(self, tmp_path: Path) -> None:
-        # Computed here independently rather than by calling the function under
-        # test, so the algorithm, the input, and the truncation are all pinned.
-        # This is the assertion that catches sha256->md5 and [:8]->[:7]/[:16].
+        # Recomputed independently of the function under test, which pins the
+        # algorithm, input and truncation against a change to identity.py alone.
+        # The frozen vector above is what covers a co-edit of both files.
         expected = hashlib.sha256(str(tmp_path.resolve()).encode()).hexdigest()[:8]
         agent_id, _ = derive_agent_identity(tmp_path)
         assert agent_id == f"agent-{expected}"
@@ -126,8 +150,12 @@ class TestEnvOverride:
         """Empty string is falsy, so an exported-but-blank var must not produce
         the id ``agent-`` with no digest."""
         monkeypatch.setenv("SPANREED_AGENT_NAME", "")
-        assert derive_agent_identity(tmp_path) == derive_agent_identity(tmp_path)
+        # Both assertions do work: the first catches `if override:` becoming
+        # `if override is not None:`; the second checks it fell through to the
+        # real digest rather than to some other non-"agent-" value.
         assert derive_agent_identity(tmp_path)[0] != "agent-"
+        expected = hashlib.sha256(str(tmp_path.resolve()).encode()).hexdigest()[:8]
+        assert derive_agent_identity(tmp_path)[0] == f"agent-{expected}"
 
     def test_unset_override_uses_the_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -150,4 +178,3 @@ def test_both_derivations_share_the_agent_prefix(
     assert derive_agent_identity(tmp_path)[0].startswith("agent-")
     monkeypatch.setenv("SPANREED_AGENT_NAME", "deadbeef")
     assert derive_agent_identity(tmp_path) == ("agent-deadbeef", "deadbeef")
-    assert os.environ["SPANREED_AGENT_NAME"] == "deadbeef"
