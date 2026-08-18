@@ -64,12 +64,31 @@ Critical and non-obvious. Three distinct trust levels in play:
 **Sender identity is NOT authenticated, deliberately.** The three levels above are all
 about *body content*; this row is about *who a message claims to be from*. `from_agent` is a
 parameter supplied by the caller and is verified against nothing — not the calling process,
-not the registry. The owner ruled on this directly (2026-08-18): *"if it's on the bus you can
-trust it."* Co-location is the trust boundary, so a forged sender is not a threat this design
-defends against, and no agent should add checks premised on it. Note the practical
-consequence that survives the ruling: an id can still be *wrong by accident* (a session that
-changed directory recomputes a different one), and a reply addressed to a wrong id goes
-nowhere silently — trusting the bus does not make a misaddressed message arrive.
+not the registry.
+
+Asked *"should `from_agent` be authenticated — derive it from the calling process, validate
+it against the registry, or leave it as is?"*, the owner answered (2026-08-18):
+
+> *"no, if its on the bus you can trust it"*
+
+So a forged sender is not a threat this design defends against. The boundary that carries
+that trust is the same one stated at `:105` and `:111` — **the single-user assumption: "you
+can reach the box"** — and it reaches *further than one machine*, because `spanreed conjoin`
+bridges a peer's bus over SSH and the receiving side appends peer frames verbatim
+(`bridge.py:113`). A bridged agent is not co-located. `open-questions.md` states the same
+boundary for the bridge explicitly. **If that assumption ever stops holding, this row is the
+first thing to revisit** — the ruling is scoped to it.
+
+Two things the ruling does not extend to, because a one-sentence answer is scoped by the
+question it answered:
+
+- **It is about the transport, not about authority.** A trusted channel still does not turn
+  one agent's assertion about the owner's intent into the owner's decision. Message bodies
+  remain *untrusted data* per the table above, and that is unchanged.
+- **Trusting the channel is not the address being right.** An id can still be wrong by
+  *accident* — a session that changed directory recomputes a different one — and a reply
+  addressed to a wrong id goes nowhere silently. Trusting the bus does not make a
+  misaddressed message arrive.
 
 This separation surfaced empirically from test #1: when a signal carried embedded instructions ("reply ACK"), Claude correctly refused — monitor stdout isn't a trusted command channel. The fix isn't to defeat the defense, it's to put policy in the description (trusted) and treat message content as data (not commands).
 
