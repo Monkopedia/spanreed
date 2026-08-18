@@ -134,7 +134,11 @@ class Bridge:
                     # reaches Path.glob(); "*" there matches every host-qualified
                     # inbox, including mail queued for an unrelated peer.
                     print(
-                        f"spanreed: peer declared an invalid host {host!r}; refusing bridge",
+                        f"spanreed: peer declared an invalid host label {host!r}; "
+                        "refusing the bridge. A label must be alphanumeric at both "
+                        "ends with only '.', '-' or '_' inside, at most 253 chars. "
+                        "Override the peer's advertised label with "
+                        "`spanreed conjoin --serve --label <name>`.",
                         file=sys.stderr,
                     )
                     self._stop.set()
@@ -190,16 +194,22 @@ class Bridge:
         if not self._hello.wait(timeout=15.0):
             self._stop.set()
             return time.monotonic() - started
-        if self._stop.is_set():
-            # The reader refused the peer and set _hello only to release the
-            # wait above. Return before advertising anything: the registry frame
-            # carries agent ids, display names, absolute working directories,
-            # pids and focus text, and a peer we just hung up on must not get it.
-            return time.monotonic() - started
-        self._last_recv = time.monotonic()
-        self._send_registry()
-        last_sync = time.monotonic()
         try:
+            if self.peer_host is None:
+                # The reader refused the peer and set _hello only to release the
+                # wait above. Return before advertising anything: the registry
+                # frame carries agent ids, display names, absolute working
+                # directories, pids and focus text, and a peer we just hung up
+                # on must not get it.
+                #
+                # Keyed on peer_host rather than _stop because _stop is also set
+                # by a plain EOF, which can land here after a VALID hello — and
+                # that case has mirrored entries to tear down. Inside the try so
+                # the finally runs either way.
+                return time.monotonic() - started
+            self._last_recv = time.monotonic()
+            self._send_registry()
+            last_sync = time.monotonic()
             while not self._stop.is_set():
                 self._forward_outbound()
                 now = time.monotonic()

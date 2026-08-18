@@ -209,6 +209,7 @@ A message addressed to `agent-X@hostB` is delivered by the normal `send_message`
 The pipe carries newline-delimited JSON frames, each with a `kind`:
 
 ```json
+{"kind": "hello", "host": "<the sender's own host label>"}
 {"kind": "msg", "message": { <Message, addresses in RECEIVER's namespace> }}
 {"kind": "registry", "agents": [ <Agent, ...> ]}
 {"kind": "ping"}
@@ -216,7 +217,9 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
 
 - `msg` — a forwarded bus message. The receiving bridge appends `message` verbatim to `inboxes/<message.to_agent>.jsonl`.
 - `registry` — the sender's current set of live local agents (bare ids, home = sender). The receiver mirrors them per "Mirrored registry entries" above. Sent on connect and whenever the local set changes.
-- `hello` — the sender's own host label, which becomes the `@host` suffix for every id it owns. **Validated on receipt**: alphanumeric at both ends, `.`/`-`/`_` inside, at most 253 characters. A label failing that is refused and the bridge exits rather than routing on it — the receiver interpolates this value into a filesystem glob when selecting outbound inboxes, so a metacharacter is a wildcard rather than a name.
+- `hello` — the sender's own host label, which becomes the `@host` suffix for every id it owns. Sent once, first, by both ends. **Validated on receipt**: alphanumeric at both ends, `.`/`-`/`_` inside, at most 253 characters. The receiver interpolates this value into a filesystem glob when selecting outbound inboxes, so a metacharacter would be a wildcard rather than a name.
+
+  On a label that fails validation the receiver **sends nothing further and closes**. Specifically, it does **not** send a `registry` frame — that frame carries agent ids, display names, absolute working directories, pids and focus text, and a peer whose identity was just rejected must not receive it. `hello` is the only frame a refused peer ever sees, and it was already in flight. The refusal is reported on stderr, naming the rule and the `--label` override; stdout is the pipe and carries nothing but frames.
 - `ping` — keepalive; lets each side detect a dead pipe and lets `connect` trigger reconnect.
 
 ### Address rewriting (done by the sending bridge)
