@@ -322,8 +322,18 @@ class TestTheGuardSaysWhenItCouldNotRun:
         The other test writes ``pid_start = None`` straight into the registry,
         so it never exercises registration. This one goes through
         ``register_agent`` and therefore also pins that the platform's answer is
-        *propagated* into the entry. Delete it only if you find that no mutation
-        separates them any more.
+        *propagated* into the entry.
+
+        The distinguishing mutation is not an artificial one, which is the
+        stronger reason to keep this: ``store.py:176`` is the exact line #31's
+        option 1 would change. A Darwin ``pid_start_time`` alters what
+        registration records, so this test is aimed at the code most likely to
+        move next — targeted coverage rather than incidental separability.
+        (#31 also requires that whoever lands that change relabel this
+        fixture: ``platform_start_time(None)`` would then model "a host where
+        the read fails" but no longer "macOS", and nothing here would go red.)
+
+        Delete it only if you find that no mutation separates them any more.
         """
         platform_start_time(None)  # a host with no /proc
         home = tmp_path / "repo"
