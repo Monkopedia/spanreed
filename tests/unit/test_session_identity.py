@@ -311,6 +311,19 @@ class TestTheGuardSaysWhenItCouldNotRun:
         (``store.py:106``) so it stays resolvable, and the note must fire. On
         such a host the note is correct on *every* drift, which is exactly why
         skipping there proved nothing either way.
+
+        **Not a duplicate of ``test_drift_warning_admits_...``, and here is the
+        mutation that proves it** — the test for that is distinguishability, not
+        source similarity, since both end at the same assertion::
+
+            store.py:176   pid_start=pid_start_time(pid)  ->  pid_start=0
+            => this test RED, test_drift_warning_admits_... still green
+
+        The other test writes ``pid_start = None`` straight into the registry,
+        so it never exercises registration. This one goes through
+        ``register_agent`` and therefore also pins that the platform's answer is
+        *propagated* into the entry. Delete it only if you find that no mutation
+        separates them any more.
         """
         platform_start_time(None)  # a host with no /proc
         home = tmp_path / "repo"
