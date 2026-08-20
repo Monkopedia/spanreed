@@ -162,11 +162,18 @@ class TestFallsBackWhereItShould:
     def test_a_restarting_session_is_not_why_stale_entries_were_consulted(
         self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Pins the reasoning above, so the include-stale view is not restored.
+        """Documents why nothing was lost by refusing stale entries.
 
         A session mid-restart cannot match on pid anyway: its registry entry
         still holds the *old*, dead pid, while ``$CLAUDE_PID`` is the new
-        process. Nothing is lost by refusing stale entries.
+        process.
+
+        Honest about its own weight: this test does NOT pin that claim. It is
+        green under both implementations, because ``owned`` is empty either way
+        — a negative with no observable to assert on. The reuse test above is
+        the one that discriminates. Kept because the reasoning is what stops
+        someone restoring the include-stale view, and a reader who finds only
+        the reuse test will not know the mid-restart case was considered.
         """
         home = tmp_path / "repo"
         home.mkdir()
@@ -178,6 +185,71 @@ class TestFallsBackWhereItShould:
         # No entry claims the new pid, so we fall back — exactly as before the
         # anchor existed, and exactly until the hook re-registers.
         assert session_agent_identity(home) == (*derive_agent_identity(home), None)
+
+
+class TestTheGuardSaysWhenItCouldNotRun:
+    """Rule 7, on the residual #31 tracks.
+
+    The staleness filter leans on ``pid_start`` to catch pid reuse. Where none
+    was recorded — macOS has no ``/proc`` — it cannot run, and the match rests
+    on the bare pid. The warning that overrides a visible answer should not
+    sound more certain than it is.
+    """
+
+    def _register_without_start_time(self, bus: StateStore, wd: Path, pid: int) -> str:
+        agent_id, name = derive_agent_identity(wd)
+        bus.register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
+        entry = bus.list_agents(include_stale=True)[0]
+        entry.pid_start = None  # what registration produces with no /proc
+        bus._write_registry_unlocked([entry])  # pyright: ignore[reportPrivateUsage]
+        return agent_id
+
+    def test_drift_warning_admits_the_reuse_check_could_not_run(
+        self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "repo"
+        home.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        registered = self._register_without_start_time(bus, home, pid=os.getpid())
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+
+        agent_id, _, warning = session_agent_identity(elsewhere)
+
+        assert agent_id == registered  # still resolved — see below
+        assert warning is not None
+        assert "could not run" in warning
+
+    def test_a_missing_start_time_does_not_refuse_the_match(
+        self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Deliberately NOT treated as disqualifying.
+
+        On macOS *every* entry has no start time, so refusing these would hand
+        that platform back the unconditional bug — a certainty, traded away to
+        avoid a conjunction. Warn, resolve, and track the gap in #31.
+        """
+        home = tmp_path / "repo"
+        home.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        registered = self._register_without_start_time(bus, home, pid=os.getpid())
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+
+        assert session_agent_identity(elsewhere)[0] == registered
+        assert session_agent_identity(elsewhere)[0] != derive_agent_identity(elsewhere)[0]
+
+    def test_no_note_when_the_answers_agree(
+        self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing is riding on the match when it agrees with the directory, and
+        macOS would otherwise warn on every single command."""
+        home = tmp_path / "repo"
+        home.mkdir()
+        self._register_without_start_time(bus, home, pid=os.getpid())
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+
+        assert session_agent_identity(home)[2] is None
 
 
 class TestOverrideStillWins:

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from spanreed import cli
-from spanreed.store import StateStore, is_stale
+from spanreed.store import StateStore
 
 
 @pytest.fixture
@@ -654,18 +654,22 @@ class TestIdentityFollowsTheSession:
 
         neighbour_dir = cli_env.parent / "neighbour"
         neighbour_dir.mkdir()
-        # Explicit --pid: the neighbour is a *different* session, so it must not
-        # share ours. (Without it `register` defaults to os.getppid(), which in a
-        # test is the one shell running both — see the `pid` ambiguity branch.)
+        # The explicit --pid is what makes this test bite, and it is worth being
+        # exact about why. Without it `register` defaults to os.getppid(), which
+        # in a test is the single shell registering BOTH agents; two entries then
+        # claim one pid, resolution hits the ambiguity branch, falls back to the
+        # cwd, and the test fails *with the fix present*. Verified by removing it.
+        #
+        # (Neighbour liveness, by contrast, is irrelevant here — checked: a dead
+        # neighbour discriminates just as well. `from_agent` never consults the
+        # recipient-side registry, and send_message validates only `to_agent`.
+        # The neighbour has to be a real registered id, not a live session.)
         _, out = _run(
             capsys,
             ["register", "--working-dir", str(neighbour_dir), "--pid", str(os.getpid())],
         )
         neighbour: str = json.loads(out)["agent_id"]
         assert neighbour != me
-        assert not is_stale(
-            next(a for a in StateStore().list_agents() if a.agent_id == neighbour)
-        ), "the neighbour must be LIVE — a dead one would make this test pass for free"
 
         _register_peer("agent-peer")
         monkeypatch.chdir(neighbour_dir)

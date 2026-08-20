@@ -51,10 +51,12 @@ def session_agent_identity(
     ``cd`` than before, so every later CLI call speaks under an id that is not
     the one the SessionStart hook registered and told the agent to use.
 
-    The anchor is ``$CLAUDE_PID``, which Claude Code sets for the hook and
-    Bash-tool processes a session spawns, and which is exactly the pid the
-    SessionStart hook records in the registry (it registers with
-    ``os.getppid()``, and Claude Code invokes hooks directly). So the registry
+    The anchor is ``$CLAUDE_PID``, which Claude Code sets for the Bash-tool
+    processes a session spawns. It matches what the SessionStart hook records
+    in the registry — not because the hook reads that variable (it does not; it
+    records ``os.getppid()``) but because Claude Code invokes hooks directly, so
+    the hook's parent *is* the claude process. Verified against the fleet: every
+    live entry's ``pid`` equals its session's ``CLAUDE_PID``. So the registry
     already holds a pid-to-identity mapping; this consults it instead of
     re-deriving from a cwd that has since moved.
 
@@ -111,6 +113,7 @@ def session_agent_identity(
 
     agent = owned[0]
     if agent.agent_id == derived_id:
+        # Both answers agree, so nothing is riding on how we got here.
         return agent.agent_id, agent.name, None
 
     warning = (
@@ -120,4 +123,16 @@ def session_agent_identity(
         f"Using the registered identity. Bus traffic is unaffected; a command "
         f"run from a different directory no longer changes who you are."
     )
+    if agent.pid_start is None:
+        # The staleness filter above leans on pid_start to catch pid reuse; with
+        # no start time recorded (macOS has no /proc) it could not run, and this
+        # match rests on the bare pid alone. Say so rather than let the sentence
+        # above sound more certain than it is — but only here, where we are
+        # overriding a visible answer with an unverified one. Warning on every
+        # agreeing call would make macOS unusable and tell the reader nothing.
+        warning += (
+            " NOTE: no process start time was recorded for this entry, so the"
+            " pid-reuse check could not run and this match rests on the pid"
+            " alone. See issue #31."
+        )
     return agent.agent_id, agent.name, warning

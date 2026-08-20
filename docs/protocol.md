@@ -160,12 +160,12 @@ Re-deriving from the cwd is only correct while the session stands where it start
 So identity is resolved against the session, in this order:
 
 1. `SPANREED_AGENT_NAME`, if set — an explicit override outranks everything.
-2. The registry entry whose `pid` is `$CLAUDE_PID`, if exactly one **live** entry matches. Claude Code sets `CLAUDE_PID` for the hook and Bash-tool processes a session spawns, and the SessionStart hook registers under that same pid, so the registry is already a pid → identity map.
+2. The registry entry whose `pid` is `$CLAUDE_PID`, if exactly one **live** entry matches. Claude Code sets `CLAUDE_PID` for the Bash-tool processes a session spawns, and the SessionStart hook registers under that same pid — not by reading the variable, but because Claude Code invokes hooks directly, so the hook's `os.getppid()` *is* the claude process. So the registry is already a pid → identity map.
 3. Otherwise, the cwd derivation above. This is the path for a human running `spanreed` at a terminal, who has no session to belong to; it is also what a session gets before its hook has run.
 
 **Stale entries are excluded from (2), and that exclusion is load-bearing.** `$CLAUDE_PID` is the caller's own ancestor, so it is alive by construction — which means the only staleness a *matching* entry can carry is a `pid_start` mismatch, i.e. precisely pid reuse. Admitting stale entries therefore buys nothing and costs everything: an abandoned agent whose pid the OS later recycled onto a live session would be adopted as that session's identity, and the drift warning below would assert it was correct. A session mid-restart is not a counter-example — its entry still holds the *old*, dead pid, so it cannot match the new one either way.
 
-Residual, and inherited rather than introduced: where `pid_start` could not be read at registration (macOS has no `/proc`), `is_stale` falls back to a bare PID-alive check and accepts a small reuse risk — see its docstring. This resolver is exactly as exposed as liveness already was, and no more.
+**Residual, and this spec should not soften it.** Where `pid_start` could not be read at registration (macOS has no `/proc`), `is_stale` falls back to a bare PID-alive check and accepts a small reuse risk — see its docstring. The *probability* of reuse is unchanged by anything here. The *consequence* is not: before identity was resolved this way, no code path turned a missing `pid_start` into a wrong `agent_id`. This resolver creates that path, and on macOS it creates it with the guard inert. That is introduced, not merely inherited. Tracked as issue #31; where the guard could not run, the drift warning says so.
 
 Ambiguity is refused, not guessed: if two entries claim the pid, (2) is skipped. Note that `register` and the auto-register fallback record `os.getppid()` — under a Claude session's Bash tool that is the *shell*, not the session — so `pid` is not yet a single well-defined thing across all writers.
 
