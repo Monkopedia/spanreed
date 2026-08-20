@@ -140,12 +140,34 @@ transitions appear in the local log) are open — see
 
 ## Identity model
 
-Agents are addressed by `agent_id`. The id is **deterministic per session**:
+Agents are addressed by `agent_id`. An id is **minted** from the directory a session starts in, and thereafter **belongs to the session**, not to the directory.
+
+### Minting (`session-start`, `register`)
 
 - Default: `agent_id = "agent-" + sha256(absolute_cwd)[:8]`. Display name = basename of cwd.
 - Override: `SPANREED_AGENT_NAME` env var → `agent_id = "agent-<name>"`, display name = `<name>`.
 
-Both the SessionStart hook and the Monitor compute identity the same way, so they coordinate without needing to persist state between them. v1 limitation: two Claude Code sessions running in the same cwd share an agent — fine for the typical one-session-per-repo workflow.
+v1 limitation: two Claude Code sessions started in the same cwd share an agent — fine for the typical one-session-per-repo workflow.
+
+### Resolving (every other command)
+
+Re-deriving from the cwd is only correct while the session stands where it started. A session that `cd`s — into a subdirectory, a sibling repo, or a git worktree — derives a **different** id, and every id it derives is a real, reachable address, so nothing errors:
+
+- If the drifted-to id is unregistered, replies raise on the sender's side and the conversation ends without either party learning why.
+- If it is registered but **stale**, replies are accepted and written to an inbox no monitor tails.
+- If it is registered and **live**, replies are delivered to a **different agent**. This is not hypothetical: on a bus with an agent rooted at `~/git`, any peer that `cd`s to `~/git` derives that agent's id, and the reply to its message lands in that agent's inbox.
+
+So identity is resolved against the session, in this order:
+
+1. `SPANREED_AGENT_NAME`, if set — an explicit override outranks everything.
+2. The registry entry whose `pid` is `$CLAUDE_PID`, if exactly one matches. Claude Code sets `CLAUDE_PID` in the environment of every process a session spawns, and the SessionStart hook registers under that same pid, so the registry is already a pid → identity map. The include-stale view is used: a session mid-restart has not stopped being itself.
+3. Otherwise, the cwd derivation above. This is the path for a human running `spanreed` at a terminal, who has no session to belong to; it is also what a session gets before its hook has run.
+
+When (2) fires and disagrees with (3), the command **prints the disagreement to stderr** and proceeds under the registered identity. Correcting silently would leave the agent still believing what `pwd` told it.
+
+The MCP server needs none of this: it is a per-session process whose own cwd is fixed at spawn, so a `cd` inside the session cannot move it. The drift was only ever reachable through the CLI.
+
+Both the SessionStart hook and the Monitor still compute identity without persisting state between them.
 
 **Renaming after the fact**: the cwd-derived name is often unhelpful (e.g. "git" when cwd is `~/git`). Agents can call `set_name` (MCP) or `spanreed name "..."` (CLI) at any time to set a more descriptive display name. The `agent_id` doesn't change, so message routing keeps working. Renames persist across session restarts thanks to the upsert-preserve behavior in `register_agent`.
 

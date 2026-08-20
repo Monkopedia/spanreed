@@ -23,6 +23,10 @@ def cli_env(monkeypatch: pytest.MonkeyPatch, state_root: Path, tmp_path: Path) -
     """Bind CLI to a per-test state root and a per-test cwd for identity derivation."""
     monkeypatch.setenv("SPANREED_STATE_ROOT", str(state_root))
     monkeypatch.delenv("SPANREED_AGENT_NAME", raising=False)
+    # Inherited from the real session when the suite is run inside Claude Code.
+    # Left set, it would make identity resolution depend on the developer's
+    # machine; tests that care set it themselves.
+    monkeypatch.delenv("CLAUDE_PID", raising=False)
     session_cwd = tmp_path / "session-cwd"
     session_cwd.mkdir()
     monkeypatch.chdir(session_cwd)
@@ -592,3 +596,82 @@ class TestParseSince:
     def test_malformed_raises_value_error(self, value: str) -> None:
         with pytest.raises(ValueError):
             _parse_since(value)
+
+
+# ------------------------------------------------- identity follows the session
+
+
+class TestIdentityFollowsTheSession:
+    """#23: commands took their identity from the cwd, so a ``cd`` renamed you.
+
+    These test the *wiring* — that each command consults
+    ``session_agent_identity`` — which the unit tests for the resolver itself
+    cannot show.
+    """
+
+    @pytest.fixture
+    def drifted(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> str:
+        """Register from the session cwd, then stand somewhere else."""
+        _, out = _run(capsys, ["register"])
+        registered: str = json.loads(out)["agent_id"]
+        monkeypatch.setenv("CLAUDE_PID", str(os.getppid()))
+        elsewhere = cli_env.parent / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        return registered
+
+    def test_agent_id_after_cd(self, drifted: str, capsys: pytest.CaptureFixture[str]) -> None:
+        _, out = _run(capsys, ["agent-id"])
+        assert out.strip() == drifted
+
+    def test_send_after_cd_is_attributed_to_the_session(
+        self, drifted: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _register_peer("agent-peer")
+        _run(capsys, ["send", "--to", "agent-peer", "--body", "hi"])
+        inbox = StateStore().recv_messages("agent-peer")
+        # Pre-fix this was the id of whatever directory the command ran in, so
+        # the peer's reply went to an inbox this session does not tail.
+        assert [m.from_agent for m in inbox] == [drifted]
+
+    def test_focus_after_cd_updates_the_session_not_a_stranger(
+        self, drifted: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["focus", "still me"])
+        entry = next(
+            a for a in StateStore().list_agents(include_stale=True) if a.agent_id == drifted
+        )
+        assert entry.focus == "still me"
+        # And no second entry was invented for the directory we were standing in.
+        assert len(StateStore().list_agents(include_stale=True)) == 1
+
+    def test_status_after_cd_updates_the_session(
+        self, drifted: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["status", "working"])
+        entry = next(
+            a for a in StateStore().list_agents(include_stale=True) if a.agent_id == drifted
+        )
+        assert entry.status == "working"
+
+    def test_name_after_cd_updates_the_session(
+        self, drifted: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["name", "renamed"])
+        entry = next(
+            a for a in StateStore().list_agents(include_stale=True) if a.agent_id == drifted
+        )
+        assert entry.name == "renamed"
+
+    def test_drift_is_announced_on_stderr_not_stdout(
+        self, drifted: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Rule 7, visibility over hiding: the agent is told, and stdout stays
+        parseable for the callers that consume it."""
+        cli.main(["agent-id"])
+        captured = capsys.readouterr()
+        assert captured.out.strip() == drifted
+        assert "registered as" in captured.err
+        assert drifted in captured.err
