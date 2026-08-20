@@ -4,10 +4,14 @@ The plugin's SessionStart hook and Monitor both call into this CLI, so the
 plugin scripts stay simple shell. The same commands are useful manually for
 inspecting bus state from a terminal.
 
-Identity model (v1): the agent_id is derived deterministically from the
-session's working directory (``SPANREED_AGENT_NAME`` env var overrides).
-This means two sessions in the same cwd will share an id — acceptable for
-v1, since the typical pattern is one Claude Code session per repo.
+Identity model (v1): a session's agent_id is *minted* deterministically from
+the working directory it starts in (``SPANREED_AGENT_NAME`` env var
+overrides), by ``session-start``/``register``. Every other command *resolves*
+the identity of the calling session instead, via ``session_agent_identity()``
+— the id is a property of the session, not of wherever the command happened
+to run. Two sessions started in the same cwd still share an id; that remains
+the v1 assumption, since the typical pattern is one Claude Code session per
+repo.
 """
 
 from __future__ import annotations
@@ -19,15 +23,30 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from spanreed.identity import derive_agent_identity
+from spanreed.identity import derive_agent_identity, session_agent_identity
 from spanreed.protocol import Agent
 from spanreed.store import StateStore, default_state_root
 
 # ---------------------------------------------------------------- commands
 
 
+def _self_identity() -> tuple[str, str]:
+    r"""This session's ``(agent_id, name)``, anchored to the session not the cwd.
+
+    Wraps :func:`session_agent_identity` and surfaces its drift warning on
+    stderr rather than swallowing it — an agent that has ``cd``\ ed should be
+    told that ``pwd`` is no longer the answer to "who am I", not quietly
+    corrected. stderr, not stdout: several of these commands have parseable
+    stdout that callers consume.
+    """
+    agent_id, name, warning = session_agent_identity()
+    if warning:
+        print(warning, file=sys.stderr)
+    return agent_id, name
+
+
 def _cmd_agent_id(_args: argparse.Namespace) -> int:
-    agent_id, _ = derive_agent_identity()
+    agent_id, _ = _self_identity()
     print(agent_id)
     return 0
 
@@ -63,7 +82,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_send(args: argparse.Namespace) -> int:
-    from_agent = args.from_agent or derive_agent_identity()[0]
+    from_agent = args.from_agent or _self_identity()[0]
     msg = StateStore().send_message(
         from_agent=from_agent,
         to_agent=args.to,
@@ -102,7 +121,7 @@ def _cmd_inbox_watch(_args: argparse.Namespace) -> int:
     Replaces the Python process with ``tail`` via ``execvp`` — no subprocess
     bookkeeping, no buffering issues, signal handling delegated to ``tail``.
     """
-    agent_id, _ = derive_agent_identity()
+    agent_id, _ = _self_identity()
     # The Monitor's description tells agents to read the disposition policy file;
     # ensure it exists before we exec into tail and never return.
     _write_disposition_policy()
@@ -199,11 +218,17 @@ def _self_entry(store: StateStore, agent_id: str) -> Agent | None:
 
 
 def _ensure_registered(store: StateStore, agent_id: str) -> None:
-    """Register a stub entry for this session so a subsequent set_* takes effect.
+    """Register a stub entry for this caller so a subsequent set_* takes effect.
 
-    ``set_name``/``set_focus`` no-op on an unknown agent, but these commands can
-    be run before the SessionStart hook has registered — so register first, then
-    the caller retries its set.
+    ``set_name``/``set_focus`` no-op on an unknown agent, but these commands are
+    documented as useful from a terminal, where nothing has registered — so
+    register first, then the caller retries its set.
+
+    Reachable only on the cwd-derived fallback: when ``session_agent_identity``
+    resolves a *registered* session, the set it precedes cannot have missed.
+    Still cwd-derived on purpose — a human in a directory has no session whose
+    identity could be borrowed, and inventing one from ``$CLAUDE_PID`` would
+    attach their entry to a Claude session that is not theirs.
     """
     _, name = derive_agent_identity()
     store.register_agent(
@@ -213,7 +238,7 @@ def _ensure_registered(store: StateStore, agent_id: str) -> None:
 
 def _cmd_name(args: argparse.Namespace) -> int:
     """Set or show this session's display name on the bus."""
-    agent_id, _ = derive_agent_identity()
+    agent_id, _ = _self_identity()
     store = StateStore()
 
     if args.text is None:
@@ -235,7 +260,7 @@ def _cmd_name(args: argparse.Namespace) -> int:
 
 def _cmd_focus(args: argparse.Namespace) -> int:
     """Set, clear, or show this session's focus on the bus."""
-    agent_id, _ = derive_agent_identity()
+    agent_id, _ = _self_identity()
     store = StateStore()
 
     if not args.clear and args.text is None:
@@ -261,7 +286,7 @@ def _cmd_focus(args: argparse.Namespace) -> int:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     """Set or show this session's status on the bus."""
-    agent_id, _ = derive_agent_identity()
+    agent_id, _ = _self_identity()
     store = StateStore()
 
     if args.level is None:

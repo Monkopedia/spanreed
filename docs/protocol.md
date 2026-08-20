@@ -140,12 +140,42 @@ transitions appear in the local log) are open — see
 
 ## Identity model
 
-Agents are addressed by `agent_id`. The id is **deterministic per session**:
+Agents are addressed by `agent_id`. An id is **minted** from the directory a session starts in, and thereafter **belongs to the session**, not to the directory.
+
+### Minting (`session-start`, `register`)
 
 - Default: `agent_id = "agent-" + sha256(absolute_cwd)[:8]`. Display name = basename of cwd.
 - Override: `SPANREED_AGENT_NAME` env var → `agent_id = "agent-<name>"`, display name = `<name>`.
 
-Both the SessionStart hook and the Monitor compute identity the same way, so they coordinate without needing to persist state between them. v1 limitation: two Claude Code sessions running in the same cwd share an agent — fine for the typical one-session-per-repo workflow.
+v1 limitation: two Claude Code sessions started in the same cwd share an agent — fine for the typical one-session-per-repo workflow.
+
+### Resolving (every other command)
+
+Re-deriving from the cwd is only correct while the session stands where it started. A session that `cd`s — into a subdirectory, a sibling repo, or a git worktree — derives a **different** id, and every id it derives is a real, reachable address, so nothing errors:
+
+- If the drifted-to id is unregistered, replies raise on the sender's side and the conversation ends without either party learning why.
+- If it is registered but **stale**, replies are accepted and written to an inbox no monitor tails.
+- If it is registered and **live**, replies are delivered to a **different agent**. This is not hypothetical: on a bus with an agent rooted at `~/git`, any peer that `cd`s to `~/git` derives that agent's id, and the reply to its message lands in that agent's inbox.
+
+So identity is resolved against the session, in this order:
+
+1. `SPANREED_AGENT_NAME`, if set — an explicit override outranks everything.
+2. The registry entry whose `pid` is `$CLAUDE_PID`, if exactly one **live** entry matches. Claude Code sets `CLAUDE_PID` for the Bash-tool processes a session spawns, and the SessionStart hook registers under that same pid — not by reading the variable, but because Claude Code invokes hooks directly, so the hook's `os.getppid()` *is* the claude process. So the registry is already a pid → identity map.
+3. Otherwise, the cwd derivation above. This is the path for a human running `spanreed` at a terminal, who has no session to belong to; it is also what a session gets before its hook has run.
+
+**Stale entries are excluded from (2), and that exclusion is load-bearing.** `$CLAUDE_PID` is the caller's own ancestor, so it is alive by construction — which means the only staleness a *matching* entry can carry is a `pid_start` mismatch, i.e. precisely pid reuse. Admitting stale entries therefore buys nothing and costs everything: an abandoned agent whose pid the OS later recycled onto a live session would be adopted as that session's identity, and the drift warning below would assert it was correct. A session mid-restart is not a counter-example — its entry still holds the *old*, dead pid, so it cannot match the new one either way.
+
+**Residual, and this spec should not soften it.** Where `pid_start` could not be read at registration (macOS has no `/proc`), `is_stale` falls back to a bare PID-alive check and accepts a small reuse risk — see its docstring. The *probability* of reuse is unchanged by anything here. The *consequence* is not: before identity was resolved this way, no code path turned a missing `pid_start` into a wrong `agent_id`. This resolver creates that path, and on macOS it creates it with the guard inert. That is introduced, not merely inherited. Tracked as issue #31; where the guard could not run, the drift warning says so.
+
+Ambiguity is refused, not guessed: if two entries claim the pid, (2) is skipped. Note that `register` and the auto-register fallback record `os.getppid()` — under a Claude session's Bash tool that is the *shell*, not the session — so `pid` is not yet a single well-defined thing across all writers.
+
+When (2) fires and disagrees with (3), the command **prints the disagreement to stderr** and proceeds under the registered identity. Correcting silently would leave the agent still believing what `pwd` told it.
+
+The MCP server needs none of this: it is a per-session process whose own cwd is fixed at spawn, so a `cd` inside the session cannot move it. The drift was only ever reachable through the CLI.
+
+This is a change in kind, worth stating plainly: minting still needs no shared state — `derive_agent_identity` is a pure function of cwd and env, which is what let the hook and the Monitor agree without coordinating. **Resolving does read shared state**, because once a session can leave the directory it started in, its identity stops being a property of that directory and has to be looked up somewhere. The registry is that somewhere, and it already existed.
+
+`CLAUDE_PID` is an undocumented Claude Code environment variable and not every spawned process receives it (MCP servers do not). Where it is absent, resolution degrades to the cwd answer — silently, and indistinguishably from a human at a terminal. The surfaces that need the anchor (the CLI, the Monitor) do have it today; if that ever stops being true, the drift returns with no signal.
 
 **Renaming after the fact**: the cwd-derived name is often unhelpful (e.g. "git" when cwd is `~/git`). Agents can call `set_name` (MCP) or `spanreed name "..."` (CLI) at any time to set a more descriptive display name. The `agent_id` doesn't change, so message routing keeps working. Renames persist across session restarts thanks to the upsert-preserve behavior in `register_agent`.
 
