@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from spanreed.identity import derive_agent_identity, session_agent_identity
-from spanreed.store import StateStore, is_stale
+from spanreed.store import StateStore, is_stale, pid_start_time
 
 
 @pytest.fixture
@@ -238,6 +238,39 @@ class TestTheGuardSaysWhenItCouldNotRun:
 
         assert session_agent_identity(elsewhere)[0] == registered
         assert session_agent_identity(elsewhere)[0] != derive_agent_identity(elsewhere)[0]
+
+    @pytest.mark.skipif(
+        pid_start_time(os.getpid()) is None,
+        reason="no process start time available here — which is #31's gap, and on"
+        " such a platform the note is *correct* on every drift, so there is"
+        " nothing to discriminate",
+    )
+    def test_no_note_when_the_check_DID_run(
+        self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The negative this class was missing, and the reason it mattered.
+
+        Three mutations proved the note *appears*; none proved it appears
+        **only** when the guard could not run. With that unpinned, folding the
+        note into the warning unconditionally kept the whole suite green — and
+        every Linux drift warning would then claim the reuse check could not run
+        on a machine where it ran and passed. A message asserting something the
+        code did not verify is precisely what this note was added to stop, so
+        leaving its converse untested reintroduced the defect in mirror image.
+        """
+        home = tmp_path / "repo"
+        home.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        _register(bus, home, pid=os.getpid())  # ordinary registration: start time recorded
+        assert bus.list_agents()[0].pid_start is not None
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+
+        _, _, warning = session_agent_identity(elsewhere)
+
+        assert warning is not None, "this is still a drift — the warning must fire"
+        assert "could not run" not in warning
+        assert "#31" not in warning
 
     def test_no_note_when_the_answers_agree(
         self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

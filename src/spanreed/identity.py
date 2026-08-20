@@ -127,9 +127,17 @@ def session_agent_identity(
         # The staleness filter above leans on pid_start to catch pid reuse; with
         # no start time recorded (macOS has no /proc) it could not run, and this
         # match rests on the bare pid alone. Say so rather than let the sentence
-        # above sound more certain than it is — but only here, where we are
-        # overriding a visible answer with an unverified one. Warning on every
-        # agreeing call would make macOS unusable and tell the reader nothing.
+        # above sound more certain than it is.
+        #
+        # Only on the drift path, and the reason is coverage rather than cost:
+        # every outcome this note warns about is a *disagreement*. A recycled
+        # pid belongs to some other agent's entry, which carries a different
+        # working_dir, so it derives a different id — a hijack disagrees by
+        # construction and cannot reach the branch above. Restricting the note
+        # here therefore gives up nothing; it is not a concession to noise.
+        # (Cost is real too — on macOS every entry has pid_start None, so an
+        # unconditional note would fire on every call — but that is a bonus,
+        # not the argument.)
         warning += (
             " NOTE: no process start time was recorded for this entry, so the"
             " pid-reuse check could not run and this match rests on the pid"
