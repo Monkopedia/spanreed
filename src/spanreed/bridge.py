@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shlex
 import signal
 import socket
@@ -31,6 +32,26 @@ from typing import IO
 
 from spanreed.protocol import Agent, Message
 from spanreed.store import StateStore, pid_start_time
+
+_HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+"""A plausible host label: alphanumeric ends, dots/hyphens/underscores inside.
+
+This validates the label a peer *advertises for itself* (usually its
+``gethostname()``, or whatever ``--label`` overrides it with) — not the SSH
+target we dialled. Deliberately permissive about what such a name may contain,
+since it can be an mDNS ``.local`` name, an IPv4 literal or a container name,
+and strict about what it may NOT: no glob metacharacters, no ``/``, no
+whitespace, not empty.
+"""
+
+
+def _is_valid_host(host: str) -> bool:
+    """True if ``host`` is safe to use as a routing suffix and a glob literal.
+
+    The peer chooses this string and we interpolate it into ``Path.glob`` and
+    into ``@``-suffix comparisons. A ``*`` there is a wildcard, not a name.
+    """
+    return len(host) <= 253 and _HOST_RE.fullmatch(host) is not None
 
 
 def _qualify_from(from_agent: str, self_host: str) -> str:
@@ -107,7 +128,27 @@ class Bridge:
                 continue
             self._last_recv = time.monotonic()  # any frame proves the pipe is alive
             if kind == "hello":
-                self.peer_host = str(frame["host"])
+                host = str(frame["host"])
+                if not _is_valid_host(host):
+                    # Refuse the connection rather than routing on it. This value
+                    # reaches Path.glob(); "*" there matches every host-qualified
+                    # inbox, including mail queued for an unrelated peer.
+                    print(
+                        f"spanreed: the peer advertised an invalid host label {host!r}; "
+                        "refusing the bridge. A label must be alphanumeric at both ends "
+                        "with only '.', '-' or '_' inside, and at most 253 characters. "
+                        "The label belongs to the OTHER end, so it has to be fixed "
+                        "there: pass --label to whichever `spanreed conjoin` runs on "
+                        "that machine, or change its hostname. Caveat: `conjoin <host>` "
+                        "launches the remote end with no way to pass --label, so a peer "
+                        "on the serve side may have no remedy but its hostname "
+                        "(spanreed#27).",
+                        file=sys.stderr,
+                    )
+                    self._stop.set()
+                    self._hello.set()  # unblock run()'s wait so it exits promptly
+                    return
+                self.peer_host = host
                 self._hello.set()
             elif kind == "msg":
                 self.store.append_message(Message.model_validate(frame["message"]))
@@ -157,10 +198,34 @@ class Bridge:
         if not self._hello.wait(timeout=15.0):
             self._stop.set()
             return time.monotonic() - started
-        self._last_recv = time.monotonic()
-        self._send_registry()
-        last_sync = time.monotonic()
         try:
+            if self.peer_host is None:
+                # The reader refused the peer and set _hello only to release the
+                # wait above. Return before advertising anything: the registry
+                # frame carries agent ids, display names, absolute working
+                # directories, pids and focus text, and a peer we just hung up
+                # on must not get it.
+                #
+                # Two independent properties here, and it is worth not
+                # confusing them:
+                #
+                # Inside the `try` so the `finally` runs. `_stop` is also set by
+                # a plain EOF, which can land here after a VALID hello, and that
+                # case has mirrored entries to tear down; an early return above
+                # the `try` skipped `clear_remote_agents` for it.
+                #
+                # Keyed on `peer_host` because that is what the branch is
+                # actually about — "we never accepted this peer" — where `_stop`
+                # only means "stop". Either change alone closes the teardown
+                # hole; both are kept because the predicate is the honest one
+                # and the placement is the robust one. They do diverge: an
+                # external stop() between the hello and this guard sets `_stop`
+                # with a valid peer_host, and only the `peer_host` form still
+                # advertises the registry. Neither is wrong; they are different.
+                return time.monotonic() - started
+            self._last_recv = time.monotonic()
+            self._send_registry()
+            last_sync = time.monotonic()
             while not self._stop.is_set():
                 self._forward_outbound()
                 now = time.monotonic()
