@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from spanreed import cli
-from spanreed.store import StateStore
+from spanreed.store import StateStore, is_stale
 
 
 @pytest.fixture
@@ -635,6 +635,47 @@ class TestIdentityFollowsTheSession:
         # Pre-fix this was the id of whatever directory the command ran in, so
         # the peer's reply went to an inbox this session does not tail.
         assert [m.from_agent for m in inbox] == [drifted]
+
+    def test_send_from_a_neighbours_directory_is_not_attributed_to_the_neighbour(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The actual misdelivery control, end to end.
+
+        ``test_send_after_cd_...`` walks into a directory no agent owns, so it
+        only discriminates "me" from "nobody". This walks into a directory that
+        a *live peer* is registered under — the real shape of the bug, where
+        ``cd ~/git`` lands on main-coordinator — and asserts the message is
+        attributed to the sender rather than to the neighbour whose doorstep it
+        was sent from.
+        """
+        _, out = _run(capsys, ["register"])
+        me: str = json.loads(out)["agent_id"]
+        monkeypatch.setenv("CLAUDE_PID", str(os.getppid()))
+
+        neighbour_dir = cli_env.parent / "neighbour"
+        neighbour_dir.mkdir()
+        # Explicit --pid: the neighbour is a *different* session, so it must not
+        # share ours. (Without it `register` defaults to os.getppid(), which in a
+        # test is the one shell running both — see the `pid` ambiguity branch.)
+        _, out = _run(
+            capsys,
+            ["register", "--working-dir", str(neighbour_dir), "--pid", str(os.getpid())],
+        )
+        neighbour: str = json.loads(out)["agent_id"]
+        assert neighbour != me
+        assert not is_stale(
+            next(a for a in StateStore().list_agents() if a.agent_id == neighbour)
+        ), "the neighbour must be LIVE — a dead one would make this test pass for free"
+
+        _register_peer("agent-peer")
+        monkeypatch.chdir(neighbour_dir)
+        _run(capsys, ["send", "--to", "agent-peer", "--body", "hi"])
+
+        attributed = [m.from_agent for m in StateStore().recv_messages("agent-peer")]
+        assert attributed == [me]
+        # The failure this replaces: the peer would reply to the neighbour, and
+        # the neighbour would receive an answer to a question it never asked.
+        assert neighbour not in attributed
 
     def test_focus_after_cd_updates_the_session_not_a_stranger(
         self, drifted: str, capsys: pytest.CaptureFixture[str]
