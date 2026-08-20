@@ -11,12 +11,13 @@ is not a dead letter but delivery to the wrong *live* agent.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from spanreed.identity import derive_agent_identity, session_agent_identity
-from spanreed.store import StateStore, is_stale, pid_start_time
+from spanreed.store import StateStore, is_stale
 
 
 @pytest.fixture
@@ -239,31 +240,55 @@ class TestTheGuardSaysWhenItCouldNotRun:
         assert session_agent_identity(elsewhere)[0] == registered
         assert session_agent_identity(elsewhere)[0] != derive_agent_identity(elsewhere)[0]
 
-    @pytest.mark.skipif(
-        pid_start_time(os.getpid()) is None,
-        reason="no process start time available here — which is #31's gap, and on"
-        " such a platform the note is *correct* on every drift, so there is"
-        " nothing to discriminate",
-    )
+    @pytest.fixture
+    def platform_start_time(self, monkeypatch: pytest.MonkeyPatch) -> Callable[[int | None], None]:
+        """Force what ``pid_start_time`` returns, so either platform's behaviour
+        can be pinned from either platform.
+
+        ``register_agent`` (``store.py:176``) and ``is_stale`` (``store.py:108``)
+        both call this one module-level function, so patching it moves them
+        together and the simulated state is self-consistent.
+
+        This exists because the first version of the test below carried a
+        ``skipif`` for hosts with no start time — which skipped on **macOS, the
+        platform this entire branch is about**, leaving the note's condition
+        unpinned there while the suite stayed green. A guard that silently does
+        not run on the platform it guards is not a guard.
+        """
+
+        def _set(value: int | None) -> None:
+            def _fake(_pid: int) -> int | None:
+                return value
+
+            monkeypatch.setattr("spanreed.store.pid_start_time", _fake)
+
+        return _set
+
     def test_no_note_when_the_check_DID_run(
-        self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        bus: StateStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        platform_start_time: Callable[[int | None], None],
     ) -> None:
         """The negative this class was missing, and the reason it mattered.
 
         Three mutations proved the note *appears*; none proved it appears
         **only** when the guard could not run. With that unpinned, folding the
-        note into the warning unconditionally kept the whole suite green — and
-        every Linux drift warning would then claim the reuse check could not run
-        on a machine where it ran and passed. A message asserting something the
-        code did not verify is precisely what this note was added to stop, so
-        leaving its converse untested reintroduced the defect in mirror image.
+        note in unconditionally kept the whole suite green — and every drift
+        warning on a start-time-capable host would then claim the reuse check
+        could not run on a machine where it ran and passed. A message asserting
+        something the code did not verify is precisely what this note was added
+        to stop, so leaving its converse untested reintroduced the defect in
+        mirror image.
         """
+        platform_start_time(123456)  # a host that records start times
         home = tmp_path / "repo"
         home.mkdir()
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
-        _register(bus, home, pid=os.getpid())  # ordinary registration: start time recorded
-        assert bus.list_agents()[0].pid_start is not None
+        _register(bus, home, pid=os.getpid())
+        assert bus.list_agents()[0].pid_start == 123456
         monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
 
         _, _, warning = session_agent_identity(elsewhere)
@@ -271,6 +296,36 @@ class TestTheGuardSaysWhenItCouldNotRun:
         assert warning is not None, "this is still a drift — the warning must fire"
         assert "could not run" not in warning
         assert "#31" not in warning
+
+    def test_the_note_DOES_fire_on_a_host_with_no_start_times(
+        self,
+        bus: StateStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        platform_start_time: Callable[[int | None], None],
+    ) -> None:
+        """The macOS half, pinned from Linux — the point of the fixture.
+
+        Simulates a host where ``pid_start_time`` always returns ``None``: the
+        entry registers with no start time, ``is_stale`` short-circuits to False
+        (``store.py:106``) so it stays resolvable, and the note must fire. On
+        such a host the note is correct on *every* drift, which is exactly why
+        skipping there proved nothing either way.
+        """
+        platform_start_time(None)  # a host with no /proc
+        home = tmp_path / "repo"
+        home.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        registered = _register(bus, home, pid=os.getpid())
+        assert bus.list_agents()[0].pid_start is None
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+
+        agent_id, _, warning = session_agent_identity(elsewhere)
+
+        assert agent_id == registered, "still resolves — refusing would be worse, see #31"
+        assert warning is not None
+        assert "could not run" in warning
 
     def test_no_note_when_the_answers_agree(
         self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
