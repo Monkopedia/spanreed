@@ -298,8 +298,12 @@ def _ensure_registered(store: StateStore, agent_id: str) -> None:
     documented as useful from a terminal, where nothing has registered — so
     register first, then the caller retries its set.
 
-    Reachable only on the cwd-derived fallback: when ``session_agent_identity``
+    Reachable on the cwd-derived fallback: when ``session_agent_identity``
     resolves a *registered* session, the set it precedes cannot have missed.
+    Not the only way in — ``SPANREED_AGENT_NAME`` is precedence 1 and never
+    consults the registry, so an override session reaches here for its **own**
+    id and then records an ephemeral pid, never anchoring. Pre-existing, and #38
+    owns whether the stub should special-case it.
 
     ``os.getppid()``, deliberately, and NOT :func:`session_pid` — this is the
     one writer where the rule in ``protocol.md`` must not apply. Reaching here
