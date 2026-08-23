@@ -52,13 +52,11 @@ def session_agent_identity(
     the one the SessionStart hook registered and told the agent to use.
 
     The anchor is ``$CLAUDE_PID``, which Claude Code sets for the Bash-tool
-    processes a session spawns. It matches what the SessionStart hook records
-    in the registry — not because the hook reads that variable (it does not; it
-    records ``os.getppid()``) but because Claude Code invokes hooks directly, so
-    the hook's parent *is* the claude process. Verified against the fleet: every
-    live entry's ``pid`` equals its session's ``CLAUDE_PID``. So the registry
-    already holds a pid-to-identity mapping; this consults it instead of
-    re-deriving from a cwd that has since moved.
+    processes a session spawns. Every writer records that same value (see
+    :func:`session_pid`), so the registry holds a pid-to-identity mapping by
+    construction, and this consults it instead of re-deriving from a cwd that
+    has since moved. Verified against the fleet: every live entry's ``pid``
+    equals its session's ``CLAUDE_PID``.
 
     Not every spawned process gets it — MCP servers do not — so this is a
     best-effort anchor that degrades to the directory answer, silently and
@@ -159,22 +157,30 @@ def session_pid() -> int:
     whose liveness matters — and wrong for every caller inside a session, where
     it is the Bash tool's ``zsh``, alive for the length of one command.
 
-    The SessionStart hook is the one in-session caller ``getppid()` happened to
-    get right, and for a reason nothing in the tree recorded: hooks are declared
-    as ``"type": "command"`` and *are* run through a shell, but ``sh -c`` with a
-    single simple command ``exec``s it in place instead of forking, so the
-    parent stays claude. Measured::
+    The SessionStart hook was the one in-session caller ``getppid()`` happened
+    to get right, for a reason nothing in the tree recorded. Hooks are declared
+    as ``"type": "command"``; a shell running a **single simple command**
+    ``exec``s it in place instead of forking, so the parent stays claude.
+    Measured on this host (``/bin/sh`` is bash)::
 
         sh -c "cmd"              ppid = the caller     exec'd in place
-        sh -c "cmd 2>/dev/null"  ppid = a doomed shell FORKED
         sh -c "cmd || true"      ppid = a doomed shell FORKED
+        sh -c "cmd 2>/dev/null"  ppid = a doomed shell FORKED   (bash only)
 
-    Adding a redirection or an ``||`` to ``hooks.json`` — the two most natural
-    edits anyone would ever make to a hook — would therefore have broken
-    registration for every agent, silently, with no test failing. Reading
-    ``$CLAUDE_PID`` first removes that dependency rather than documenting it.
+    The ``||`` result holds in sh, dash, bash and zsh. The redirection result is
+    **bash-specific** — dash and zsh still exec in place — so how fragile this
+    is depends on which shell runs hooks, which is not something we control or
+    have measured. That uncertainty is the argument, not against it: an
+    invariant that holds depending on the host's ``/bin/sh`` is not one to
+    build identity on. Adding ``|| true`` to ``hooks.json`` would break
+    registration for every agent on any shell, silently, with no test failing.
+    Reading ``$CLAUDE_PID`` removes the dependency rather than documenting it.
     """
     claude_pid = os.environ.get("CLAUDE_PID")
-    if claude_pid and claude_pid.isdigit():
+    # `> 0` matters: pid 0 passes isdigit(), and `os.kill(0, 0)` signals the whole
+    # process group rather than probing a process — so an entry recorded with
+    # pid 0 reads live forever, which is the fail-open shape this rule exists to
+    # prevent. Reject it rather than record an unfalsifiable liveness claim.
+    if claude_pid and claude_pid.isdigit() and int(claude_pid) > 0:
         return int(claude_pid)
     return os.getppid()

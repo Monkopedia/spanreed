@@ -747,14 +747,24 @@ class TestRegisterRecordsTheClaudePid:
         _, out = _run(capsys, ["register"])
         assert json.loads(out)["pid"] == 770002
 
-    def test_auto_register_records_the_session(
+    def test_auto_register_does_NOT_stamp_the_session_onto_a_foreign_id(
         self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """`focus` before any registration goes through `_ensure_registered`."""
+        """`_ensure_registered` is the one writer that must keep `getppid()`.
+
+        An earlier revision of this PR switched it to `session_pid()` and this
+        test asserted that — encoding the bug. Reaching that path from inside a
+        session means the anchor found nothing, so the id is cwd-derived and by
+        construction not ours. Stamping `$CLAUDE_PID` there attaches our
+        liveness to a foreign entry permanently: it never decays, `is_stale`
+        confirms it, and the resolver then sees two live entries claiming one
+        pid. A doomed shell pid is right because it fails closed.
+        """
         monkeypatch.setenv("CLAUDE_PID", "770003")
         _run(capsys, ["focus", "hello"])
         entry = StateStore().list_agents(include_stale=True)[0]
-        assert entry.pid == 770003
+        assert entry.pid == os.getppid()
+        assert entry.pid != 770003
 
     def test_a_human_at_a_terminal_still_gets_their_shell(
         self, cli_env: Path, capsys: pytest.CaptureFixture[str]
@@ -771,15 +781,63 @@ class TestRegisteringSomeoneElse:
     own `$CLAUDE_PID` would fail OPEN — `is_stale` confirms it forever, because
     pid-alive and `pid_start` both hold of the registrar's real process."""
 
-    def test_refuses_a_foreign_id_without_an_explicit_pid(
+    def test_refuses_a_foreign_id_once_this_session_is_registered(
         self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        """The guard is the ANCHOR: a live entry already holds our pid, so
+        defaulting would put our liveness on a second, foreign entry."""
         monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+        _run(capsys, ["register"])
+        before = len(StateStore().list_agents(include_stale=True))
+
         rc = cli.main(["register", "--agent-id", "agent-someone-else", "--name", "other"])
+
         captured = capsys.readouterr()
         assert rc == 1
         assert "refusing to register" in captured.err
-        assert StateStore().list_agents(include_stale=True) == [], "nothing was written"
+        assert len(StateStore().list_agents(include_stale=True)) == before, "nothing written"
+
+    def test_a_corrupt_session_may_repair_its_own_entry_from_anywhere(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#29's victim must be able to fix itself, and the first predicate
+        refused exactly that — naming a session that did not exist.
+
+        Its entry holds a dead pid, so no live entry claims ours, so the anchor
+        is empty. Empty is positive evidence that nothing live is being taken
+        over, which makes the repair safe to allow.
+        """
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+        _, out = _run(capsys, ["register", "--pid", "999999"])  # the corrupt state
+        mine: str = json.loads(out)["agent_id"]
+        assert StateStore().list_agents() == [], "precondition: filtered out as stale"
+
+        elsewhere = cli_env.parent / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        rc, out = _run(capsys, ["register", "--agent-id", mine, "--working-dir", str(cli_env)])
+
+        assert rc == 0
+        assert json.loads(out)["pid"] == os.getpid()
+        assert [a.agent_id for a in StateStore().list_agents()] == [mine]
+
+    def test_a_drifted_register_cannot_mint_a_new_id_under_our_pid(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The other half the first predicate got backwards: plain `register`
+        with no --agent-id from a drifted cwd was ALLOWED, minting a fresh id
+        carrying our live pid."""
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+        _run(capsys, ["register"])
+        elsewhere = cli_env.parent / "elsewhere2"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        rc = cli.main(["register"])
+
+        assert rc == 1
+        assert "refusing to register" in capsys.readouterr().err
+        assert len(StateStore().list_agents()) == 1
 
     def test_allows_a_foreign_id_with_an_explicit_pid(
         self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

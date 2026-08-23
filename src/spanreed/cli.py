@@ -57,6 +57,22 @@ def _cmd_inbox_path(args: argparse.Namespace) -> int:
     return 0
 
 
+def _entry_owning_this_session() -> Agent | None:
+    """The live registry entry whose ``pid`` is ``$CLAUDE_PID``, if exactly one.
+
+    "Ours" in the only sense the registry can express. ``None`` means no live
+    entry claims this session's pid — either nothing is registered yet, or the
+    entry that should be ours holds a wrong pid (#29) and needs repairing.
+    Returns ``None`` on ambiguity too: two entries claiming one pid is a state
+    to refuse to reason from, not to pick a winner in.
+    """
+    claude_pid = os.environ.get("CLAUDE_PID")
+    if not claude_pid or not claude_pid.isdigit():
+        return None
+    owned = [a for a in StateStore().list_agents() if a.pid == int(claude_pid)]
+    return owned[0] if len(owned) == 1 else None
+
+
 def _cmd_register(args: argparse.Namespace) -> int:
     wd = Path(args.working_dir) if args.working_dir else Path.cwd()
     derived_id, derived_name = derive_agent_identity(wd)
@@ -65,22 +81,29 @@ def _cmd_register(args: argparse.Namespace) -> int:
 
     if args.pid is not None:
         pid = args.pid
-    elif os.environ.get("CLAUDE_PID") and agent_id != session_agent_identity()[0]:
-        # Registering an entry that is not ours, from inside a session. There is
-        # no correct default: getppid() is a shell that dies with this command,
-        # and session_pid() is OUR claude process, which would stamp our liveness
-        # onto someone else's entry. The second is worse — it fails OPEN, reading
-        # healthy forever with is_stale() confirming it, because pid-alive and
-        # pid_start both hold of the wrong process. Refuse instead of guessing.
-        print(
-            f"spanreed: refusing to register {agent_id} from inside another session "
-            f"({session_agent_identity()[0]}) without an explicit --pid. `pid` must be "
-            f"the claude pid of the process whose liveness this entry tracks; neither "
-            f"this session's pid nor this shell's is that. Pass --pid <their CLAUDE_PID>.",
-            file=sys.stderr,
-        )
-        return 1
     else:
+        # Guard on the ANCHOR, not on what the resolver returned. Asking
+        # `session_agent_identity()` conflates "not mine" with "differs from the
+        # cwd answer": it refused a corrupt session's own self-repair (naming an
+        # id that does not exist) while allowing a drifted `register` with no
+        # --agent-id to mint a new id under our live pid. Both backwards.
+        #
+        # The live entry holding $CLAUDE_PID, if any, IS ours — that is what the
+        # anchor means. Its absence is positive evidence that nothing live claims
+        # our pid, which makes a first registration or a repair safe: afterwards
+        # exactly one entry holds it.
+        mine = _entry_owning_this_session()
+        if mine is not None and mine.agent_id != agent_id:
+            print(
+                f"spanreed: refusing to register {agent_id} without an explicit --pid. "
+                f"This session's pid is already held by {mine.agent_id} ({mine.name}), so "
+                f"defaulting would stamp our liveness onto an entry that is not ours — "
+                f"which reads healthy forever instead of failing. `pid` must be the claude "
+                f"pid of the process whose liveness the entry tracks; pass "
+                f"--pid <their CLAUDE_PID>.",
+                file=sys.stderr,
+            )
+            return 1
         pid = session_pid()
 
     agent = StateStore().register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
@@ -246,13 +269,24 @@ def _ensure_registered(store: StateStore, agent_id: str) -> None:
 
     Reachable only on the cwd-derived fallback: when ``session_agent_identity``
     resolves a *registered* session, the set it precedes cannot have missed.
-    Still cwd-derived on purpose — a human in a directory has no session whose
-    identity could be borrowed, and inventing one from ``$CLAUDE_PID`` would
-    attach their entry to a Claude session that is not theirs.
+
+    ``os.getppid()``, deliberately, and NOT :func:`session_pid` — this is the
+    one writer where the rule in ``protocol.md`` must not apply. Reaching here
+    from inside a session means the anchor found nothing, so ``agent_id`` is
+    cwd-derived and by construction *not* this session's. Stamping
+    ``$CLAUDE_PID`` on it would attach our liveness to an entry that is not
+    ours, permanently: it would never decay, ``is_stale`` would confirm it, and
+    the resolver would then find two live entries claiming one pid. A doomed
+    shell pid is the right answer precisely because it fails closed — the stub
+    evaporates when the command does.
+
+    (This was changed to ``session_pid()`` in an earlier revision of #37 while
+    this docstring, which already said why not, was left untouched. Review
+    caught it and reproduced the duplicate-claim regression.)
     """
     _, name = derive_agent_identity()
     store.register_agent(
-        name=name, working_dir=str(Path.cwd()), pid=session_pid(), agent_id=agent_id
+        name=name, working_dir=str(Path.cwd()), pid=os.getppid(), agent_id=agent_id
     )
 
 
