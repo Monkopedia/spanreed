@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from spanreed.identity import derive_agent_identity, session_agent_identity
+from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.store import StateStore, is_stale
 
 
@@ -374,3 +374,46 @@ class TestOverrideStillWins:
         monkeypatch.setenv("SPANREED_AGENT_NAME", "explicit")
 
         assert session_agent_identity(tmp_path) == ("agent-explicit", "explicit", None)
+
+
+class TestSessionPid:
+    """``pid`` is the claude pid of the process whose liveness the entry tracks.
+
+    Owner ruling, 2026-08-23 (#29). ``$CLAUDE_PID`` is that value; ``getppid()``
+    is a fallback correct only where the parent shell IS the process whose
+    liveness matters — i.e. a human at a terminal.
+    """
+
+    def test_prefers_claude_pid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLAUDE_PID", "424242")
+        assert session_pid() == 424242
+
+    def test_falls_back_to_getppid_for_a_human_at_a_terminal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CLAUDE_PID", raising=False)
+        assert session_pid() == os.getppid()
+
+    @pytest.mark.parametrize("junk", ["", "not-a-pid", "12x", "-1", " 5"])
+    def test_unusable_claude_pid_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch, junk: str
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_PID", junk)
+        assert session_pid() == os.getppid()
+
+    def test_does_not_depend_on_the_shell_exec_optimisation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reason this helper exists rather than a comment on ``getppid()``.
+
+        ``hooks.json`` declares ``"type": "command"``, which runs through a
+        shell. ``getppid()`` is the claude process only because ``sh -c`` execs
+        a *single simple command* in place; adding ``2>/dev/null`` or
+        ``|| true`` makes it fork, and every session would then register a pid
+        that dies with the hook — silently, with no test failing.
+
+        Pinning it as: the answer must come from the environment, not from who
+        happens to have spawned us.
+        """
+        monkeypatch.setenv("CLAUDE_PID", "999001")
+        assert session_pid() == 999001 != os.getppid()

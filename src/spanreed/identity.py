@@ -52,13 +52,13 @@ def session_agent_identity(
     the one the SessionStart hook registered and told the agent to use.
 
     The anchor is ``$CLAUDE_PID``, which Claude Code sets for the Bash-tool
-    processes a session spawns. It matches what the SessionStart hook records
-    in the registry — not because the hook reads that variable (it does not; it
-    records ``os.getppid()``) but because Claude Code invokes hooks directly, so
-    the hook's parent *is* the claude process. Verified against the fleet: every
-    live entry's ``pid`` equals its session's ``CLAUDE_PID``. So the registry
-    already holds a pid-to-identity mapping; this consults it instead of
-    re-deriving from a cwd that has since moved.
+    processes a session spawns. A session's own entry records that value (see
+    :func:`session_pid`), which is what makes this lookup work instead of
+    re-deriving from a cwd that has since moved. Not every writer records it —
+    ``_ensure_registered`` deliberately does not, and mirrored ``@peer`` entries
+    carry the bridge's — so this is a lookup that usually succeeds, not an
+    invariant the store guarantees. Verified against the fleet: every live entry's ``pid``
+    equals its session's ``CLAUDE_PID``.
 
     Not every spawned process gets it — MCP servers do not — so this is a
     best-effort anchor that degrades to the directory answer, silently and
@@ -144,3 +144,45 @@ def session_agent_identity(
             " alone. See issue #31."
         )
     return agent.agent_id, agent.name, warning
+
+
+def session_pid() -> int:
+    """The pid a registry entry should record for the calling session.
+
+    ``pid`` means *the claude pid of the process whose liveness the entry
+    tracks* — settled by the owner on 2026-08-23 (issue #29), and already what
+    ``docs/protocol.md`` says for mirrored ``@peer`` entries, which record the
+    bridge's pid because the bridge's liveness is theirs.
+
+    ``$CLAUDE_PID`` is that value directly. ``os.getppid()`` is a fallback that
+    is right for a human at a terminal — whose parent shell *is* the process
+    whose liveness matters — and wrong for every caller inside a session, where
+    it is the Bash tool's ``zsh``, alive for the length of one command.
+
+    The SessionStart hook was the one in-session caller ``getppid()`` happened
+    to get right, for a reason nothing in the tree recorded. Hooks are declared
+    as ``"type": "command"``; a shell running a **single simple command**
+    ``exec``s it in place instead of forking, so the parent stays claude.
+    Measured on this host (``/bin/sh`` is bash)::
+
+        sh -c "cmd"              ppid = the caller     exec'd in place
+        sh -c "cmd || true"      ppid = a doomed shell FORKED
+        sh -c "cmd 2>/dev/null"  ppid = a doomed shell FORKED   (bash only)
+
+    The ``||`` result holds in sh, dash, bash and zsh. The redirection result is
+    **bash-specific** — dash and zsh still exec in place — so how fragile this
+    is depends on which shell runs hooks, which is not something we control or
+    have measured. That uncertainty is the argument, not against it: an
+    invariant that holds depending on the host's ``/bin/sh`` is not one to
+    build identity on. Adding ``|| true`` to ``hooks.json`` would break
+    registration for every agent on any shell, silently, with no test failing.
+    Reading ``$CLAUDE_PID`` removes the dependency rather than documenting it.
+    """
+    claude_pid = os.environ.get("CLAUDE_PID")
+    # `> 0` matters: pid 0 passes isdigit(), and `os.kill(0, 0)` signals the whole
+    # process group rather than probing a process — so an entry recorded with
+    # pid 0 reads live forever, which is the fail-open shape this rule exists to
+    # prevent. Reject it rather than record an unfalsifiable liveness claim.
+    if claude_pid and claude_pid.isdigit() and int(claude_pid) > 0:
+        return int(claude_pid)
+    return os.getppid()
