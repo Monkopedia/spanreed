@@ -52,10 +52,12 @@ def session_agent_identity(
     the one the SessionStart hook registered and told the agent to use.
 
     The anchor is ``$CLAUDE_PID``, which Claude Code sets for the Bash-tool
-    processes a session spawns. Every writer records that same value (see
-    :func:`session_pid`), so the registry holds a pid-to-identity mapping by
-    construction, and this consults it instead of re-deriving from a cwd that
-    has since moved. Verified against the fleet: every live entry's ``pid``
+    processes a session spawns. A session's own entry records that value (see
+    :func:`session_pid`), which is what makes this lookup work instead of
+    re-deriving from a cwd that has since moved. Not every writer records it —
+    ``_ensure_registered`` deliberately does not, and mirrored ``@peer`` entries
+    carry the bridge's — so this is a lookup that usually succeeds, not an
+    invariant the store guarantees. Verified against the fleet: every live entry's ``pid``
     equals its session's ``CLAUDE_PID``.
 
     Not every spawned process gets it — MCP servers do not — so this is a

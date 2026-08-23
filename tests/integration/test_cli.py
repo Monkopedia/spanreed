@@ -868,3 +868,78 @@ class TestRegisteringSomeoneElse:
         rc, out = _run(capsys, ["register", "--agent-id", "agent-someone-else", "--name", "other"])
         assert rc == 0
         assert json.loads(out)["pid"] == os.getppid()
+
+    def test_cannot_overwrite_a_LIVE_third_party_entry(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The second operand. Guarding only *our* pid left this open.
+
+        An unanchored session registering a healthy peer's id took that peer's
+        entry: the peer fell back to a cwd-derived id and the registrar resolved
+        as them on the anchor. Strictly worse than the doomed shell pid this
+        used to write, which made the victim go stale visibly rather than
+        handing their identity over.
+        """
+        peer_dir = cli_env.parent / "peer"
+        peer_dir.mkdir()
+        peer = derive_agent_identity(peer_dir)[0]
+        _run(capsys, ["register", "--agent-id", peer, "--name", "peer", "--pid", str(os.getpid())])
+        assert [a.agent_id for a in StateStore().list_agents()] == [peer]
+
+        # A different session, with no entry of its own, defaults the pid.
+        monkeypatch.setenv("CLAUDE_PID", "880404")
+        rc = cli.main(["register", "--agent-id", peer, "--name", "peer"])
+
+        assert rc == 1
+        assert "already registered and LIVE" in capsys.readouterr().err
+        assert StateStore().list_agents()[0].pid == os.getpid(), "peer's entry untouched"
+
+    def test_a_STALE_entry_may_be_taken_over(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The live-only qualifier, which is what keeps repair working: a dead
+        pid is #29's victim state, not a running agent to protect."""
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+        _, out = _run(capsys, ["register", "--pid", "999998"])
+        mine: str = json.loads(out)["agent_id"]
+
+        rc, out = _run(capsys, ["register", "--agent-id", mine])
+
+        assert rc == 0
+        assert json.loads(out)["pid"] == os.getpid()
+
+    def test_refuses_to_grow_an_ambiguous_registry(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Two entries already claim our pid. Falling through to `allowed` made
+        it three. `--pid` still bypasses, so the repair command is untouched."""
+        mypid = str(os.getpid())
+        monkeypatch.setenv("CLAUDE_PID", mypid)
+        for name in ("dup-a", "dup-b"):
+            d = cli_env.parent / name
+            d.mkdir()
+            _run(capsys, ["register", "--working-dir", str(d), "--pid", mypid])
+        assert len(StateStore().list_agents()) == 2
+
+        rc = cli.main(["register", "--agent-id", "agent-third"])
+
+        assert rc == 1
+        assert "ambiguous" in capsys.readouterr().err
+        assert len(StateStore().list_agents()) == 2, "not grown"
+
+    def test_explicit_pid_still_bypasses_every_guard(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The escape hatch has to survive all of them, or a real repair is
+        impossible from the one state that most needs one."""
+        mypid = str(os.getpid())
+        monkeypatch.setenv("CLAUDE_PID", mypid)
+        for name in ("amb-a", "amb-b"):
+            d = cli_env.parent / name
+            d.mkdir()
+            _run(capsys, ["register", "--working-dir", str(d), "--pid", mypid])
+
+        rc, out = _run(capsys, ["register", "--agent-id", "agent-third", "--pid", "880505"])
+
+        assert rc == 0
+        assert json.loads(out)["pid"] == 880505

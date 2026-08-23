@@ -57,20 +57,54 @@ def _cmd_inbox_path(args: argparse.Namespace) -> int:
     return 0
 
 
-def _entry_owning_this_session() -> Agent | None:
-    """The live registry entry whose ``pid`` is ``$CLAUDE_PID``, if exactly one.
+def _refuse_defaulted_pid(agent_id: str) -> str | None:
+    """Why defaulting ``pid`` for ``agent_id`` would be wrong, or ``None``.
 
-    "Ours" in the only sense the registry can express. ``None`` means no live
-    entry claims this session's pid — either nothing is registered yet, or the
-    entry that should be ours holds a wrong pid (#29) and needs repairing.
-    Returns ``None`` on ambiguity too: two entries claiming one pid is a state
-    to refuse to reason from, not to pick a winner in.
+    Two operands, and an earlier revision guarded only the first:
+
+    - **Ours** — the live entries holding ``$CLAUDE_PID``. If one exists under a
+      *different* id, defaulting would put our liveness on a second entry. If
+      *several* exist the registry is already ambiguous, and adding a third is
+      not a repair; refuse rather than grow it. (``--pid`` bypasses this
+      entirely, so the command that *fixes* ambiguity is untouched.)
+    - **Theirs** — the live entry already registered under ``agent_id``. If it
+      is alive under someone else's pid, defaulting overwrites a healthy third
+      party with ours: they fall back to a cwd-derived id and we resolve as
+      them. Reproduced against a healthy peer; strictly worse than the doomed
+      shell pid this used to write, which at least made the victim go stale
+      visibly instead of transferring their identity to us.
+
+    Live entries only, in both cases: an entry with a dead pid is #29's victim
+    state, and a session repairing its own must not be blocked by the corruption
+    it is repairing.
     """
+    live = StateStore().list_agents()
     claude_pid = os.environ.get("CLAUDE_PID")
-    if not claude_pid or not claude_pid.isdigit():
-        return None
-    owned = [a for a in StateStore().list_agents() if a.pid == int(claude_pid)]
-    return owned[0] if len(owned) == 1 else None
+    if claude_pid and claude_pid.isdigit() and int(claude_pid) > 0:
+        ours = [a for a in live if a.pid == int(claude_pid)]
+        if len(ours) > 1:
+            ids = ", ".join(a.agent_id for a in ours)
+            return (
+                f"{len(ours)} live entries already claim this session's pid ({ids}). "
+                f"The registry is ambiguous about who owns it, and defaulting would add "
+                f"another. Resolve it with an explicit --pid."
+            )
+        if ours and ours[0].agent_id != agent_id:
+            return (
+                f"this session's pid is already held by {ours[0].agent_id} "
+                f"({ours[0].name}), so defaulting would stamp our liveness onto a second "
+                f"entry that is not ours — which reads healthy forever instead of failing."
+            )
+
+    theirs = next((a for a in live if a.agent_id == agent_id), None)
+    if theirs is not None and theirs.pid != session_pid():
+        return (
+            f"{agent_id} ({theirs.name}) is already registered and LIVE under pid "
+            f"{theirs.pid}, which is not ours. Defaulting would overwrite a running "
+            f"agent's entry with our pid: they would lose their identity and we would "
+            f"resolve as them."
+        )
+    return None
 
 
 def _cmd_register(args: argparse.Namespace) -> int:
@@ -92,15 +126,12 @@ def _cmd_register(args: argparse.Namespace) -> int:
         # anchor means. Its absence is positive evidence that nothing live claims
         # our pid, which makes a first registration or a repair safe: afterwards
         # exactly one entry holds it.
-        mine = _entry_owning_this_session()
-        if mine is not None and mine.agent_id != agent_id:
+        reason = _refuse_defaulted_pid(agent_id)
+        if reason is not None:
             print(
-                f"spanreed: refusing to register {agent_id} without an explicit --pid. "
-                f"This session's pid is already held by {mine.agent_id} ({mine.name}), so "
-                f"defaulting would stamp our liveness onto an entry that is not ours — "
-                f"which reads healthy forever instead of failing. `pid` must be the claude "
-                f"pid of the process whose liveness the entry tracks; pass "
-                f"--pid <their CLAUDE_PID>.",
+                f"spanreed: refusing to register {agent_id} without an explicit --pid — "
+                f"{reason} `pid` must be the claude pid of the process whose liveness the "
+                f"entry tracks; pass --pid <that process's CLAUDE_PID>.",
                 file=sys.stderr,
             )
             return 1
