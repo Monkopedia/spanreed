@@ -23,7 +23,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from spanreed.identity import derive_agent_identity, session_agent_identity
+from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.protocol import Agent
 from spanreed.store import StateStore, default_state_root
 
@@ -62,7 +62,27 @@ def _cmd_register(args: argparse.Namespace) -> int:
     derived_id, derived_name = derive_agent_identity(wd)
     agent_id = args.agent_id or derived_id
     name = args.name or derived_name
-    pid = args.pid if args.pid is not None else os.getppid()
+
+    if args.pid is not None:
+        pid = args.pid
+    elif os.environ.get("CLAUDE_PID") and agent_id != session_agent_identity()[0]:
+        # Registering an entry that is not ours, from inside a session. There is
+        # no correct default: getppid() is a shell that dies with this command,
+        # and session_pid() is OUR claude process, which would stamp our liveness
+        # onto someone else's entry. The second is worse — it fails OPEN, reading
+        # healthy forever with is_stale() confirming it, because pid-alive and
+        # pid_start both hold of the wrong process. Refuse instead of guessing.
+        print(
+            f"spanreed: refusing to register {agent_id} from inside another session "
+            f"({session_agent_identity()[0]}) without an explicit --pid. `pid` must be "
+            f"the claude pid of the process whose liveness this entry tracks; neither "
+            f"this session's pid nor this shell's is that. Pass --pid <their CLAUDE_PID>.",
+            file=sys.stderr,
+        )
+        return 1
+    else:
+        pid = session_pid()
+
     agent = StateStore().register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
     json.dump(agent.model_dump(mode="json"), sys.stdout, indent=2)
     print()
@@ -232,7 +252,7 @@ def _ensure_registered(store: StateStore, agent_id: str) -> None:
     """
     _, name = derive_agent_identity()
     store.register_agent(
-        name=name, working_dir=str(Path.cwd()), pid=os.getppid(), agent_id=agent_id
+        name=name, working_dir=str(Path.cwd()), pid=session_pid(), agent_id=agent_id
     )
 
 
@@ -383,7 +403,11 @@ def _cmd_session_start(_args: argparse.Namespace) -> int:
     """Register this session and emit the SessionStart hook output to stdout."""
     agent_id, name = derive_agent_identity()
     wd = Path.cwd()
-    pid = os.getppid()
+    # Not os.getppid(): that is only the claude process because `sh -c` execs a
+    # single simple command in place. Adding `2>/dev/null` or `|| true` to
+    # hooks.json would fork, and every session would register a doomed pid with
+    # nothing failing. See session_pid().
+    pid = session_pid()
     store = StateStore()
     agent = store.register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
     # Write the disposition policy to a stable path so the inbox Monitor's

@@ -144,3 +144,37 @@ def session_agent_identity(
             " alone. See issue #31."
         )
     return agent.agent_id, agent.name, warning
+
+
+def session_pid() -> int:
+    """The pid a registry entry should record for the calling session.
+
+    ``pid`` means *the claude pid of the process whose liveness the entry
+    tracks* — settled by the owner on 2026-08-23 (issue #29), and already what
+    ``docs/protocol.md`` says for mirrored ``@peer`` entries, which record the
+    bridge's pid because the bridge's liveness is theirs.
+
+    ``$CLAUDE_PID`` is that value directly. ``os.getppid()`` is a fallback that
+    is right for a human at a terminal — whose parent shell *is* the process
+    whose liveness matters — and wrong for every caller inside a session, where
+    it is the Bash tool's ``zsh``, alive for the length of one command.
+
+    The SessionStart hook is the one in-session caller ``getppid()` happened to
+    get right, and for a reason nothing in the tree recorded: hooks are declared
+    as ``"type": "command"`` and *are* run through a shell, but ``sh -c`` with a
+    single simple command ``exec``s it in place instead of forking, so the
+    parent stays claude. Measured::
+
+        sh -c "cmd"              ppid = the caller     exec'd in place
+        sh -c "cmd 2>/dev/null"  ppid = a doomed shell FORKED
+        sh -c "cmd || true"      ppid = a doomed shell FORKED
+
+    Adding a redirection or an ``||`` to ``hooks.json`` — the two most natural
+    edits anyone would ever make to a hook — would therefore have broken
+    registration for every agent, silently, with no test failing. Reading
+    ``$CLAUDE_PID`` first removes that dependency rather than documenting it.
+    """
+    claude_pid = os.environ.get("CLAUDE_PID")
+    if claude_pid and claude_pid.isdigit():
+        return int(claude_pid)
+    return os.getppid()

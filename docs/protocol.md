@@ -160,14 +160,14 @@ Re-deriving from the cwd is only correct while the session stands where it start
 So identity is resolved against the session, in this order:
 
 1. `SPANREED_AGENT_NAME`, if set — an explicit override outranks everything.
-2. The registry entry whose `pid` is `$CLAUDE_PID`, if exactly one **live** entry matches. Claude Code sets `CLAUDE_PID` for the Bash-tool processes a session spawns, and the SessionStart hook registers under that same pid — not by reading the variable, but because Claude Code invokes hooks directly, so the hook's `os.getppid()` *is* the claude process. So the registry is already a pid → identity map.
+2. The registry entry whose `pid` is `$CLAUDE_PID`, if exactly one **live** entry matches. Every writer records that same value (see "What `pid` means" below), so the registry is a pid → identity map by construction.
 3. Otherwise, the cwd derivation above. This is the path for a human running `spanreed` at a terminal, who has no session to belong to; it is also what a session gets before its hook has run.
 
 **Stale entries are excluded from (2), and that exclusion is load-bearing.** `$CLAUDE_PID` is the caller's own ancestor, so it is alive by construction — which means the only staleness a *matching* entry can carry is a `pid_start` mismatch, i.e. precisely pid reuse. Admitting stale entries therefore buys nothing and costs everything: an abandoned agent whose pid the OS later recycled onto a live session would be adopted as that session's identity, and the drift warning below would assert it was correct. A session mid-restart is not a counter-example — its entry still holds the *old*, dead pid, so it cannot match the new one either way.
 
 **Residual, and this spec should not soften it.** Where `pid_start` could not be read at registration (macOS has no `/proc`), `is_stale` falls back to a bare PID-alive check and accepts a small reuse risk — see its docstring. The *probability* of reuse is unchanged by anything here. The *consequence* is not: before identity was resolved this way, no code path turned a missing `pid_start` into a wrong `agent_id`. This resolver creates that path, and on macOS it creates it with the guard inert. That is introduced, not merely inherited. Tracked as issue #31; where the guard could not run, the drift warning says so.
 
-Ambiguity is refused, not guessed: if two entries claim the pid, (2) is skipped. Note that `register` and the auto-register fallback record `os.getppid()` — under a Claude session's Bash tool that is the *shell*, not the session — so `pid` is not yet a single well-defined thing across all writers.
+Ambiguity is refused, not guessed: if two entries claim the pid, (2) is skipped.
 
 When (2) fires and disagrees with (3), the command **prints the disagreement to stderr** and proceeds under the registered identity. Correcting silently would leave the agent still believing what `pwd` told it.
 
@@ -178,6 +178,22 @@ This is a change in kind, worth stating plainly: minting still needs no shared s
 `CLAUDE_PID` is an undocumented Claude Code environment variable and not every spawned process receives it (MCP servers do not). Where it is absent, resolution degrades to the cwd answer — silently, and indistinguishably from a human at a terminal. The surfaces that need the anchor (the CLI, the Monitor) do have it today; if that ever stops being true, the drift returns with no signal.
 
 **Renaming after the fact**: the cwd-derived name is often unhelpful (e.g. "git" when cwd is `~/git`). Agents can call `set_name` (MCP) or `spanreed name "..."` (CLI) at any time to set a more descriptive display name. The `agent_id` doesn't change, so message routing keeps working. Renames persist across session restarts thanks to the upsert-preserve behavior in `register_agent`.
+
+### What `pid` means
+
+`pid` is **the claude pid of the process whose liveness the entry tracks.** One rule, every writer. Settled by the owner on 2026-08-23 (issue #29), which also declined a `session_pid`/`pid` split and a separate remote marker as unnecessary once the field has a single meaning.
+
+| entry | records | because |
+|---|---|---|
+| a local session | its own `$CLAUDE_PID` | its liveness *is* the session's |
+| a mirrored `@peer` | the **bridge's** pid | the remote pid is meaningless locally; the bridge's liveness is that entry's liveness (see "Mirrored registry entries") |
+| a human at a terminal | `os.getppid()`, their shell | there is no session; the parent shell is the process whose liveness matters |
+
+So writers read `$CLAUDE_PID` and fall back to `getppid()` only when it is unset. **`getppid()` is never a substitute for it inside a session** — under a Bash tool the parent is an ephemeral `zsh`, alive for the length of one command, and an entry written that way is not a correct value that decays but *the wrong value at the moment of writing*. Its symptom is that the agent silently disappears from `list_agents` while running normally, and that identity resolution above falls back to the cwd with no warning, because a wrong pid is indistinguishable from an unregistered session.
+
+This applies to the SessionStart hook too, which is where it is least obvious. `hooks.json` declares `"type": "command"`, so the hook *is* run through a shell; `getppid()` nonetheless returned the claude process, because `sh -c` `exec`s a **single simple command** in place rather than forking. Adding a redirection or an `||` to that command line — `spanreed session-start 2>/dev/null`, `... || true`, the two most natural edits anyone would make to a hook — makes `sh` fork, and every session from that moment registers a pid that dies with the hook, silently and with nothing failing. Reading `$CLAUDE_PID` removes that dependency; **do not reintroduce `getppid()` here on the grounds that it "works".**
+
+**Registering an entry that is not your own requires an explicit `--pid`, and is refused without one.** From inside a session there is no correct default: `getppid()` is a shell that dies with the command, and `$CLAUDE_PID` is the *registrar's* process, which would stamp the registrar's liveness onto someone else's entry. The second is the worse failure — it fails **open**, reading healthy indefinitely, with `is_stale` actively confirming it because pid-alive and `pid_start` both hold of the wrong process. A dead shell pid at least announces itself by vanishing. Refuse rather than guess, per the same rule the bridge applies to an invalid host label.
 
 **`register_agent` upsert semantics**: when called with an already-registered `agent_id`, only `pid`, `pid_start`, and `last_seen` are updated; `name`, `working_dir`, and `focus` are preserved. This is what makes in-session customizations (set_name, set_focus) sticky across the SessionStart hook firing on every restart.
 

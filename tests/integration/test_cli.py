@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from spanreed import cli
+from spanreed.identity import derive_agent_identity
 from spanreed.store import StateStore
 
 
@@ -720,3 +721,92 @@ class TestIdentityFollowsTheSession:
         assert captured.out.strip() == drifted
         assert "registered as" in captured.err
         assert drifted in captured.err
+
+
+# ------------------------------------------------- `pid` is the claude pid (#29)
+
+
+class TestRegisterRecordsTheClaudePid:
+    """Owner ruling 2026-08-23: `pid` is the claude pid of the process whose
+    liveness the entry tracks. Under a Bash tool `os.getppid()` is an ephemeral
+    zsh, so every in-session write recorded a doomed pid — which hid the agent
+    from `list_agents` and made #28's resolver silently fall back to the cwd."""
+
+    def test_session_start_records_the_session_not_the_hooks_shell(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_PID", "770001")
+        _run(capsys, ["session-start"])
+        entry = StateStore().list_agents(include_stale=True)[0]
+        assert entry.pid == 770001
+
+    def test_register_records_the_session(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_PID", "770002")
+        _, out = _run(capsys, ["register"])
+        assert json.loads(out)["pid"] == 770002
+
+    def test_auto_register_records_the_session(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`focus` before any registration goes through `_ensure_registered`."""
+        monkeypatch.setenv("CLAUDE_PID", "770003")
+        _run(capsys, ["focus", "hello"])
+        entry = StateStore().list_agents(include_stale=True)[0]
+        assert entry.pid == 770003
+
+    def test_a_human_at_a_terminal_still_gets_their_shell(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No CLAUDE_PID means no session: the parent shell IS the process whose
+        liveness matters, so `getppid()` is the right answer, not a fallback we
+        tolerate. This is the path the three auto-register tests exercise."""
+        _, out = _run(capsys, ["register"])
+        assert json.loads(out)["pid"] == os.getppid()
+
+
+class TestRegisteringSomeoneElse:
+    """The refusal branch. A live session writing a third party's entry with its
+    own `$CLAUDE_PID` would fail OPEN — `is_stale` confirms it forever, because
+    pid-alive and `pid_start` both hold of the registrar's real process."""
+
+    def test_refuses_a_foreign_id_without_an_explicit_pid(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+        rc = cli.main(["register", "--agent-id", "agent-someone-else", "--name", "other"])
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "refusing to register" in captured.err
+        assert StateStore().list_agents(include_stale=True) == [], "nothing was written"
+
+    def test_allows_a_foreign_id_with_an_explicit_pid(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`--pid` is the documented escape hatch — how a repair is done."""
+        monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
+        rc, out = _run(
+            capsys,
+            ["register", "--agent-id", "agent-someone-else", "--name", "other", "--pid", "770004"],
+        )
+        assert rc == 0
+        assert json.loads(out)["pid"] == 770004
+
+    def test_registering_your_own_id_explicitly_is_not_refused(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_PID", "770005")
+        mine = derive_agent_identity(cli_env)[0]
+        rc, out = _run(capsys, ["register", "--agent-id", mine])
+        assert rc == 0
+        assert json.loads(out)["pid"] == 770005
+
+    def test_a_human_registering_a_foreign_id_is_not_refused(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No session, so nothing to mis-stamp — the refusal must not leak into
+        the manual path it was never about."""
+        rc, out = _run(capsys, ["register", "--agent-id", "agent-someone-else", "--name", "other"])
+        assert rc == 0
+        assert json.loads(out)["pid"] == os.getppid()
