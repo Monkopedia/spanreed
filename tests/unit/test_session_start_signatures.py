@@ -12,6 +12,14 @@ bus.
 substring checks. This module is that tie. It derives the truth from
 ``mcp_app.list_tools()`` rather than restating it, so the next signature change
 fails here instead of on a user's machine.
+
+**Parameter ORDER is deliberately not asserted.** Signatures are parsed into
+sets, so reordering a documented signature passes. MCP is keyword-addressed, so
+order cannot affect whether a call is valid — asserting it would bind this
+suite to Python declaration order and turn a no-op refactor red for a reason
+unrelated to what these tests protect. Written down because a deliberate
+non-assertion that is not recorded is indistinguishable from a missing one, and
+the next reader will otherwise "fix" it.
 """
 
 from __future__ import annotations
@@ -107,14 +115,21 @@ async def test_the_disposition_policy_names_real_parameters() -> None:
     text an agent actually reads was never scanned.
     """
     _, optional = (await _actual())["recv_messages"]
-    cursors = {p for p in optional if "since" in p}
-    assert cursors, "recv_messages no longer has a since-style cursor; update this test"
-    for name in cursors:
-        assert name in _DISPOSITION_POLICY or "cursor" not in _DISPOSITION_POLICY, (
-            f"the disposition policy references a cursor but not by its real name "
-            f"({sorted(cursors)}); an agent following it passes a parameter that "
-            f"does not exist"
-        )
+    real = {p for p in optional if p.startswith("since")}
+    assert real, "recv_messages no longer has a since-style cursor; update this test"
+
+    # Every `since`-ish token the policy names must BE a real parameter. Keyed on
+    # what the text says, not on whether it also says "cursor" — an earlier form
+    # excused itself when the word "cursor" was absent, so rewording the prose
+    # while keeping the wrong parameter left the suite green with the bug back.
+    # Verified: `since` marker -> red here, `since_msg_id` marker -> green.
+    named = set(re.findall(r"since\w*", _DISPOSITION_POLICY))
+    bogus = named - real
+    assert not bogus, (
+        f"the disposition policy names {sorted(bogus)}, which is not a parameter of "
+        f"recv_messages (real: {sorted(real)}). An agent following it passes something "
+        f"that does not exist."
+    )
 
 
 async def test_every_documented_signature_matches_the_server() -> None:
