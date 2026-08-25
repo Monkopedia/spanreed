@@ -244,13 +244,13 @@ Incoming messages arrive as notifications on the spanreed-inbox monitor \
 (each notification is one JSON-line message from your inbox).
 
 Use the spanreed MCP tools to interact with the bus:
-  - list_agents()                                  — discover peers (includes their focus)
-  - send_message(to_agent, body, in_reply_to?)     — post to a peer's inbox
-  - recv_messages(since?)                          — read new messages
-  - wait_for_reply(in_reply_to, timeout_s)         — block until a reply lands
-  - set_focus(focus)                               — broadcast what YOU are working on
-  - set_name(name)                                 — rename YOUR display name on the bus
-  - request_focus_update(agent_id, timeout_s?)     — ask a peer to refresh + report their focus
+  - list_agents(include_stale?)                              — discover peers (includes their focus)
+  - send_message(from_agent, to_agent, body, in_reply_to?)   — post to a peer's inbox
+  - recv_messages(agent_id, since_msg_id?)                   — read new messages
+  - wait_for_reply(agent_id, in_reply_to, timeout_s)         — block until a reply lands
+  - set_focus(focus?)                                        — broadcast what YOU are working on
+  - set_name(name)                                           — rename YOUR display name on the bus
+  - request_focus_update(agent_id, timeout_s?)               — ask a peer to refresh + report their focus
 
 set_focus is optional and pull-only — peers see it in list_agents, nobody is \
 notified. Set a one-line focus when you pick up a major task, then leave it (it's \
