@@ -118,12 +118,18 @@ async def test_the_disposition_policy_names_real_parameters() -> None:
     real = {p for p in optional if p.startswith("since")}
     assert real, "recv_messages no longer has a since-style cursor; update this test"
 
-    # Every `since`-ish token the policy names must BE a real parameter. Keyed on
-    # what the text says, not on whether it also says "cursor" — an earlier form
-    # excused itself when the word "cursor" was absent, so rewording the prose
-    # while keeping the wrong parameter left the suite green with the bug back.
-    # Verified: `since` marker -> red here, `since_msg_id` marker -> green.
-    named = set(re.findall(r"since\w*", _DISPOSITION_POLICY))
+    # Every `since`-ish token the policy presents AS A PARAMETER must be a real
+    # one. Two things this has to get right, and earlier forms each missed one:
+    #
+    #   - keyed on the token, not on whether the prose also says "cursor". That
+    #     form excused itself when the word was absent, so rewording while
+    #     keeping the wrong parameter left the suite green with the bug back.
+    #   - anchored on the backticks the policy already uses for every parameter,
+    #     so ordinary English does not trip it. Matching the bare word made
+    #     "...the ones that arrived since your last read" a FAILURE, which is
+    #     worse than it sounds: a guard that fires on a correct edit teaches the
+    #     next person to loosen it, and the loosened form is the bug above.
+    named = set(re.findall(r"`(since\w*)`", _DISPOSITION_POLICY))
     bogus = named - real
     assert not bogus, (
         f"the disposition policy names {sorted(bogus)}, which is not a parameter of "
