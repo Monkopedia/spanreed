@@ -183,11 +183,30 @@ async def test_the_published_description_does_not_contradict_that() -> None:
     tool = next(t for t in await mcp_app.list_tools() if t.name == "wait_for_reply")
     description = (tool.description or "").lower()
 
-    assert "ignored" not in description, (
-        "the published description says pre-existing matches are ignored; they are "
-        "returned (see the test above). This text is loaded into every agent's context."
-    )
-    assert "all" in description, "the description should state that all inbox messages count"
+    # Phrases, not words. `assert "all" in description` was the first version of
+    # the positive half and it could never fail: "call", "caller" and "stalling"
+    # all satisfy it, and the last is in this very docstring. A guard that cannot
+    # fail is worse than none — it reports coverage it does not have.
+    for lie in ("are ignored", "arrive *after*", "only considers messages that arrive"):
+        assert lie not in description, (
+            f"the published description contains {lie!r}, which is the #14 claim: "
+            f"pre-existing matches are RETURNED (see the test above). This text is "
+            f"loaded into every agent's context."
+        )
+    # There is deliberately NO positive assertion, and this is the third form of
+    # this guard rather than the first. `"all" in description` could not fail.
+    # `"pre-existing" in description` could, but on the WRONG input: it reddened a
+    # truthful rewrite ("Every message in the inbox counts, including one already
+    # present"), which is the failure that teaches the next person to loosen the
+    # guard — and the loosened form is the one that cannot fail.
+    #
+    # Requiring prose to contain a phrase always false-reds on a legitimate
+    # rewording, because there are many true ways to say a thing and one list of
+    # them is not it. So this guard only ever asserts the ABSENCE of specific
+    # known-false claims. That is a real limit, not an oversight: a lie phrased a
+    # new way passes. The behaviour test above is what actually pins the
+    # semantics; this catches the description going stale after a change, which
+    # is the failure that reliably leaves the old words in place.
 
 
 # ----------------------------------------------------------------- focus
