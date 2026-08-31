@@ -18,6 +18,7 @@ import pytest
 from spanreed.mcp_server import (
     deregister_agent,
     list_agents,
+    mcp_app,
     recv_messages,
     register_agent,
     request_focus_update,
@@ -144,6 +145,49 @@ async def test_wait_for_reply_times_out(ab: None) -> None:
     m1 = send_message(from_agent="A", to_agent="B", body="ping")
     reply = await wait_for_reply(agent_id="A", in_reply_to=str(m1["msg_id"]), timeout_s=0.2)
     assert reply is None
+
+
+async def test_wait_for_reply_returns_a_reply_that_already_landed(ab: None) -> None:
+    """#14. The semantics an agent most needs, and the ones its docs got backwards.
+
+    A reply arriving between the caller's ``send_message`` and its
+    ``wait_for_reply`` is the COMMON case against a fast peer, not an edge one.
+    Returning it is deliberate; skipping it silently lost those replies.
+
+    Pinned here rather than only in ``store.py``'s tests because the claim that
+    was wrong lived on the MCP tool — the layer agents actually read.
+    """
+    m1 = send_message(from_agent="A", to_agent="B", body="ping")
+    send_message(from_agent="B", to_agent="A", body="pong", in_reply_to=str(m1["msg_id"]))
+
+    # No task group, no sleep: the reply is already sitting in the inbox.
+    reply = await wait_for_reply(agent_id="A", in_reply_to=str(m1["msg_id"]), timeout_s=0.2)
+
+    assert reply is not None, (
+        "a reply that landed before the call was dropped — this is the footgun "
+        "the current behaviour exists to prevent"
+    )
+    assert reply["body"] == "pong"
+
+
+async def test_the_published_description_does_not_contradict_that() -> None:
+    """The description is what agents read; the true version lived in store.py.
+
+    Deliberately a heuristic, and worth saying so: this greps published prose
+    for the specific false claim (#14 said pre-existing matches "are ignored"),
+    so a reworded lie would pass. It is here because the failure being guarded
+    is *staleness after a behaviour change*, which reliably leaves the old
+    words in place — not adversarial rewording. The assertion above is the
+    durable one; this catches the description drifting away from it.
+    """
+    tool = next(t for t in await mcp_app.list_tools() if t.name == "wait_for_reply")
+    description = (tool.description or "").lower()
+
+    assert "ignored" not in description, (
+        "the published description says pre-existing matches are ignored; they are "
+        "returned (see the test above). This text is loaded into every agent's context."
+    )
+    assert "all" in description, "the description should state that all inbox messages count"
 
 
 # ----------------------------------------------------------------- focus

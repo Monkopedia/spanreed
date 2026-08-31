@@ -136,8 +136,16 @@ async def wait_for_reply(
 ) -> dict[str, object] | None:
     """Block until a message replying to ``in_reply_to`` lands, or timeout.
 
-    Returns the reply, or ``None`` on timeout. Only considers messages that
-    arrive *after* this call starts; pre-existing matching messages are ignored.
+    Returns the reply, or ``None`` on timeout. Considers **all** messages in the
+    inbox, not only ones arriving after this call: a matching reply that is
+    already there is returned immediately. That is deliberate — skipping
+    pre-existing matches silently lost any reply that landed between the
+    caller's ``send_message`` and this call, which is the common case for a fast
+    peer.
+
+    So there is no race to defend against here: it is safe to call this straight
+    after ``send_message`` without a ``recv_messages`` first.
+
     Runs the blocking poll on a worker thread to avoid stalling the event loop.
     """
     store = StateStore()
