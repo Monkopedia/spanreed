@@ -18,6 +18,7 @@ import pytest
 from spanreed.mcp_server import (
     deregister_agent,
     list_agents,
+    mcp_app,
     recv_messages,
     register_agent,
     request_focus_update,
@@ -144,6 +145,90 @@ async def test_wait_for_reply_times_out(ab: None) -> None:
     m1 = send_message(from_agent="A", to_agent="B", body="ping")
     reply = await wait_for_reply(agent_id="A", in_reply_to=str(m1["msg_id"]), timeout_s=0.2)
     assert reply is None
+
+
+async def test_wait_for_reply_returns_a_reply_that_already_landed(ab: None) -> None:
+    r"""#14. The semantics an agent most needs, and the ones its docs got backwards.
+
+    A reply arriving between the caller's ``send_message`` and its
+    ``wait_for_reply`` is the COMMON case against a fast peer, not an edge one.
+    Returning it is deliberate; skipping it silently lost those replies.
+
+    Pinned at the MCP layer as well as in ``store.py``'s tests, and the reason
+    is NOT that this defends against the docs drifting — an earlier version of
+    this docstring said that and it is false. #14's behaviour was correct all
+    along and both layers were green throughout; only the *description* was
+    wrong, and the description guard below is what defends that.
+
+    What this earns instead, verified by mutation rather than assumed: the
+    wrapper forwards three **positional** arguments through
+    ``to_thread.run_sync`` and reshapes the result. Swap ``agent_id`` and
+    ``in_reply_to``, or return the raw ``Message`` instead of
+    ``model_dump``\ ing it, and every test in ``test_store.py`` stays green
+    while this one fails. It pins a contract the store suite structurally
+    cannot see.
+    """
+    m1 = send_message(from_agent="A", to_agent="B", body="ping")
+    send_message(from_agent="B", to_agent="A", body="pong", in_reply_to=str(m1["msg_id"]))
+
+    # No task group, no sleep: the reply is already sitting in the inbox.
+    reply = await wait_for_reply(agent_id="A", in_reply_to=str(m1["msg_id"]), timeout_s=0.2)
+
+    assert reply is not None, (
+        "a reply that landed before the call was dropped — this is the footgun "
+        "the current behaviour exists to prevent"
+    )
+    assert reply["body"] == "pong"
+
+
+async def test_the_published_description_does_not_contradict_that() -> None:
+    """The description is what agents read; the true version lived in store.py.
+
+    Deliberately a heuristic, and worth saying so: this greps published prose
+    for the specific false claim (#14 said pre-existing matches "are ignored"),
+    so a reworded lie would pass. It is here because the failure being guarded
+    is *staleness after a behaviour change*, which reliably leaves the old
+    words in place — not adversarial rewording. The assertion above is the
+    durable one; this catches the description drifting away from it.
+    """
+    tool = next(t for t in await mcp_app.list_tools() if t.name == "wait_for_reply")
+    description = (tool.description or "").lower()
+
+    # Phrases, not words. `assert "all" in description` was the first version of
+    # the positive half and it could never fail: "call", "caller" and "stalling"
+    # all satisfy it, and the last is in this very docstring. A guard that cannot
+    # fail is worse than none — it reports coverage it does not have.
+    # Each phrase must be long enough that only the FALSE claim can contain it.
+    # "are ignored" was the first list's entry and it is too generic: a fully
+    # truthful sentence — "messages whose ``in_reply_to`` does not match are
+    # ignored" — tripped it. That is the false-red direction again, on the guard
+    # whose commit message called false-reds the dangerous kind. Third time this
+    # assertion has been wrong; the lesson is that a fragment short enough to
+    # match a lie robustly is also short enough to match a truth.
+    for lie in (
+        "pre-existing matching messages are ignored",
+        "only considers messages that arrive",
+        "arrive *after* this call",
+    ):
+        assert lie not in description, (
+            f"the published description contains {lie!r}, which is the #14 claim: "
+            f"pre-existing matches are RETURNED (see the test above). This text is "
+            f"loaded into every agent's context."
+        )
+    # There is deliberately NO positive assertion, and this is the third form of
+    # this guard rather than the first. `"all" in description` could not fail.
+    # `"pre-existing" in description` could, but on the WRONG input: it reddened a
+    # truthful rewrite ("Every message in the inbox counts, including one already
+    # present"), which is the failure that teaches the next person to loosen the
+    # guard — and the loosened form is the one that cannot fail.
+    #
+    # Requiring prose to contain a phrase always false-reds on a legitimate
+    # rewording, because there are many true ways to say a thing and one list of
+    # them is not it. So this guard only ever asserts the ABSENCE of specific
+    # known-false claims. That is a real limit, not an oversight: a lie phrased a
+    # new way passes. The behaviour test above is what actually pins the
+    # semantics; this catches the description going stale after a change, which
+    # is the failure that reliably leaves the old words in place.
 
 
 # ----------------------------------------------------------------- focus
