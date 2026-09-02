@@ -104,6 +104,17 @@ class TestFallsBackWhereItShould:
 
         assert session_agent_identity(wd) == (*derive_agent_identity(wd), None)
 
+    # No "0" here, deliberately, and the reason is a defect rather than a
+    # tidy-up. `session_agent_identity` guards with `.isdigit()` alone
+    # (identity.py:89) and has no `> 0` check, so "0" would NOT exercise
+    # validation — it passes the digit test, reaches the registry lookup, finds
+    # nothing, and exits through the already-covered no-match branch. It would
+    # read as guard coverage and be none.
+    #
+    # A case that DID discriminate cannot be written, because the behaviour it
+    # would assert is wrong: a pid-0 entry has pid_start=None, so is_stale() is
+    # False forever, and this function adopts it. Tracked as #50; the guard in
+    # session_pid() is one layer of two.
     @pytest.mark.parametrize("junk", ["", "not-a-pid", "12x", "-1"])
     def test_unusable_claude_pid_uses_the_directory(
         self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, junk: str
@@ -394,7 +405,15 @@ class TestSessionPid:
         monkeypatch.delenv("CLAUDE_PID", raising=False)
         assert session_pid() == os.getppid()
 
-    @pytest.mark.parametrize("junk", ["", "not-a-pid", "12x", "-1", " 5"])
+    # "0" is listed FIRST because it is the only value the `> 0` guard exists
+    # for, and it was the one value this list omitted. Everything else here is
+    # rejected by `.isdigit()` alone, so before this case was added, deleting
+    # the guard left the whole suite green. `session_pid`'s own comment explains
+    # why 0 is the dangerous one — `os.kill(0, 0)` signals the process group
+    # rather than probing a process, so an entry recorded with pid 0 reads live
+    # forever — and nothing tested it. A guard whose rationale is written down
+    # and whose rationale is untested is the shape this repo keeps finding.
+    @pytest.mark.parametrize("junk", ["0", "", "not-a-pid", "12x", "-1", " 5"])
     def test_unusable_claude_pid_falls_back(
         self, monkeypatch: pytest.MonkeyPatch, junk: str
     ) -> None:
