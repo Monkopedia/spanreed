@@ -113,8 +113,8 @@ class TestFallsBackWhereItShould:
     #
     # A case that DID discriminate cannot be written, because the behaviour it
     # would assert is wrong: a pid-0 entry has pid_start=None, so is_stale() is
-    # False forever, and this function adopts it. Tracked separately; the guard
-    # in session_pid() is one layer of two.
+    # False forever, and this function adopts it. Tracked as #50; the guard in
+    # session_pid() is one layer of two.
     @pytest.mark.parametrize("junk", ["", "not-a-pid", "12x", "-1"])
     def test_unusable_claude_pid_uses_the_directory(
         self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, junk: str
@@ -407,12 +407,12 @@ class TestSessionPid:
 
     # "0" is listed FIRST because it is the only value the `> 0` guard exists
     # for, and it was the one value this list omitted. Everything else here is
-    # rejected by `.isdigit()` alone; deleting the guard left the whole suite
-    # green. `session_pid`'s own comment explains why 0 is the dangerous one —
-    # `os.kill(0, 0)` signals the process group rather than probing a process,
-    # so an entry recorded with pid 0 reads live forever — and then nothing
-    # tested it. A guard whose rationale is written down and whose rationale is
-    # untested is the shape this repo keeps finding.
+    # rejected by `.isdigit()` alone, so before this case was added, deleting
+    # the guard left the whole suite green. `session_pid`'s own comment explains
+    # why 0 is the dangerous one — `os.kill(0, 0)` signals the process group
+    # rather than probing a process, so an entry recorded with pid 0 reads live
+    # forever — and nothing tested it. A guard whose rationale is written down
+    # and whose rationale is untested is the shape this repo keeps finding.
     @pytest.mark.parametrize("junk", ["0", "", "not-a-pid", "12x", "-1", " 5"])
     def test_unusable_claude_pid_falls_back(
         self, monkeypatch: pytest.MonkeyPatch, junk: str
