@@ -104,7 +104,7 @@ class TestFallsBackWhereItShould:
 
         assert session_agent_identity(wd) == (*derive_agent_identity(wd), None)
 
-    @pytest.mark.parametrize("junk", ["", "not-a-pid", "12x", "-1"])
+    @pytest.mark.parametrize("junk", ["0", "", "not-a-pid", "12x", "-1"])
     def test_unusable_claude_pid_uses_the_directory(
         self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, junk: str
     ) -> None:
@@ -394,7 +394,15 @@ class TestSessionPid:
         monkeypatch.delenv("CLAUDE_PID", raising=False)
         assert session_pid() == os.getppid()
 
-    @pytest.mark.parametrize("junk", ["", "not-a-pid", "12x", "-1", " 5"])
+    # "0" is listed FIRST because it is the only value the `> 0` guard exists
+    # for, and it was the one value this list omitted. Everything else here is
+    # rejected by `.isdigit()` alone; deleting the guard left the whole suite
+    # green. `session_pid`'s own comment explains why 0 is the dangerous one —
+    # `os.kill(0, 0)` signals the process group rather than probing a process,
+    # so an entry recorded with pid 0 reads live forever — and then nothing
+    # tested it. A guard whose rationale is written down and whose rationale is
+    # untested is the shape this repo keeps finding.
+    @pytest.mark.parametrize("junk", ["0", "", "not-a-pid", "12x", "-1", " 5"])
     def test_unusable_claude_pid_falls_back(
         self, monkeypatch: pytest.MonkeyPatch, junk: str
     ) -> None:
