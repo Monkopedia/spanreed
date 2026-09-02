@@ -148,14 +148,25 @@ async def test_wait_for_reply_times_out(ab: None) -> None:
 
 
 async def test_wait_for_reply_returns_a_reply_that_already_landed(ab: None) -> None:
-    """#14. The semantics an agent most needs, and the ones its docs got backwards.
+    r"""#14. The semantics an agent most needs, and the ones its docs got backwards.
 
     A reply arriving between the caller's ``send_message`` and its
     ``wait_for_reply`` is the COMMON case against a fast peer, not an edge one.
     Returning it is deliberate; skipping it silently lost those replies.
 
-    Pinned here rather than only in ``store.py``'s tests because the claim that
-    was wrong lived on the MCP tool — the layer agents actually read.
+    Pinned at the MCP layer as well as in ``store.py``'s tests, and the reason
+    is NOT that this defends against the docs drifting — an earlier version of
+    this docstring said that and it is false. #14's behaviour was correct all
+    along and both layers were green throughout; only the *description* was
+    wrong, and the description guard below is what defends that.
+
+    What this earns instead, verified by mutation rather than assumed: the
+    wrapper forwards three **positional** arguments through
+    ``to_thread.run_sync`` and reshapes the result. Swap ``agent_id`` and
+    ``in_reply_to``, or return the raw ``Message`` instead of
+    ``model_dump``\ ing it, and every test in ``test_store.py`` stays green
+    while this one fails. It pins a contract the store suite structurally
+    cannot see.
     """
     m1 = send_message(from_agent="A", to_agent="B", body="ping")
     send_message(from_agent="B", to_agent="A", body="pong", in_reply_to=str(m1["msg_id"]))
