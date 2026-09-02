@@ -15,6 +15,10 @@ Things still to test, design, or decide.
 ## Design
 
 - **MCP tool surface**: final shape of `register`, `send`, `recv`. Acknowledgments? Read receipts? Conversation threading?
+- **Single-sourcing published tool descriptions**: `MCPServer.tool()` accepts `description=`, so a tool's docstring and its *published* description could be one string instead of two. Raised by the review of #42 and deferred rather than decided.
+  - **What it fixes.** Not "the two copies disagreeing" — that framing is wrong, and getting it wrong is how #14 stayed live. #14's harm was **asymmetric visibility**: the false copy was the published one (in every agent's context) and the true copy was in `store.py`, which no agent reads. Single-sourcing puts the human editing the docstring in front of the exact bytes the agent receives, so the reader best placed to catch an error finally looks at the published artifact.
+  - **What it does not fix.** It unifies the two *Python* copies only. `docs/protocol.md` remains a third, so it would have addressed two of #14's three locations. A single wrong string is still wrong — it removes the asymmetry, not the falsehood — so it never substitutes for a description guard. The code/spec edge it leaves open is exactly where #44 sits.
+  - **Suggested scope if taken**: the few tools carrying load-bearing semantics (`wait_for_reply`, `register_agent`), not file-wide. Related: #14, #42, #44.
 - **State format**: JSONL append-only? SQLite? File-per-message?
 - **Agent identity**: what makes two sessions "the same agent" vs. distinct? Working directory? Manual name? PID?
 - **Conversation continuity**: can a message reference a thread, and Claude pick up context from prior messages in it?
