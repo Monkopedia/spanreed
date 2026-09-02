@@ -104,7 +104,18 @@ class TestFallsBackWhereItShould:
 
         assert session_agent_identity(wd) == (*derive_agent_identity(wd), None)
 
-    @pytest.mark.parametrize("junk", ["0", "", "not-a-pid", "12x", "-1"])
+    # No "0" here, deliberately, and the reason is a defect rather than a
+    # tidy-up. `session_agent_identity` guards with `.isdigit()` alone
+    # (identity.py:89) and has no `> 0` check, so "0" would NOT exercise
+    # validation — it passes the digit test, reaches the registry lookup, finds
+    # nothing, and exits through the already-covered no-match branch. It would
+    # read as guard coverage and be none.
+    #
+    # A case that DID discriminate cannot be written, because the behaviour it
+    # would assert is wrong: a pid-0 entry has pid_start=None, so is_stale() is
+    # False forever, and this function adopts it. Tracked separately; the guard
+    # in session_pid() is one layer of two.
+    @pytest.mark.parametrize("junk", ["", "not-a-pid", "12x", "-1"])
     def test_unusable_claude_pid_uses_the_directory(
         self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, junk: str
     ) -> None:
