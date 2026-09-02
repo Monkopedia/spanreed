@@ -187,7 +187,18 @@ async def test_the_published_description_does_not_contradict_that() -> None:
     # the positive half and it could never fail: "call", "caller" and "stalling"
     # all satisfy it, and the last is in this very docstring. A guard that cannot
     # fail is worse than none — it reports coverage it does not have.
-    for lie in ("are ignored", "arrive *after*", "only considers messages that arrive"):
+    # Each phrase must be long enough that only the FALSE claim can contain it.
+    # "are ignored" was the first list's entry and it is too generic: a fully
+    # truthful sentence — "messages whose ``in_reply_to`` does not match are
+    # ignored" — tripped it. That is the false-red direction again, on the guard
+    # whose commit message called false-reds the dangerous kind. Third time this
+    # assertion has been wrong; the lesson is that a fragment short enough to
+    # match a lie robustly is also short enough to match a truth.
+    for lie in (
+        "pre-existing matching messages are ignored",
+        "only considers messages that arrive",
+        "arrive *after* this call",
+    ):
         assert lie not in description, (
             f"the published description contains {lie!r}, which is the #14 claim: "
             f"pre-existing matches are RETURNED (see the test above). This text is "
