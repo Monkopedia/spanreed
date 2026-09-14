@@ -462,6 +462,7 @@ def main() -> int:
     # ---- step 3: discover threads -------------------------------------------
     hr("Step 3 — list threads")
     found: list[str] = []
+    created = False
     for mid, method, params in ((2, "thread/loaded/list", {}), (3, "thread/list", {"limit": 10})):
         try:
             res = jsonrpc(sock, buf, method, params, mid, wire)
@@ -480,7 +481,31 @@ def main() -> int:
         else:
             print(f"  {method:20} 0 threads. Raw result: {json.dumps(res)[:200]}")
 
-    if found:
+    if not found:
+        print("\n  No threads exist. Creating one so the turn path is still testable —")
+        print("  this answers 'can this client drive a turn AT ALL', which is most of")
+        print("  the protocol risk. It does NOT answer 'someone else's open thread'.")
+        for params in ({"cwd": str(Path.home())}, {}):
+            try:
+                res = jsonrpc(sock, buf, "thread/start", params, 10, wire)
+            except Exception as exc:
+                print(f"  thread/start {json.dumps(params)[:30]:32} no  -- {str(exc)[:90]}")
+                continue
+            ids = extract_ids(res)
+            print(f"  thread/start {json.dumps(params)[:30]:32} YES -- {json.dumps(res)[:110]}")
+            if ids:
+                found.extend(ids)
+                created = True
+                break
+
+    if found and created:
+        s3.verdict = "PARTIAL"
+        s3.detail = (
+            f"{len(found)} thread id(s), but all created by this script — "
+            f"`thread/list` returned empty, so nothing shows whether a human's open "
+            f"session is visible here. That is the half that matters."
+        )
+    elif found:
         s3.ok(f"{len(found)} distinct thread id(s) visible to a non-owning client")
     else:
         s3.no(
@@ -491,7 +516,12 @@ def main() -> int:
 
     # ---- step 4: start a turn ------------------------------------------------
     hr("Step 4 — start a turn in a thread someone else has open")
-    if not args.turn:
+    target = args.turn or (found[0] if created and found else None)
+    if target and not args.turn:
+        print(f"  no --turn given, but a thread was just created: using {target}")
+        print("  NOTE: this is OUR thread, not one a human has open. A pass here means")
+        print("  the protocol works; it does not yet mean we can reach someone else's.")
+    if not target:
         s4.skip(
             "not requested. Re-run with --turn <thread-id> to test this. "
             "THIS IS THE QUESTION THAT MATTERS — steps 1-3 passing without it "
@@ -503,10 +533,10 @@ def main() -> int:
             f"{SPIKE_MARKER} and nothing else. Do not use any tools, do not read "
             f"or modify any files, do not run any commands."
         )
-        print(f"  thread : {args.turn}")
+        print(f"  thread : {target}")
         print(f"  prompt : {prompt[:80]}...")
         try:
-            jsonrpc(sock, buf, "thread/resume", {"threadId": args.turn}, 4, wire)
+            jsonrpc(sock, buf, "thread/resume", {"threadId": target}, 4, wire)
         except Exception as exc:
             print(
                 f"  thread/resume FAILED  {type(exc).__name__}: {exc}  (may be fine — trying turn/start anyway)"
@@ -516,11 +546,26 @@ def main() -> int:
                 sock,
                 buf,
                 "turn/start",
-                {"threadId": args.turn, "input": [{"type": "text", "text": prompt}]},
+                {"threadId": target, "input": [{"type": "text", "text": prompt}]},
                 5,
                 wire,
             )
-            s4.ok(f"turn/start accepted: {json.dumps(res)[:200]}")
+            if created:
+                # Do NOT call this a pass. The question is "a thread someone
+                # else is using" and this thread is ours. Reporting PASS here
+                # would be a verdict claiming more than the run showed — the
+                # defect this script exists to avoid, in the script's own
+                # output.
+                s4.verdict = "PARTIAL"
+                s4.detail = (
+                    f"turn/start accepted ({json.dumps(res)[:120]}) — but on a thread THIS "
+                    f"SCRIPT created. The protocol works end to end. Whether a NON-OWNING "
+                    f"client may drive a thread a human has open is still unanswered: open "
+                    f"`codex` in another terminal, re-run, and pass --turn with an id from "
+                    f"step 3."
+                )
+            else:
+                s4.ok(f"turn/start accepted: {json.dumps(res)[:200]}")
         except Exception as exc:
             s4.no(
                 f"{type(exc).__name__}: {exc}  (A5 — or turns from a non-owning client are refused)"
@@ -583,15 +628,38 @@ def report(
     server_output = drain(proc)
     if server_output.strip():
         hr("What app-server itself said")
-        for line in server_output.strip().splitlines()[-40:]:
-            print(f"  {line}")
+        # Run 3's single useful line — the websocket upgrade failure — arrived
+        # buried in forty enter/exit traces of the same span. WARN/ERROR first,
+        # INFO deduped by message, because a diagnostic nobody reads is not one.
+        warns, infos, seen = [], [], set()
+        for line in server_output.strip().splitlines():
+            if " WARN " in line or " ERROR " in line:
+                warns.append(line)
+                continue
+            body = line.split(": ", 1)[-1][:120]
+            if body not in seen:
+                seen.add(body)
+                infos.append(line)
+        for line in warns:
+            print(f"  {line[:240]}")
+        if warns and infos:
+            print(f"  -- {len(infos)} distinct INFO line(s) follow --")
+        for line in infos[-12:]:
+            print(f"  {line[:200]}")
+        total = len(server_output.strip().splitlines())
+        print(f"  [{len(warns)} warn/error, {total} lines total; INFO deduped]")
     hr("Result")
     for s in steps:
         print(f"  {s.n}. [{s.verdict:11}] {s.question}\n        {s.detail}")
 
     verdicts = {s.n: s.verdict for s in steps}
     print()
-    if verdicts[4] == "PASS":
+    if verdicts[4] == "PARTIAL":
+        print("  The protocol works: connect, list, create, and drive a turn — all of it")
+        print("  over the unix WebSocket, from a process Codex did not spawn.")
+        print("  NOT yet shown: that a thread a HUMAN has open is visible and drivable.")
+        print("  That needs a live `codex` session and a re-run. It is the whole question.")
+    elif verdicts[4] == "PASS":
         print("  A non-owning process can start a turn in an open thread.")
         print(f"  CHECK THE HUMAN'S CODEX WINDOW: did it show a turn replying {SPIKE_MARKER}?")
         print("  If it did, a Codex session can be a real peer on the bus, not a mailbox.")
@@ -623,7 +691,7 @@ def report(
     elif tmp and keep:
         print(f"\n  socket dir kept at {tmp}")
 
-    return 0 if verdicts[4] == "PASS" else 1
+    return 0 if verdicts[4] in ("PASS", "PARTIAL") else 1
 
 
 if __name__ == "__main__":
