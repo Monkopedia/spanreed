@@ -332,7 +332,22 @@ def main() -> int:
         help="also run step 4: start ONE short turn in this thread. "
         "Get the id from step 3's output, or from a session you have open.",
     )
+    ap.add_argument(
+        "--connect",
+        metavar="SOCKET",
+        help="connect to an EXISTING app-server socket instead of spawning one. "
+        "This is the only way to reach threads another process owns — a spawned "
+        "server has its own state and sees nothing of the TUI's.",
+    )
     ap.add_argument("--keep-socket", action="store_true", help="don't delete the socket dir")
+    ap.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="seconds to wait per operation (default 60). Run 5 saw thread/list and "
+        "thread/start exceed 15s — thread/start may be booting a real session, and "
+        "the earlier log showed online model fetches, so slow is plausible.",
+    )
     args = ap.parse_args()
 
     steps = [
@@ -353,38 +368,91 @@ def main() -> int:
     print(f"  version       : {ver.stdout.strip() or ver.stderr.strip() or '(no output)'}")
     print(f"  CODEX_HOME    : {os.environ.get('CODEX_HOME', '(unset, defaults to ~/.codex)')}")
 
+    # ---- step 0: what already exists ----------------------------------------
+    # Run 5 settled something the first five runs could not: a human talked to
+    # `codex` in another terminal and step 3 still saw nothing. That is not a
+    # bug — every run has been spawning its OWN app-server, a separate process
+    # with separate state. A private server cannot see another process's
+    # threads, so the question was never being asked.
+    #
+    # If the TUI (or the App, or the VS Code extension) already has a socket,
+    # connecting to THAT is the whole game.
+    hr("Step 0 — what is already on this machine?")
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    print(f"  CODEX_HOME: {home}  exists={home.exists()}")
+    existing: list[Path] = []
+    if home.exists():
+        for sub in sorted(home.iterdir()):
+            kind = "dir" if sub.is_dir() else "file"
+            extra = ""
+            if sub.is_dir():
+                try:
+                    extra = f" ({sum(1 for _ in sub.rglob('*') if _.is_file())} files)"
+                except OSError:
+                    extra = " (unreadable)"
+            print(f"    {kind:4} {sub.name}{extra}")
+        for sock_file in home.rglob("*.sock"):
+            existing.append(sock_file)
+    if existing:
+        print("\n  EXISTING SOCKETS — these belong to processes already running:")
+        for e in existing:
+            print(f"    {e}")
+        print("  If one of these is a live app-server, it is the one that can see")
+        print("  the human's threads. Re-run with --connect <path> to use it.")
+    else:
+        print("\n  No existing sockets under CODEX_HOME.")
+        print("  Note what that means: nothing here is serving the TUI's threads, so")
+        print("  a spawned server necessarily starts empty. That is consistent with")
+        print("  step 3 staying empty after you talked to codex in another terminal.")
+    procs = subprocess.run(["pgrep", "-af", "codex"], capture_output=True, text=True)
+    lines = [ln for ln in (procs.stdout or "").splitlines() if "spike" not in ln]
+    print(f"\n  codex processes running: {len(lines)}")
+    for ln in lines[:8]:
+        print(f"    {ln[:150]}")
+
     # ---- step 1: start the server -------------------------------------------
     hr("Step 1 — start app-server on a unix socket")
-    tmp = Path(tempfile.mkdtemp(prefix="spanreed-spike-"))
-    sock_path = tmp / "app.sock"
-    cmd = [codex, "app-server", "--listen", f"unix://{sock_path}"]
-    print(f"  $ {' '.join(cmd)}")
-    # RUST_LOG: app-server is Rust and said nothing at all on run 2. If it can
-    # be made to explain why it hangs up, this is the switch that does it.
-    env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "info")}
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
-    )
+    if args.connect:
+        print(f"  SKIPPED: --connect {args.connect} given; using an existing socket instead.")
+        sock_path = Path(args.connect)
+        proc = None
+        tmp = None
+        if not sock_path.exists():
+            s1.no(f"{sock_path} does not exist")
+            return report(steps, args)
+        s1.ok(f"using existing socket {sock_path} (not spawned by this script)")
+        print(f"  {s1.verdict}: {s1.detail}")
+    else:
+        tmp = Path(tempfile.mkdtemp(prefix="spanreed-spike-"))
+        sock_path = tmp / "app.sock"
+        cmd = [codex, "app-server", "--listen", f"unix://{sock_path}"]
+        print(f"  $ {' '.join(cmd)}")
+        # RUST_LOG: app-server is Rust and said nothing at all on run 2. If it can
+        # be made to explain why it hangs up, this is the switch that does it.
+        env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "info")}
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
+        )
 
-    for _ in range(60):  # up to ~15s
-        if sock_path.exists():
-            break
-        if proc.poll() is not None:
-            out = (proc.stdout.read() if proc.stdout else "") or "(no output)"
+        for _ in range(60):  # up to ~15s
+            if sock_path.exists():
+                break
+            if proc.poll() is not None:
+                out = (proc.stdout.read() if proc.stdout else "") or "(no output)"
+                s1.no(
+                    f"exited {proc.returncode} before creating the socket (A1). Output:\n      "
+                    + out.strip().replace("\n", "\n      ")
+                )
+                return report(steps, args, proc, tmp, args.keep_socket)
+            time.sleep(0.25)
+        else:
             s1.no(
-                f"exited {proc.returncode} before creating the socket (A1). Output:\n      "
-                + out.strip().replace("\n", "\n      ")
+                f"ran for 15s without creating {sock_path} (A1) — wrong flag, or a different transport"
             )
             return report(steps, args, proc, tmp, args.keep_socket)
-        time.sleep(0.25)
-    else:
-        s1.no(
-            f"ran for 15s without creating {sock_path} (A1) — wrong flag, or a different transport"
-        )
-        return report(steps, args, proc, tmp, args.keep_socket)
 
-    s1.ok(f"socket appeared at {sock_path}")
-    print(f"  {s1.verdict}: {s1.detail}")
+        s1.ok(f"socket appeared at {sock_path}")
+        print(f"  {s1.verdict}: {s1.detail}")
 
     # ---- step 2: connect and initialize --------------------------------------
     # A matrix, not a guess. Run 1 sent one shape on one framing and the server
@@ -464,11 +532,15 @@ def main() -> int:
     found: list[str] = []
     created = False
     for mid, method, params in ((2, "thread/loaded/list", {}), (3, "thread/list", {"limit": 10})):
+        t0 = time.monotonic()
         try:
-            res = jsonrpc(sock, buf, method, params, mid, wire)
+            res = jsonrpc(sock, buf, method, params, mid, wire, args.timeout)
         except Exception as exc:
-            print(f"  {method:20} FAILED  {type(exc).__name__}: {exc}")
+            print(
+                f"  {method:20} FAILED after {time.monotonic() - t0:.1f}s  {type(exc).__name__}: {exc}"
+            )
             continue
+        print(f"  {method:20} ({time.monotonic() - t0:.1f}s)", end=" ")
         ids = extract_ids(res)
         # Deduplicate across methods: a live thread appears in BOTH listings, and
         # summing them reported 3 threads for 2. A count that overstates is the
@@ -477,19 +549,23 @@ def main() -> int:
         # The denominator matters: "0 threads" and "the call did not work" must
         # not look the same, which is why the raw shape is printed on zero.
         if ids:
-            print(f"  {method:20} {len(ids)} thread(s): {', '.join(ids[:5])}")
+            print(f"{len(ids)} thread(s): {', '.join(ids[:5])}")
         else:
-            print(f"  {method:20} 0 threads. Raw result: {json.dumps(res)[:200]}")
+            print(f"0 threads. Raw: {json.dumps(res)[:160]}")
 
     if not found:
         print("\n  No threads exist. Creating one so the turn path is still testable —")
         print("  this answers 'can this client drive a turn AT ALL', which is most of")
         print("  the protocol risk. It does NOT answer 'someone else's open thread'.")
         for params in ({"cwd": str(Path.home())}, {}):
+            t0 = time.monotonic()
             try:
-                res = jsonrpc(sock, buf, "thread/start", params, 10, wire)
+                res = jsonrpc(sock, buf, "thread/start", params, 10, wire, args.timeout)
             except Exception as exc:
-                print(f"  thread/start {json.dumps(params)[:30]:32} no  -- {str(exc)[:90]}")
+                print(
+                    f"  thread/start {json.dumps(params)[:28]:30} no after "
+                    f"{time.monotonic() - t0:.1f}s -- {str(exc)[:70]}"
+                )
                 continue
             ids = extract_ids(res)
             print(f"  thread/start {json.dumps(params)[:30]:32} YES -- {json.dumps(res)[:110]}")
@@ -636,10 +712,17 @@ def report(
             if " WARN " in line or " ERROR " in line:
                 warns.append(line)
                 continue
-            body = line.split(": ", 1)[-1][:120]
-            if body not in seen:
-                seen.add(body)
-                infos.append(line)
+            # Key on the span NAME plus the trailing message, not on a split
+            # that lands inside the span's own fields — the previous key made
+            # 120 lines of one repeated span look like 12 distinct ones.
+            name = ""
+            if 'otel.name="' in line:
+                name = line.split('otel.name="', 1)[1].split('"', 1)[0]
+            tail = line.rsplit("}: ", 1)[-1].rsplit(": ", 1)[-1].strip()
+            key = f"{name}|{tail}"
+            if key not in seen:
+                seen.add(key)
+                infos.append(f"{name or '-':24} {tail}")
         for line in warns:
             print(f"  {line[:240]}")
         if warns and infos:
