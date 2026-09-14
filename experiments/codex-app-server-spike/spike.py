@@ -684,11 +684,15 @@ def main() -> int:
                 # output.
                 s4.verdict = "PARTIAL"
                 s4.detail = (
-                    f"turn/start accepted ({json.dumps(res)[:120]}) — but on a thread THIS "
-                    f"SCRIPT created. The protocol works end to end. Whether a NON-OWNING "
-                    f"client may drive a thread a human has open is still unanswered: open "
-                    f"`codex` in another terminal, re-run, and pass --turn with an id from "
-                    f"step 3."
+                    f"turn/start accepted ({json.dumps(res)[:100]}) on a thread THIS SCRIPT "
+                    f"created and owns.\n"
+                    f"        PARTIAL only for 'join a session a human has open' — that is "
+                    f"still unanswered.\n"
+                    f"        For a HEADLESS BUS WORKER — a Codex nobody attaches to, driven "
+                    f"entirely by\n"
+                    f"        spanreed — this IS the answer, and it is yes. Spawn the server, "
+                    f"own the thread,\n"
+                    f"        turn/start on inbound mail. Nothing above blocks that design."
                 )
             else:
                 s4.ok(f"turn/start accepted: {json.dumps(res)[:200]}")
@@ -790,10 +794,16 @@ def report(
     verdicts = {s.n: s.verdict for s in steps}
     print()
     if verdicts[4] == "PARTIAL":
-        print("  The protocol works: connect, list, create, and drive a turn — all of it")
-        print("  over the unix WebSocket, from a process Codex did not spawn.")
-        print("  NOT yet shown: that a thread a HUMAN has open is visible and drivable.")
-        print("  That needs a live `codex` session and a re-run. It is the whole question.")
+        print("  Two designs, and this result answers them differently:")
+        print()
+        print("  HEADLESS BUS WORKER (a Codex nobody attaches to)            ANSWERED: YES")
+        print("    Spawn app-server, create a thread, turn/start on inbound mail.")
+        print("    Every step of that just ran. Nothing here blocks it.")
+        print()
+        print("  JOIN A HUMAN'S OPEN SESSION                                 STILL NO")
+        print("    Needs a thread this script did not create. On 0.154.0 the TUI")
+        print("    exposes no socket and locks the thread store, so there is nothing")
+        print("    to join. See the README.")
     elif verdicts[4] == "PASS":
         print("  A non-owning process can start a turn in an open thread.")
         print(f"  CHECK THE HUMAN'S CODEX WINDOW: did it show a turn replying {SPIKE_MARKER}?")
