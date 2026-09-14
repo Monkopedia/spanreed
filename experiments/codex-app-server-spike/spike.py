@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -188,6 +189,24 @@ def frame(payload: bytes, style: str) -> bytes:
     return payload + b"\n"
 
 
+def notify(sock: socket.socket, method: str, params: Any, style: str) -> None:
+    """A JSON-RPC notification: no id, no reply expected.
+
+    `initialized` is required. From the app-server docs: clients must send one
+    `initialize` request per connection, "then acknowledge with an initialized
+    notification. The server rejects any request on that connection before this
+    handshake."
+
+    Nine runs missed this. `initialize` answered, so the connection looked
+    established, and every call after it hung — which reads as a broken method
+    rather than an incomplete handshake. The answer was in the docs the whole
+    time and in ClientNotification.json, 431 bytes, sitting in CODEX_HOME and
+    listed by name in this script's own output for five runs.
+    """
+    payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": params})
+    sock.sendall(frame(payload.encode(), style))
+
+
 def jsonrpc(
     sock: socket.socket,
     buf: bytearray,
@@ -287,13 +306,17 @@ def dump_schema(codex: str) -> list[tuple[str, Any]]:
             continue
         if "initialize" not in text.lower():
             continue
-        print(f"  {f.name}: mentions initialize ({len(text)} bytes)")
-        try:
+        # Print small files in full rather than announcing their names. Five
+        # runs listed ClientNotification.json at 431 bytes without opening it;
+        # it names the handshake notification that was missing the whole time.
+        if len(text) <= 2500:
+            print(f"  --- {f.name} ({len(text)} bytes) ---")
+            for line in text.splitlines()[:40]:
+                print(f"      {line[:160]}")
+        else:
+            print(f"  {f.name}: {len(text)} bytes, too large to dump; grep it if needed")
+        with contextlib.suppress(json.JSONDecodeError):
             found.append((f.name, json.loads(text)))
-        except json.JSONDecodeError:
-            for line in text.splitlines():
-                if "initialize" in line.lower():
-                    print(f"      {line.strip()[:150]}")
     return found
 
 
@@ -546,6 +569,8 @@ def main() -> int:
                 probe.close()
                 continue
             print(f"  {style:5} / {label:16} YES -- {json.dumps(result)[:110]}")
+            notify(probe, "initialized", {}, style)
+            print("  sent `initialized` — required before any other method is serviced")
             s2.ok(f"framing={style}, params={label}; returned {json.dumps(result)[:150]}")
             probe.settimeout(TIMEOUT)
             # Carry the winning framing forward. Steps 3-4 previously used the
