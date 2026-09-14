@@ -111,12 +111,18 @@ thread store while the TUI holds it.
 | the TUI exposes no socket | `~/.codex/ipc/ipc.sock` exists but is **stale** — ECONNREFUSED on probe |
 | nothing advertises a server | `app-server-control/` holds one empty `app-server-startup.lock` |
 | no app-server is running | the two codex processes are `codex` (the TUI) and a ChatGPT.app computer-use helper |
-| a second server is locked out | `thread/list` and `thread/start` return **instantly when no TUI runs** and **time out when one does** — `thread_history_1.sqlite` plus a `thread-writer-locks/` dir |
+| ~~a second server is locked out~~ | **RETRACTED — this was wrong.** Run 9 had `codex processes running: 0` and `thread/list` still timed out. The lock-contention story was inferred from a `thread-writer-locks/` directory and a coincidence of timing, asserted here as measured, and then falsified. The real candidate is startup: the log shows `list_models{refresh_strategy=online}` and `fetching remote plugin catalog` still running when the call lands ~230ms later. Untested as of writing. |
 | a human's thread never appears | talking to `codex` in another terminal added nothing to `thread/list` |
 
-The contrast in row 4 is the one that matters: the same call, fast when the TUI
-is absent and hung when it is present, is contention rather than a guess about
-contention.
+**Row 4 was the one I was most confident about and it is the one that was
+wrong.** The "contrast" — fast without a TUI, hung with one — came from
+comparing runs that differed in more than the TUI, and I read a correlation
+across two runs as a demonstrated mechanism. Run 9 held the TUI at zero and the
+timeout persisted.
+
+The finding survives without it: rows 1-3 and 5 still say the TUI exposes
+nothing and a human's thread never appears. What does not survive is the
+explanation of *why* the second server is useless, which is now open.
 
 ## What was established, and is reusable
 

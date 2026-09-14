@@ -509,6 +509,7 @@ def main() -> int:
     # closed the connection with no error body — which cannot distinguish "wrong
     # framing" from "wrong params". Every combination is now tried, each on a
     # FRESH connection, because a rejected message closes the one it arrived on.
+    start_wall = time.monotonic()
     hr("Step 2a — what does Codex say its own initialize looks like?")
     schema = dump_schema(codex)
     if not schema:
@@ -581,16 +582,35 @@ def main() -> int:
     hr("Step 3 — list threads")
     found: list[str] = []
     created = False
-    for mid, method, params in ((2, "thread/loaded/list", {}), (3, "thread/list", {"limit": 10})):
-        t0 = time.monotonic()
-        try:
-            res = jsonrpc(sock, buf, method, params, mid, wire, args.timeout)
-        except Exception as exc:
-            print(
-                f"  {method:20} FAILED after {time.monotonic() - t0:.1f}s  {type(exc).__name__}: {exc}"
-            )
+    # Retry with backoff rather than one shot. Run 9 killed the contention
+    # hypothesis — zero codex processes, still timed out — and the log shows why
+    # that guess was wrong: startup does online work ("list_models
+    # refresh_strategy=online", "fetching remote plugin catalog") and these calls
+    # land ~230ms after the socket appears, while it is still in flight. One
+    # attempt cannot tell "never works" from "not ready yet". A series can.
+    attempt_id = 100
+    for _mid, method, params in ((2, "thread/loaded/list", {}), (3, "thread/list", {"limit": 10})):
+        res = None
+        for delay in (0, 5, 10, 20):
+            if delay:
+                print(f"  {method:20} waiting {delay}s — server may still be warming up")
+                time.sleep(delay)
+            attempt_id += 1
+            t0 = time.monotonic()
+            try:
+                res = jsonrpc(sock, buf, method, params, attempt_id, wire, args.timeout)
+                break
+            except Exception as exc:
+                print(
+                    f"  {method:20} FAILED after {time.monotonic() - t0:.1f}s "
+                    f"(t+{time.monotonic() - start_wall:.0f}s since start)  "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if not isinstance(exc, TimeoutError):
+                    break  # a real error, not slowness; retrying will not help
+        if res is None:
             continue
-        print(f"  {method:20} ({time.monotonic() - t0:.1f}s)", end=" ")
+        print(f"  {method:20} (t+{time.monotonic() - start_wall:.0f}s)", end=" ")
         ids = extract_ids(res)
         # Deduplicate across methods: a live thread appears in BOTH listings, and
         # summing them reported 3 threads for 2. A count that overstates is the
@@ -608,9 +628,10 @@ def main() -> int:
         print("  this answers 'can this client drive a turn AT ALL', which is most of")
         print("  the protocol risk. It does NOT answer 'someone else's open thread'.")
         for params in ({"cwd": str(Path.home())}, {}):
+            attempt_id += 1
             t0 = time.monotonic()
             try:
-                res = jsonrpc(sock, buf, "thread/start", params, 10, wire, args.timeout)
+                res = jsonrpc(sock, buf, "thread/start", params, attempt_id, wire, args.timeout)
             except Exception as exc:
                 print(
                     f"  thread/start {json.dumps(params)[:28]:30} no after "
