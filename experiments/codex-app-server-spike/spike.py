@@ -41,10 +41,13 @@ If a step fails, the printed reason names the assumption, so you can tell
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -83,10 +86,102 @@ def hr(title: str) -> None:
     print(f"\n{'=' * 72}\n{title}\n{'=' * 72}")
 
 
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_handshake(sock: socket.socket, host: str = "localhost", path: str = "/") -> bytearray:
+    """RFC 6455 upgrade. Returns whatever body bytes arrived with the response.
+
+    Run 3's log said exactly what was missing:
+
+        failed to upgrade control socket websocket connection:
+        WebSocket protocol error: httparse error: invalid token
+
+    The unix socket is a WebSocket control socket, so raw JSON was being parsed
+    as an HTTP request line. None of A1-A5 covered that — the assumption that
+    broke was one I had not written down, which is its own lesson about
+    enumerating assumptions.
+    """
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    sock.sendall(req.encode())
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("server closed during the WebSocket handshake")
+        buf.extend(chunk)
+    head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+    status = head.split(b"\r\n")[0].decode(errors="replace")
+    if "101" not in status:
+        raise RuntimeError(
+            f"no upgrade: {status!r}; headers: {head.decode(errors='replace')[:200]}"
+        )
+    want = base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
+    if want.lower() not in head.decode(errors="replace").lower():
+        raise RuntimeError("Sec-WebSocket-Accept did not match — not a conformant upgrade")
+    return bytearray(rest)
+
+
+def ws_encode(payload: bytes, opcode: int = 0x1) -> bytes:
+    """A client frame. Masking is mandatory client->server; an unmasked frame is
+    a protocol error the server must close on, which would look exactly like the
+    failure this is fixing."""
+    mask = os.urandom(4)
+    n = len(payload)
+    if n < 126:
+        hdr = struct.pack("!BB", 0x80 | opcode, 0x80 | n)
+    elif n < 65536:
+        hdr = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, n)
+    else:
+        hdr = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, n)
+    return hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def ws_decode(buf: bytearray) -> tuple[int, bytes, int] | None:
+    """One frame, or None if more bytes are needed. (opcode, payload, consumed)."""
+    if len(buf) < 2:
+        return None
+    b0, b1 = buf[0], buf[1]
+    opcode, masked, n = b0 & 0x0F, b1 & 0x80, b1 & 0x7F
+    off = 2
+    if n == 126:
+        if len(buf) < 4:
+            return None
+        n = struct.unpack("!H", bytes(buf[2:4]))[0]
+        off = 4
+    elif n == 127:
+        if len(buf) < 10:
+            return None
+        n = struct.unpack("!Q", bytes(buf[2:10]))[0]
+        off = 10
+    mask = b""
+    if masked:
+        if len(buf) < off + 4:
+            return None
+        mask = bytes(buf[off : off + 4])
+        off += 4
+    if len(buf) < off + n:
+        return None
+    payload = bytes(buf[off : off + n])
+    if masked:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return opcode, payload, off + n
+
+
 def frame(payload: bytes, style: str) -> bytes:
     """`jsonl` = one JSON object per line. `lsp` = a Content-Length header first,
     as LSP and MCP-over-stdio use. Run 1 assumed jsonl and the server hung up
     without a word, which does not distinguish wrong framing from wrong params."""
+    if style == "ws":
+        return ws_encode(payload)
     if style == "lsp":
         return b"Content-Length: %d\r\n\r\n%s" % (len(payload), payload)
     return payload + b"\n"
@@ -113,6 +208,23 @@ def jsonrpc(
 
     deadline = time.monotonic() + timeout
     while True:
+        if style == "ws":
+            while (got := ws_decode(buf)) is not None:
+                opcode, payload, used = got
+                del buf[:used]
+                if opcode == 0x8:
+                    raise RuntimeError("server sent a WebSocket close frame")
+                if opcode == 0x9:  # ping -> pong, or it hangs up on us
+                    sock.sendall(ws_encode(payload, 0xA))
+                    continue
+                if opcode not in (0x1, 0x2):
+                    continue
+                msg = json.loads(payload.decode(errors="replace"))
+                if msg.get("id") == mid:
+                    if "error" in msg:
+                        raise RuntimeError(f"server returned an error: {msg['error']}")
+                    return msg.get("result")
+                continue
         while b"\n" in buf:
             line, _, rest = bytes(buf).partition(b"\n")
             buf.clear()
@@ -294,7 +406,8 @@ def main() -> int:
     ]
     sock: socket.socket | None = None
     buf = bytearray()
-    for style in ("jsonl", "lsp"):
+    wire = "jsonl"
+    for style in ("ws", "jsonl", "lsp"):
         for label, params in shapes:
             try:
                 probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -306,6 +419,8 @@ def main() -> int:
             pbuf = bytearray()
             try:
                 probe.settimeout(PROBE_TIMEOUT)
+                if style == "ws":
+                    pbuf = ws_handshake(probe)
                 result = jsonrpc(probe, pbuf, "initialize", params, 1, style, PROBE_TIMEOUT)
             except Exception as exc:
                 print(f"  {style:5} / {label:16} no  -- {type(exc).__name__}: {str(exc)[:88]}")
@@ -314,6 +429,11 @@ def main() -> int:
             print(f"  {style:5} / {label:16} YES -- {json.dumps(result)[:110]}")
             s2.ok(f"framing={style}, params={label}; returned {json.dumps(result)[:150]}")
             probe.settimeout(TIMEOUT)
+            # Carry the winning framing forward. Steps 3-4 previously used the
+            # default, so a WebSocket connection got raw JSON lines and the
+            # server hung up — a bug found only by testing against a real
+            # implementation rather than one that agreed with me.
+            wire = style
             sock, buf = probe, pbuf
             break
         if sock is not None:
@@ -344,7 +464,7 @@ def main() -> int:
     found: list[str] = []
     for mid, method, params in ((2, "thread/loaded/list", {}), (3, "thread/list", {"limit": 10})):
         try:
-            res = jsonrpc(sock, buf, method, params, mid)
+            res = jsonrpc(sock, buf, method, params, mid, wire)
         except Exception as exc:
             print(f"  {method:20} FAILED  {type(exc).__name__}: {exc}")
             continue
@@ -386,7 +506,7 @@ def main() -> int:
         print(f"  thread : {args.turn}")
         print(f"  prompt : {prompt[:80]}...")
         try:
-            jsonrpc(sock, buf, "thread/resume", {"threadId": args.turn}, 4)
+            jsonrpc(sock, buf, "thread/resume", {"threadId": args.turn}, 4, wire)
         except Exception as exc:
             print(
                 f"  thread/resume FAILED  {type(exc).__name__}: {exc}  (may be fine — trying turn/start anyway)"
@@ -398,6 +518,7 @@ def main() -> int:
                 "turn/start",
                 {"threadId": args.turn, "input": [{"type": "text", "text": prompt}]},
                 5,
+                wire,
             )
             s4.ok(f"turn/start accepted: {json.dumps(res)[:200]}")
         except Exception as exc:
