@@ -141,6 +141,77 @@ def jsonrpc(
         buf.extend(chunk)
 
 
+def dump_schema(codex: str) -> list[tuple[str, Any]]:
+    """Ask Codex for its own schema instead of guessing a fifth time.
+
+    `codex app-server generate-json-schema --out DIR` writes the authoritative
+    request shapes. Run 2 tried eight hand-written combinations and the server
+    closed the connection on all eight, including empty params — which is not
+    what parameter validation looks like, so the shape was probably never the
+    problem. Reading beats guessing either way.
+    """
+    out = Path(tempfile.mkdtemp(prefix="spanreed-schema-"))
+    r = subprocess.run(
+        [codex, "app-server", "generate-json-schema", "--out", str(out)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if r.returncode != 0:
+        print(
+            f"  generate-json-schema exited {r.returncode}: {(r.stderr or r.stdout).strip()[:300]}"
+        )
+        return []
+    files = sorted(out.rglob("*"))
+    print(f"  wrote {len([f for f in files if f.is_file()])} file(s) to {out}")
+    found: list[tuple[str, Any]] = []
+    for f in files:
+        if not f.is_file() or f.suffix not in (".json", ".ts", ".txt", ""):
+            continue
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        if "initialize" not in text.lower():
+            continue
+        print(f"  {f.name}: mentions initialize ({len(text)} bytes)")
+        try:
+            found.append((f.name, json.loads(text)))
+        except json.JSONDecodeError:
+            for line in text.splitlines():
+                if "initialize" in line.lower():
+                    print(f"      {line.strip()[:150]}")
+    return found
+
+
+def try_stdio(codex: str, params: Any) -> str:
+    """Control: the SAME message over the stdio transport.
+
+    stdio is the documented default; unix and websocket are flagged
+    experimental. If stdio accepts what unix rejects, the transport is the
+    problem and the params are fine — which is a different answer from both
+    "Codex declines" and "the script guessed wrong", and neither of the first
+    two runs could have told them apart.
+    """
+    proc = subprocess.Popen(
+        [codex, "app-server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
+    try:
+        out, err = proc.communicate(req + "\n", timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return "no reply within 20s (process still running — may be waiting for more input)"
+    reply = (out or "").strip().splitlines()
+    if reply:
+        return f"REPLIED: {reply[0][:220]}"
+    return f"no stdout. exit={proc.returncode}. stderr: {(err or '').strip()[:220] or '(silent)'}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument(
@@ -176,7 +247,12 @@ def main() -> int:
     sock_path = tmp / "app.sock"
     cmd = [codex, "app-server", "--listen", f"unix://{sock_path}"]
     print(f"  $ {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # RUST_LOG: app-server is Rust and said nothing at all on run 2. If it can
+    # be made to explain why it hangs up, this is the switch that does it.
+    env = {**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "info")}
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
+    )
 
     for _ in range(60):  # up to ~15s
         if sock_path.exists():
@@ -203,7 +279,12 @@ def main() -> int:
     # closed the connection with no error body — which cannot distinguish "wrong
     # framing" from "wrong params". Every combination is now tried, each on a
     # FRESH connection, because a rejected message closes the one it arrived on.
-    hr("Step 2 — connect as a second client and initialize")
+    hr("Step 2a — what does Codex say its own initialize looks like?")
+    schema = dump_schema(codex)
+    if not schema:
+        print("  (no schema recovered — the matrix below is still a guess)")
+
+    hr("Step 2b — connect as a second client and initialize")
     client = {"name": "spanreed-spike", "version": "0.0.0"}
     shapes: list[tuple[str, Any]] = [
         ("mcp-style", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": client}),
@@ -239,6 +320,17 @@ def main() -> int:
             break
 
     if sock is None:
+        hr("Step 2c — CONTROL: the same message over stdio")
+        print("  stdio is the documented default; unix/ws are experimental.")
+        verdict = try_stdio(codex, {"clientInfo": client})
+        print(f"  stdio initialize -> {verdict}")
+        if verdict.startswith("REPLIED"):
+            s2.no(
+                "unix socket rejected every combination, but STDIO ANSWERED the same "
+                "message. The params are fine and the unix transport is the problem — "
+                "so the design is not dead, it just cannot use this transport."
+            )
+            return report(steps, args, proc, tmp, args.keep_socket)
         s2.no(
             "every framing x params combination was rejected (A2/A3). Run "
             "`codex app-server generate-json-schema` there — it emits the authoritative "
