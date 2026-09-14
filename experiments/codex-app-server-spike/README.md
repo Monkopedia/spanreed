@@ -94,3 +94,66 @@ real reply, so the client's id-filtering is exercised rather than assumed.
 The verdict table is the output. Worth capturing separately if it happens:
 **a turn that runs but the human never sees** — that would mean turns are
 possible but invisible, which is a different answer from either yes or no.
+
+
+---
+
+# ANSWER: no, not today. Eight runs, codex-cli 0.154.0, macOS.
+
+**A Codex TUI session cannot be reached by another process.** Not via IPC —
+nothing is listening. Not via a second app-server — it is locked out of the
+thread store while the TUI holds it.
+
+## The evidence
+
+| finding | how it was established |
+|---|---|
+| the TUI exposes no socket | `~/.codex/ipc/ipc.sock` exists but is **stale** — ECONNREFUSED on probe |
+| nothing advertises a server | `app-server-control/` holds one empty `app-server-startup.lock` |
+| no app-server is running | the two codex processes are `codex` (the TUI) and a ChatGPT.app computer-use helper |
+| a second server is locked out | `thread/list` and `thread/start` return **instantly when no TUI runs** and **time out when one does** — `thread_history_1.sqlite` plus a `thread-writer-locks/` dir |
+| a human's thread never appears | talking to `codex` in another terminal added nothing to `thread/list` |
+
+The contrast in row 4 is the one that matters: the same call, fast when the TUI
+is absent and hung when it is present, is contention rather than a guess about
+contention.
+
+## What was established, and is reusable
+
+The protocol work is sound and none of it is wasted if this changes:
+
+- `codex app-server --listen unix://PATH` runs under **ChatGPT subscription
+  sign-in** — no API key
+- the unix transport is a **WebSocket control socket**, not newline JSON. There
+  is a working stdlib RFC 6455 client here, tested against `aiohttp`
+- `initialize` from a foreign process **works** — the server echoes the client
+  name back and logs the call under `rpc.transport="unix_socket"`
+- `thread/loaded/list` works; the full protocol schema is emitted by
+  `codex app-server generate-json-schema --out DIR` (305 files)
+
+So the client is finished. What is missing is a server that owns a human's
+session and will talk to anyone else.
+
+## What would change the answer
+
+1. **OpenAI ships the wake primitive.** Four open issues ask for exactly it —
+   [#20312](https://github.com/openai/codex/issues/20312),
+   [#35542](https://github.com/openai/codex/issues/35542),
+   [#8375](https://github.com/openai/codex/issues/8375),
+   [#29922](https://github.com/openai/codex/issues/29922). #35542 describes this
+   situation precisely: *"nothing can reach an idle TUI"*.
+2. **Use the App or VS Code extension instead of the TUI.** Both reportedly
+   register as thread owners on the IPC router, which is why that socket exists
+   at all. Untested here, and it means not working in a terminal.
+
+## Why it stopped here
+
+Eight runs, and most of the cost was self-inflicted: five spawned a private
+server that could never have seen another process's threads, and one connected
+to a dead socket on the strength of a sentence in this script that claimed
+sockets were live without probing them.
+
+What the script got right is that every one of those was reported as **the
+script being wrong**, never as Codex refusing. That distinction is why the
+conclusion above can be trusted: the failures that were mine were labelled mine,
+and the one that is Codex's is the only one left.
