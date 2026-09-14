@@ -273,6 +273,40 @@ def jsonrpc(
         buf.extend(chunk)
 
 
+def _find_method(node: Any, method: str, depth: int = 0) -> Any:
+    """Find the sub-schema describing `method`, without assuming the layout.
+
+    JSON-Schema nests differently per generator, so this searches for a const or
+    enum carrying the method name and returns its enclosing object — the params
+    shape lives beside it whatever the surrounding structure.
+    """
+    if depth > 12:
+        return None
+    if isinstance(node, dict):
+        # Match the ENCLOSING schema, not the name node. A first version
+        # returned {"enum": ["thread/list"]} — technically a hit, and useless:
+        # it confirms the method exists while dropping the params shape, which
+        # is the only reason to look. Verified by testing the extractor on a
+        # generator-shaped document before trusting its output.
+        props = node.get("properties")
+        if isinstance(props, dict):
+            meth = props.get("method")
+            if isinstance(meth, dict):
+                val = meth.get("const", meth.get("enum"))
+                if val == method or (isinstance(val, list) and method in val):
+                    return node
+        for val in node.values():
+            hit = _find_method(val, method, depth + 1)
+            if hit is not None:
+                return hit
+    elif isinstance(node, list):
+        for item in node:
+            hit = _find_method(item, method, depth + 1)
+            if hit is not None:
+                return hit
+    return None
+
+
 def dump_schema(codex: str) -> list[tuple[str, Any]]:
     """Ask Codex for its own schema instead of guessing a fifth time.
 
@@ -313,8 +347,24 @@ def dump_schema(codex: str) -> list[tuple[str, Any]]:
             print(f"  --- {f.name} ({len(text)} bytes) ---")
             for line in text.splitlines()[:40]:
                 print(f"      {line[:160]}")
+        elif f.name == "ClientRequest.json":
+            # 199KB, and the authoritative shape of every request. Run 10 printed
+            # "too large to dump; grep it if needed" — telling the operator to go
+            # and find the thing this step exists to find. Extract instead.
+            print(f"  --- {f.name}: extracting the methods that are failing ---")
+            try:
+                doc = json.loads(text)
+            except json.JSONDecodeError:
+                print("      (not parseable)")
+                continue
+            for want in ("thread/list", "thread/start", "turn/start"):
+                hit = _find_method(doc, want)
+                if hit:
+                    print(f"      {want}: {json.dumps(hit)[:420]}")
+                else:
+                    print(f"      {want}: not found by name in this schema")
         else:
-            print(f"  {f.name}: {len(text)} bytes, too large to dump; grep it if needed")
+            print(f"  {f.name}: {len(text)} bytes, not dumped")
         with contextlib.suppress(json.JSONDecodeError):
             found.append((f.name, json.loads(text)))
     return found
@@ -446,6 +496,23 @@ def main() -> int:
         print("  a spawned server necessarily starts empty. That is consistent with")
         print("  step 3 staying empty after you talked to codex in another terminal.")
     existing = live
+    locks = home / "thread-writer-locks"
+    if locks.is_dir():
+        entries = sorted(locks.iterdir())
+        print(f"\n  thread-writer-locks/ — {len(entries)} entry(ies):")
+        for f in entries:
+            try:
+                st = f.stat()
+                body = f.read_text(errors="replace").strip()[:120] if f.is_file() else ""
+                print(
+                    f"    {f.name}  {st.st_size}B  mtime={int(time.time() - st.st_mtime)}s ago  {body}"
+                )
+            except OSError as exc:
+                print(f"    {f.name}: unreadable ({exc})")
+        print("    A leftover lock here, with no process holding it, is a CANDIDATE for")
+        print("    the thread/list and thread/start hangs — NOT a diagnosis. The last")
+        print("    time a lock file was treated as evidence of contention it was wrong.")
+
     control = home / "app-server-control"
     if control.is_dir():
         print("\n  app-server-control/ — a running server may advertise itself here:")
@@ -541,6 +608,19 @@ def main() -> int:
     hr("Step 2b — connect as a second client and initialize")
     client = {"name": "spanreed-spike", "version": "0.0.0"}
     shapes: list[tuple[str, Any]] = [
+        # InitializeParams.json declares an `experimentalApi` capability —
+        # "Opt into receiving experimental API methods and fields." Run 10 dumped
+        # that schema and I read past it. thread/loaded/list works while
+        # thread/list and thread/start hang, and "experimental" is a plausible
+        # reason for a method to be present but inert. Offered first now.
+        (
+            "experimental",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"experimentalApi": True},
+                "clientInfo": client,
+            },
+        ),
         ("mcp-style", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": client}),
         ("clientInfo-only", {"clientInfo": client}),
         ("flat", client),
