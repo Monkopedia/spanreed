@@ -399,22 +399,57 @@ def main() -> int:
             print(f"    {kind:4} {sub.name}{extra}")
         for sock_file in home.rglob("*.sock"):
             existing.append(sock_file)
+    live: list[Path] = []
     if existing:
-        print("\n  EXISTING SOCKETS — these belong to processes already running:")
+        print("\n  SOCKETS FOUND — probing each, because a socket file outliving its")
+        print("  process is indistinguishable from a live one until you connect:")
         for e in existing:
-            print(f"    {e}")
-        print("  If one of these is a live app-server, it is the one that can see")
-        print("  the human's threads. Re-run with --connect <path> to use it.")
+            try:
+                t = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                t.settimeout(2.0)
+                t.connect(str(e))
+                t.close()
+                live.append(e)
+                print(f"    LIVE   {e}")
+            except OSError as exc:
+                print(f"    STALE  {e}  ({exc.strerror or exc})")
+        if not live:
+            print("\n  Every socket is stale — a leftover file, nothing listening.")
+            print("  Run 7 connected to this one and got ECONNREFUSED, because step 0")
+            print("  claimed 'these belong to processes already running' without probing.")
     else:
         print("\n  No existing sockets under CODEX_HOME.")
         print("  Note what that means: nothing here is serving the TUI's threads, so")
         print("  a spawned server necessarily starts empty. That is consistent with")
         print("  step 3 staying empty after you talked to codex in another terminal.")
+    existing = live
+    control = home / "app-server-control"
+    if control.is_dir():
+        print("\n  app-server-control/ — a running server may advertise itself here:")
+        for f in sorted(control.iterdir()):
+            try:
+                body = f.read_text(errors="replace").strip()
+                print(f"    {f.name}: {body[:400]}")
+            except OSError as exc:
+                print(f"    {f.name}: unreadable ({exc})")
+
     procs = subprocess.run(["pgrep", "-af", "codex"], capture_output=True, text=True)
-    lines = [ln for ln in (procs.stdout or "").splitlines() if "spike" not in ln]
+    raw = [ln.strip() for ln in (procs.stdout or "").splitlines() if ln.strip()]
+    lines: list[str] = []
+    for ln in raw:
+        if ln.isdigit():  # macOS pgrep has no -a; it printed bare pids on run 7
+            cmd = subprocess.run(["ps", "-p", ln, "-o", "command="], capture_output=True, text=True)
+            ln = f"{ln} {cmd.stdout.strip()}"
+        if "spike" in ln:
+            continue
+        lines.append(ln)
     print(f"\n  codex processes running: {len(lines)}")
     for ln in lines[:8]:
-        print(f"    {ln[:150]}")
+        print(f"    {ln[:160]}")
+    if lines and not live:
+        print("\n  Codex IS running but nothing is listening. If none of those command")
+        print("  lines is an `app-server`, that is the answer: the TUI keeps its threads")
+        print("  in-process and exposes no socket for another client to reach.")
 
     # ---- step 1: start the server -------------------------------------------
     hr("Step 1 — start app-server on a unix socket")
