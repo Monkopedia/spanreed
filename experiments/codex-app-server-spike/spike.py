@@ -45,6 +45,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import struct
@@ -339,14 +340,19 @@ def main() -> int:
         "This is the only way to reach threads another process owns — a spawned "
         "server has its own state and sees nothing of the TUI's.",
     )
+    ap.add_argument(
+        "--spawn",
+        action="store_true",
+        help="force spawning a new app-server even when one is already running. "
+        "Only useful for reproducing run 6's lock contention.",
+    )
     ap.add_argument("--keep-socket", action="store_true", help="don't delete the socket dir")
     ap.add_argument(
         "--timeout",
         type=float,
-        default=60.0,
-        help="seconds to wait per operation (default 60). Run 5 saw thread/list and "
-        "thread/start exceed 15s — thread/start may be booting a real session, and "
-        "the earlier log showed online model fetches, so slow is plausible.",
+        default=20.0,
+        help="seconds to wait per operation (default 20). Run 6 hung 3x60s against a "
+        "spawned server; a shorter fuse fails faster when contention is the cause.",
     )
     args = ap.parse_args()
 
@@ -412,9 +418,18 @@ def main() -> int:
 
     # ---- step 1: start the server -------------------------------------------
     hr("Step 1 — start app-server on a unix socket")
-    if args.connect:
-        print(f"  SKIPPED: --connect {args.connect} given; using an existing socket instead.")
-        sock_path = Path(args.connect)
+    auto = existing[0] if (existing and not args.spawn and not args.connect) else None
+    if auto:
+        print(f"  Using the EXISTING socket {auto} rather than spawning a second server.")
+        print("  Run 6 spawned one while two codex processes were already running, and")
+        print("  thread/list and thread/start each hung for the full timeout while the")
+        print("  server spun on one span. CODEX_HOME holds thread_history_*.sqlite with")
+        print("  -wal/-shm and a thread-writer-locks dir, so a third server contending")
+        print("  for a lock the live one holds is the obvious candidate. Pass --spawn to")
+        print("  force the old behaviour.")
+    if args.connect or auto:
+        sock_path = Path(args.connect) if args.connect else auto
+        assert sock_path is not None
         proc = None
         tmp = None
         if not sock_path.exists():
@@ -715,14 +730,16 @@ def report(
             # Key on the span NAME plus the trailing message, not on a split
             # that lands inside the span's own fields — the previous key made
             # 120 lines of one repeated span look like 12 distinct ones.
-            name = ""
-            if 'otel.name="' in line:
-                name = line.split('otel.name="', 1)[1].split('"', 1)[0]
-            tail = line.rsplit("}: ", 1)[-1].rsplit(": ", 1)[-1].strip()
-            key = f"{name}|{tail}"
+            # Normalise rather than parse. An earlier version split on the span
+            # structure and produced a dash and a full line for every entry when
+            # the real logs did not match the assumed shape — a formatter with
+            # its own guess about the input, which is the thing being debugged.
+            # Stripping digits collapses timestamps, ids and durations, so
+            # repeats of one span share a key whatever the surrounding format.
+            key = re.sub(r"\d+", "#", line)[:160]
             if key not in seen:
                 seen.add(key)
-                infos.append(f"{name or '-':24} {tail}")
+                infos.append(line)
         for line in warns:
             print(f"  {line[:240]}")
         if warns and infos:
