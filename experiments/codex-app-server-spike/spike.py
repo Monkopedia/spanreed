@@ -53,6 +53,10 @@ from pathlib import Path
 from typing import Any
 
 TIMEOUT = 15.0
+# Discovery probes get a short fuse: step 2 tries 8 combinations, and a server
+# that simply never answers a shape it dislikes would otherwise cost 8 x 15s.
+# Two minutes of silence is a script nobody runs twice.
+PROBE_TIMEOUT = 4.0
 SPIKE_MARKER = "SPANREED_SPIKE_OK"
 
 
@@ -79,7 +83,24 @@ def hr(title: str) -> None:
     print(f"\n{'=' * 72}\n{title}\n{'=' * 72}")
 
 
-def jsonrpc(sock: socket.socket, buf: bytearray, method: str, params: Any, mid: int) -> Any:
+def frame(payload: bytes, style: str) -> bytes:
+    """`jsonl` = one JSON object per line. `lsp` = a Content-Length header first,
+    as LSP and MCP-over-stdio use. Run 1 assumed jsonl and the server hung up
+    without a word, which does not distinguish wrong framing from wrong params."""
+    if style == "lsp":
+        return b"Content-Length: %d\r\n\r\n%s" % (len(payload), payload)
+    return payload + b"\n"
+
+
+def jsonrpc(
+    sock: socket.socket,
+    buf: bytearray,
+    method: str,
+    params: Any,
+    mid: int,
+    style: str = "jsonl",
+    timeout: float = TIMEOUT,
+) -> Any:
     """One request, one matching response. Raises on timeout or transport error.
 
     Reads newline-delimited JSON (A2). Notifications and responses to other ids
@@ -88,9 +109,9 @@ def jsonrpc(sock: socket.socket, buf: bytearray, method: str, params: Any, mid: 
     and every assertion after it would be about that object.
     """
     payload = json.dumps({"jsonrpc": "2.0", "id": mid, "method": method, "params": params})
-    sock.sendall(payload.encode() + b"\n")
+    sock.sendall(frame(payload.encode(), style))
 
-    deadline = time.monotonic() + TIMEOUT
+    deadline = time.monotonic() + timeout
     while True:
         while b"\n" in buf:
             line, _, rest = bytes(buf).partition(b"\n")
@@ -98,10 +119,13 @@ def jsonrpc(sock: socket.socket, buf: bytearray, method: str, params: Any, mid: 
             buf.extend(rest)
             if not line.strip():
                 continue
+            text = line.decode(errors="replace").strip()
+            if not text or (":" in text.split("{")[0][:20] and text.lower().startswith("content-")):
+                continue  # LSP header; the body follows a blank line
             try:
-                msg = json.loads(line)
+                msg = json.loads(text)
             except json.JSONDecodeError as exc:
-                raise RuntimeError(f"not newline-delimited JSON (A2): {line[:120]!r}") from exc
+                raise RuntimeError(f"not JSON on this framing (A2): {text[:110]!r}") from exc
             if msg.get("id") == mid:
                 if "error" in msg:
                     raise RuntimeError(f"server returned an error: {msg['error']}")
@@ -109,7 +133,7 @@ def jsonrpc(sock: socket.socket, buf: bytearray, method: str, params: Any, mid: 
             # else: a notification or another id — keep reading.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError(f"no response to {method} within {TIMEOUT}s")
+            raise TimeoutError(f"no response to {method} within {timeout}s")
         sock.settimeout(remaining)
         chunk = sock.recv(65536)
         if not chunk:
@@ -175,27 +199,51 @@ def main() -> int:
     print(f"  {s1.verdict}: {s1.detail}")
 
     # ---- step 2: connect and initialize --------------------------------------
+    # A matrix, not a guess. Run 1 sent one shape on one framing and the server
+    # closed the connection with no error body — which cannot distinguish "wrong
+    # framing" from "wrong params". Every combination is now tried, each on a
+    # FRESH connection, because a rejected message closes the one it arrived on.
     hr("Step 2 — connect as a second client and initialize")
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(TIMEOUT)
-        sock.connect(str(sock_path))
-    except OSError as exc:
-        s2.no(f"could not connect to the socket: {exc}")
-        return report(steps, args, proc, tmp, args.keep_socket)
-
+    client = {"name": "spanreed-spike", "version": "0.0.0"}
+    shapes: list[tuple[str, Any]] = [
+        ("mcp-style", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": client}),
+        ("clientInfo-only", {"clientInfo": client}),
+        ("flat", client),
+        ("empty", {}),
+    ]
+    sock: socket.socket | None = None
     buf = bytearray()
-    try:
-        result = jsonrpc(
-            sock,
-            buf,
-            "initialize",
-            {"clientInfo": {"name": "spanreed-spike", "version": "0"}},
-            1,
+    for style in ("jsonl", "lsp"):
+        for label, params in shapes:
+            try:
+                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                probe.settimeout(TIMEOUT)
+                probe.connect(str(sock_path))
+            except OSError as exc:
+                s2.no(f"could not connect to the socket at all: {exc}")
+                return report(steps, args, proc, tmp, args.keep_socket)
+            pbuf = bytearray()
+            try:
+                probe.settimeout(PROBE_TIMEOUT)
+                result = jsonrpc(probe, pbuf, "initialize", params, 1, style, PROBE_TIMEOUT)
+            except Exception as exc:
+                print(f"  {style:5} / {label:16} no  -- {type(exc).__name__}: {str(exc)[:88]}")
+                probe.close()
+                continue
+            print(f"  {style:5} / {label:16} YES -- {json.dumps(result)[:110]}")
+            s2.ok(f"framing={style}, params={label}; returned {json.dumps(result)[:150]}")
+            probe.settimeout(TIMEOUT)
+            sock, buf = probe, pbuf
+            break
+        if sock is not None:
+            break
+
+    if sock is None:
+        s2.no(
+            "every framing x params combination was rejected (A2/A3). Run "
+            "`codex app-server generate-json-schema` there — it emits the authoritative "
+            "request shape, which beats another round of guessing."
         )
-        s2.ok(f"initialize returned: {json.dumps(result)[:200]}")
-    except Exception as exc:
-        s2.no(f"{type(exc).__name__}: {exc}  (A2/A3)")
         return report(steps, args, proc, tmp, args.keep_socket)
     print(f"  {s2.verdict}: {s2.detail}")
 
@@ -293,6 +341,25 @@ def extract_ids(result: Any) -> list[str]:
     return out
 
 
+def drain(proc: subprocess.Popen[str] | None) -> str:
+    """Whatever app-server wrote to stdout/stderr. Run 1 printed this ONLY when
+    the process died early, so a server that closed a connection and explained
+    why had its explanation thrown away — the single most useful line in the
+    run, discarded by the script meant to diagnose it."""
+    if not proc or not proc.stdout:
+        return ""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    try:
+        return proc.stdout.read() or ""
+    except Exception:
+        return ""
+
+
 def report(
     steps: list[Step],
     args: argparse.Namespace,
@@ -300,6 +367,11 @@ def report(
     tmp: Path | None = None,
     keep: bool = False,
 ) -> int:
+    server_output = drain(proc)
+    if server_output.strip():
+        hr("What app-server itself said")
+        for line in server_output.strip().splitlines()[-40:]:
+            print(f"  {line}")
     hr("Result")
     for s in steps:
         print(f"  {s.n}. [{s.verdict:11}] {s.question}\n        {s.detail}")
