@@ -152,10 +152,11 @@ see [findings.md](findings.md#test-5-can-a-foreign-process-drive-a-codex-turn-20
 section is the design, not the evidence.
 
 ```
-spanreed codex --name reviewer --cwd ~/git/foo
+spanreed codex --name reviewer --cwd ~/git/foo \
+               --model gpt-5.6-sol --effort medium
   ├─ spawn `codex app-server --listen unix://<private socket>`
   ├─ initialize + initialized          (the notification is mandatory)
-  ├─ thread/start --cwd                (one thread, owned for the worker's life)
+  ├─ thread/start --cwd --model …      (one thread, owned for the worker's life)
   ├─ register in the registry          (ordinary agent row; peers address it normally)
   ├─ tail inbox → turn/start           (one turn per message, FIFO)
   ├─ item/agentMessage/delta → reply back to the sender
@@ -172,6 +173,34 @@ status" above), and `last_seen` has been shown unreliable in practice
 **Quota is observable.** `account/rateLimits/updated` arrives unprompted during a turn. A worker
 burning the owner's ChatGPT allowance can say so on the bus instead of failing opaquely later.
 
+### Startup configuration
+
+The worker's model, reasoning effort and persona are fixed when it starts. The parameter names
+below are taken from `codex app-server generate-json-schema`, which is authoritative and on disk —
+they are not guesses, and the split between the two calls is real:
+
+| Flag | Passed on | Notes |
+|---|---|---|
+| `--cwd` | `thread/start` | **Required, no default.** See below. |
+| `--model` | `thread/start`, re-sent per `turn/start` | Ids come from `models_cache.json`. |
+| `--effort` | **`turn/start` only** | Not accepted by `thread/start`. A worker-level effort must therefore be re-applied on every turn — it cannot be set once at thread creation. |
+| `--personality` | both | |
+| `--service-tier` | both | `serviceTierForTurn` also exists, turn-only. |
+| `--instructions` | `thread/start` | Maps to `baseInstructions` / `developerInstructions`. This is where a worker is told it is *on a bus*: who its peers are, that input is mail from another agent, and that its reply is sent back as mail. Without it the worker behaves like a terminal session that does not know why it is being spoken to. |
+
+**`config` is prohibited.** `thread/start` accepts a per-thread `config` override and we must never
+send one: on the version this was validated against, any `config` override makes subsequent turns
+hang silently — no notifications, no error, no timeout
+([openai/codex#45361](https://github.com/openai/codex/issues/45361)). Given that a silent turn hang
+is precisely the failure this spike spent thirty runs mistaking for a protocol problem, this is
+written down as a rule rather than left to be rediscovered.
+
+**Senders cannot override any of it** (owner decision, 2026-09-15). `effort`, `model` and the rest
+are per-turn parameters, so a message *could* carry them; it may not. Cost and model choice stay a
+property of how the worker was started, not of who mailed it — which matters because "any registered
+agent may wake it" means senders are unauthenticated, and an override would let one burn the owner's
+quota at will.
+
 ### Controls
 
 Decided by the owner, 2026-09-15, in the session that closed the spike.
@@ -182,6 +211,7 @@ Decided by the owner, 2026-09-15, in the session that closed the spike.
 | Who may wake it | **Any registered agent** | Consistent with the trust model above — "if it's on the bus you can trust it". No allowlist. |
 | Concurrency | **Queue, FIFO** | One turn per message, each with its own reply. Senders may wait. Codex's native `steer` is deliberately *not* used: a steered turn produces one reply for two senders' messages, which the bus has no way to express. |
 | Thread lifetime | **One thread per worker** | Context accumulates, so a worker remembers its conversation the way a Claude session does. History growth is a token cost, not a correctness problem. |
+| Startup config | **Fixed at start; senders cannot override** | Model, effort and persona are worker flags. A message may not change them, so cost is a property of how the worker was launched. See "Startup configuration" above. |
 
 ### `--cwd` is the security boundary, and it is required
 
