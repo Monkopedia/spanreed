@@ -169,6 +169,58 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# Run 28: the singleton is dead too, and one real answer fell out
+
+```
+app-server-startup.lock free — not a held lock
+01a0a666-…lock is HELD by a live process
+01a0a669-…lock is HELD by a live process
+```
+
+No per-machine singleton. Seven causes proposed across this investigation, seven
+wrong. For the record, in order: writer lock on the target thread, unanswered
+server requests, leaked servers, DB contention, TLS interception, thread volume
+(#45246), app-server singleton.
+
+## The one thing that is now settled
+
+The two held locks are the threads the human has open in the TUI, and they are
+held by **live** processes — confirmed by `flock`, not inferred from a file's
+existence.
+
+That answers the question this spike was built for, at least by half:
+
+> **A foreign client cannot drive a thread a human has open.** Codex takes a
+> per-thread writer lock and holds it for the life of the session.
+
+So the original framing of step 4 — "start a turn in a thread someone else is
+using" — is not a thing Codex will ever permit. Spanreed would have to own its
+thread. Whether *that* works is still unknown, because `thread/start` has never
+returned on this machine.
+
+## A label this spike got wrong
+
+Run 28 printed, for two perfectly ordinary thread locks:
+
+```
+01a0a666-….lock is HELD by a live process — a singleton is in force
+```
+
+Those two facts are unrelated. The startup lock being held would mean a
+per-machine singleton; a per-thread writer lock being held means somebody has
+that thread open, which is the normal state of a working editor. One message was
+written for the first case and applied to every lock file, turning the expected
+into an alarm. The two cases now say different things, and a free thread lock is
+no longer reported at all — it is not news.
+
+## What has not been read yet
+
+`spike-server.log` — the untruncated server log — has been written on the last
+three runs and not yet examined. It is the only artifact that contains
+`remote_control_url=…` and the `http.method`/URL of the two online calls that
+start at boot and never complete. Every remaining theory is guesswork until it
+is read.
+
 # Run 26: 240s, four threads, and three of this spike's own probes found blind
 
 240s also timed out. And the state store now reads:

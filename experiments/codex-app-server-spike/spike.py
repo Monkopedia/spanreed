@@ -628,14 +628,27 @@ def probe_lock_files(home: Path) -> None:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             # EWOULDBLOCK/EAGAIN: somebody else has it right now.
+            # Say which lock, because the two mean opposite things. The
+            # startup lock held would mean a per-machine singleton. A
+            # per-thread writer lock held just means someone has that thread
+            # open, which is normal and expected. Run 28 printed "a singleton
+            # is in force" for two ordinary thread locks.
+            if lf.parent.name == "thread-writer-locks":
+                claim = (
+                    f"thread {lf.stem} is HELD by a live process — a foreign client "
+                    "cannot drive that thread"
+                )
+            else:
+                claim = f"{lf.name} is HELD — a per-machine singleton is in force"
             print(f"  {lf.name}: HELD by another process ({exc.strerror})")
-            FACTS.append(f"{lf.name} is HELD by a live process — a singleton is in force")
+            FACTS.append(claim)
             fh.close()
             continue
         fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         fh.close()
         print(f"  {lf.name}: free (nobody holds it)")
-        FACTS.append(f"{lf.name} free — not a held lock")
+        if lf.parent.name != "thread-writer-locks":
+            FACTS.append(f"{lf.name} free — no per-machine singleton")
 
 
 def probe_state_db(home: Path) -> None:
