@@ -1683,6 +1683,13 @@ def main() -> int:
         # with issues open against codex itself.
         lockdir = home / "thread-writer-locks"
         hits = sorted(lockdir.glob(f"*{target}*")) if lockdir.is_dir() else []
+        if hits and args.fresh:
+            # We created this thread seconds ago, so of course we hold its
+            # writer lock. Run 29 printed "expect a refusal/hang" about our own
+            # thread and then drove a turn in it successfully -- a warning that
+            # its own run disproved four lines later.
+            print(f"  writer lock on {target} is OURS (we just created it) — expected")
+            hits = []
         if hits:
             for f in hits:
                 body = ""
@@ -1898,7 +1905,34 @@ def main() -> int:
                     f"        turn/start on inbound mail. Nothing above blocks that design."
                 )
             else:
-                s4.ok(f"turn/start accepted: {json.dumps(res)[:200]}")
+                # Accepted is not completed. Wait for a terminal turn event
+                # before claiming the turn ran.
+                print(
+                    f"  turn/start accepted; waiting for it to COMPLETE (up to {args.turn_timeout:.0f}s)"
+                )
+                done, marker, evts = wait_for_turn(
+                    sock, buf, wire, SPIKE_MARKER, args.turn_timeout, watch
+                )
+                kinds = ", ".join(sorted(set(evts))[:8]) or "none"
+                FACTS.append(f"turn events after accept: {kinds}")
+                if marker:
+                    s4.ok(
+                        f"turn COMPLETED and the model replied with {SPIKE_MARKER}. Events: {kinds}"
+                    )
+                elif done:
+                    s4.ok(
+                        f"turn reached a terminal state (events: {kinds}) but the reply did "
+                        f"not contain {SPIKE_MARKER} — it ran; check the transcript for what "
+                        f"it said"
+                    )
+                else:
+                    s4.verdict = "PARTIAL"
+                    s4.detail = (
+                        f"turn/start was ACCEPTED ({json.dumps(res)[:90]}) but no terminal "
+                        f"turn event arrived within {args.turn_timeout:.0f}s.\n"
+                        f"        Events seen: {kinds}. Accepted is not completed — the "
+                        f"protocol works, the turn is unproven."
+                    )
         except Exception as exc:
             if seen_notifications:
                 # The turn ran. That answers step 4 even without the response.
@@ -1946,6 +1980,67 @@ def main() -> int:
     print(f"  {s4.verdict}: {s4.detail}")
 
     return report(steps, args, proc, tmp, args.keep_socket)
+
+
+def wait_for_turn(
+    sock: socket.socket,
+    buf: bytearray,
+    style: str,
+    marker: str,
+    timeout: float,
+    on_notify: Any = None,
+) -> tuple[bool, bool, list[str]]:
+    """Read notifications until the turn reaches a terminal state.
+
+    Returns (completed, marker_seen, statuses).
+
+    turn/start returning `status: "inProgress"` means the server ACCEPTED the
+    turn. Run 29 reported that as "can drive a turn", then immediately killed
+    the server -- the shutdown appears in its own log two lines later, with the
+    turn still pending. Accepted and completed are different claims, and only
+    one of them was ever observed.
+    """
+    deadline = time.monotonic() + timeout
+    statuses: list[str] = []
+    completed = marker_seen = False
+    while time.monotonic() < deadline and not completed:
+        if style == "ws":
+            got = ws_decode(buf)
+            if got is not None:
+                opcode, payload, used = got
+                del buf[:used]
+                if opcode == 0x9:
+                    sock.sendall(ws_encode(payload, 0xA))
+                    continue
+                if opcode not in (0x1, 0x2):
+                    continue
+                try:
+                    msg = json.loads(payload.decode(errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                method = msg.get("method")
+                if method and msg.get("id") is not None:
+                    handle_server_request(sock, msg, style)
+                    continue
+                if method:
+                    statuses.append(method)
+                    blob = json.dumps(msg.get("params") or {})
+                    if on_notify:
+                        on_notify(method, msg.get("params") or {})
+                    if marker in blob:
+                        marker_seen = True
+                    if method in ("turn/completed", "turn/failed", "turn/aborted"):
+                        completed = True
+                continue
+        try:
+            sock.settimeout(max(0.5, min(5.0, deadline - time.monotonic())))
+            chunk = sock.recv(65536)
+        except (TimeoutError, OSError):
+            continue
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return completed, marker_seen, statuses
 
 
 def extract_ids(result: Any) -> list[str]:

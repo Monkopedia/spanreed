@@ -169,6 +169,81 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# Run 29: all four steps pass. The pipe was the whole thing.
+
+```
+3. [PASS] Can it see threads — including ones a human has open?
+      3 distinct thread id(s) visible to a non-owning client
+4. [PASS] Can it create its OWN thread and drive a turn in it?
+      turn/start accepted
+```
+
+`thread/list` answered in **0.0s** — the same call that had just timed out at
+20s, 90s and 240s across fifteen runs. `thread/start` created a thread.
+`turn/start` was accepted. And the captured server log went from a constant
+~123 lines to **4038**.
+
+Nothing about Codex changed. The spike stopped holding its breath.
+
+## What is actually established now
+
+- A separate process **can** spawn app-server, connect over a unix socket,
+  initialize, list threads, create its own thread, and start a turn in it.
+- `thread/resume` on a brand-new thread returns a clean error — `no rollout
+  found for thread id …` — rather than hanging. Errors were always available;
+  we were preventing the server from producing them.
+- MCP servers start per-thread and announce themselves:
+  `mcpServer/startupStatus/updated` for `node_repl`, `cua_repl`, `codex_apps`.
+- Threads a human has open stay flock-held by live processes, so driving
+  *those* remains impossible. Owning our own thread is the supported path, and
+  it works.
+
+**For spanreed this is the answer, and it is yes:** spawn the server, own the
+thread, `turn/start` on inbound mail. A Codex session can be a bus peer.
+
+## Two things this run claimed that it had not shown
+
+**The turn never ran.** `turn/start` returned `status: "inProgress"`, the spike
+called that a pass, and `report()` terminated the server immediately — the
+shutdown is in its own log two lines below the success:
+
+```
+received shutdown signal; entering graceful restart drain
+(connections=1, runningAssistantTurns=0, requests still a…)
+```
+
+*Accepted* and *completed* are different claims and only one was observed.
+`wait_for_turn()` now reads until a terminal turn event: the marker in a reply
+is a PASS, a terminal event without it is a PASS with the caveat stated, and an
+accept with no terminal event is **PARTIAL** — which is what run 29 actually
+earned. Verified both ways against a stub.
+
+**The writer-lock warning fired on our own thread.** `target thread … HAS a
+writer-lock file — expect a refusal/hang`, printed about a thread this script
+had created four lines earlier, and then contradicted by the same run driving a
+turn in it. A lock we hold on a thread we just made is the expected state, and
+it now says so.
+
+## The count
+
+Eight causes proposed, eight wrong, one real:
+
+| # | Proposed | Killed by |
+| --- | --- | --- |
+| 1 | writer lock on the target thread | `thread/start` hung too, on a thread that did not exist |
+| 2 | unanswered server→client requests | `REQUESTS seen: NONE` |
+| 3 | leaked app-servers | `LEAKED: 0` once the filter stopped hiding them |
+| 4 | sqlite contention | plain read-only open succeeded on every file |
+| 5 | TLS interception | real handshake, public CA issuers |
+| 6 | thread volume (#45246) | `threads has 4 row(s)` |
+| 7 | per-machine singleton | `app-server-startup.lock free` |
+| 8 | MCP startup timeout | 240s cleared it and nothing changed |
+| — | **an unread pipe blocking the server's `write()`** | **the fix; all four steps pass** |
+
+Each of the eight explained the evidence available when it was proposed. The
+real cause was in a number this script printed in every run since run 3 — `123
+lines total` — identical every time, and never once read as a measurement.
+
 # Run 28, resolved: the spike was strangling the server it was measuring
 
 The untruncated server log ends **7 milliseconds** after `thread/list` arrives,
