@@ -169,6 +169,51 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# Run 25: "codex works fine" — so the thing that is broken is ours
+
+The owner confirmed the Codex TUI works normally on the target machine. That
+retires the whole class of theories at once: the account is valid, the network
+reaches the model service, sandboxing works, the store is fine. Everything
+app-server needs, Codex has, right now, on that machine.
+
+What does not work is the app-server **this script spawns**.
+
+## We were looking for the working server in the wrong directory
+
+Our own spawned server logs this, in every run since 22:
+
+```
+app-server control socket listening socket_path=/var/folders/8c/y...
+```
+
+`/var/folders/...` is **TMPDIR** on macOS. Step 0 globbed `CODEX_HOME` for
+`*.sock`, found nothing, printed "No existing sockets under CODEX_HOME", and
+spawned a second server beside the working one — twenty-five times. The log line
+naming the real location was four lines below that message in every run.
+
+Step 0 now searches TMPDIR as well, and reads `app-server-control/`: any
+absolute path in there that is a live socket is treated as an advertised
+endpoint and added to the candidate list. That directory is how a running server
+tells other clients where to reach it, and the spike has printed its contents
+since run 8 without ever acting on them.
+
+Verified end to end against a stand-in "TUI" server on a TMPDIR socket: the
+spike finds it, connects to it instead of spawning, and lists its threads.
+
+## Why every run was pasted back with its head cut off
+
+Twenty-five runs were reported as their last screenful, because step 0 — the
+inventory that holds sockets, config, processes, sign-in — scrolls off the top.
+So each round of analysis worked from the one section that contained the fewest
+facts.
+
+The run now tees itself to `./spike-run.log` and prints that path at the very
+bottom, where it cannot scroll away. **Send the file, not the tail.**
+
+That is the sixth instance in this README of the same defect: a diagnostic that
+exists but cannot be read is not a diagnostic. It has cost more runs here than
+any single wrong theory.
+
 # Run 24: TLS is clean, and the official docs name three causes — all in a file we never opened
 
 The real TLS probe came back clean: `issuer=Let's Encrypt`,

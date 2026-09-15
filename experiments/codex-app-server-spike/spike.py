@@ -485,6 +485,34 @@ def probe_auth(home: Path) -> None:
 SECRETISH = ("key", "token", "secret", "password", "passwd", "credential", "authorization")
 
 
+class Tee:
+    """Write to the terminal and to a file at once.
+
+    Every run so far has been pasted back as its last screenful, because the
+    interesting part -- step 0, which inventories sockets, config and processes
+    -- scrolls off the top. Diagnostics that only exist in scrollback are
+    diagnostics nobody reads, which this script has now demonstrated about six
+    times. So write the whole run to a file and say where it is.
+    """
+
+    def __init__(self, stream: Any, path: Path) -> None:
+        self.stream = stream
+        self.fh = path.open("w", encoding="utf-8")
+
+    def write(self, data: str) -> int:
+        self.stream.write(data)
+        self.fh.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.stream.flush()
+        self.fh.flush()
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self.fh.close()
+
+
 def probe_config(home: Path) -> None:
     """Print config.toml, redacted, and name the settings documented to hang.
 
@@ -822,6 +850,13 @@ def main() -> int:
         "and anything you started are never touched.",
     )
     ap.add_argument(
+        "--log",
+        default=None,
+        help="write the COMPLETE run to this file (default ./spike-run.log). Send "
+        "this file rather than pasting the tail -- step 0 holds the inventory and "
+        "it is the part that scrolls away.",
+    )
+    ap.add_argument(
         "--fresh",
         action="store_true",
         help="create a NEW thread with thread/start and drive that, instead of an "
@@ -868,6 +903,11 @@ def main() -> int:
     )
     args = ap.parse_args()
     install_reaper()
+
+    log_path = Path(args.log) if args.log else Path.cwd() / "spike-run.log"
+    tee = Tee(sys.stdout, log_path)
+    sys.stdout = tee  # type: ignore[assignment]
+    atexit.register(tee.close)
 
     steps = [
         Step(1, "Does `codex app-server` start under this machine's sign-in?"),
@@ -981,6 +1021,27 @@ def main() -> int:
             print(f"    {kind:4} {sub.name}{extra}")
         for sock_file in home.rglob("*.sock"):
             existing.append(sock_file)
+    # The working server does not put its socket in CODEX_HOME. Our own spawned
+    # one logs "app-server control socket listening socket_path=/var/folders/..."
+    # -- that is TMPDIR. Every run globbed CODEX_HOME only, found nothing, and
+    # spawned a second server alongside the one that works. Look where the log
+    # says it is.
+    tmpdir = Path(os.environ.get("TMPDIR") or "/tmp")
+    print(f"\n  Searching TMPDIR for app-server sockets: {tmpdir}")
+    found_tmp = 0
+    for pattern in ("codex*/**/*.sock", "codex*.sock", "**/app-server*.sock", "**/app.sock"):
+        try:
+            for sock_file in tmpdir.glob(pattern):
+                if SOCK_PREFIX in str(sock_file):
+                    continue  # one of ours, from this run or an earlier one
+                if sock_file not in existing:
+                    existing.append(sock_file)
+                    found_tmp += 1
+                    print(f"    {sock_file}")
+        except OSError as exc:
+            print(f"    {pattern}: {exc}")
+    print(f"  TMPDIR sockets found: {found_tmp}")
+    FACTS.append(f"{found_tmp} app-server socket(s) found in TMPDIR (not CODEX_HOME)")
     live: list[Path] = []
     if existing:
         print("\n  SOCKETS FOUND — probing each, because a socket file outliving its")
@@ -1032,10 +1093,25 @@ def main() -> int:
     control = home / "app-server-control"
     if control.is_dir():
         print("\n  app-server-control/ — a running server may advertise itself here:")
-        for f in sorted(control.iterdir()):
+        entries = sorted(control.iterdir())
+        FACTS.append(f"app-server-control/ has {len(entries)} entry(ies)")
+        for f in entries:
             try:
                 body = f.read_text(errors="replace").strip()
                 print(f"    {f.name}: {body[:400]}")
+                # A path in here is an advertised endpoint: that is how the
+                # running server tells other clients where to reach it.
+                for tok in body.replace('"', " ").replace(",", " ").split():
+                    cand = Path(tok)
+                    if (
+                        tok.startswith("/")
+                        and cand.exists()
+                        and cand.is_socket()
+                        and cand not in existing
+                    ):
+                        existing.append(cand)
+                        print(f"      -> advertises a live socket, added: {cand}")
+                        FACTS.append(f"app-server-control advertises socket {cand}")
             except OSError as exc:
                 print(f"    {f.name}: unreadable ({exc})")
 
@@ -1879,6 +1955,13 @@ def report(
         tmp.rmdir()
     elif tmp and keep:
         print(f"\n  socket dir kept at {tmp}")
+
+    out = sys.stdout
+    if isinstance(out, Tee):
+        out.flush()
+        print(f"\n  FULL LOG WRITTEN TO: {out.fh.name}")
+        print("  Send that file. It has step 0 — sockets, config, processes — which is")
+        print("  where the answer has been sitting, unreadable, for several runs.")
 
     return 0 if verdicts[4] in ("PASS", "PARTIAL") else 1
 
