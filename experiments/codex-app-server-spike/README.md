@@ -169,6 +169,64 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# Run 25 (full log): step 0 was the answer all along
+
+The owner sent a complete run for the first time. Step 0 — the section every
+previous paste cut off — contained two facts that reframe everything above.
+
+## 1. The fuse is still below a documented ceiling, and the ceiling is in this config
+
+```toml
+[mcp_servers.node_repl]
+command = "/Applications/ChatGPT.app/.../node_repl"
+startup_timeout_sec = 120
+```
+
+`--timeout` was 90. **An MCP server on this machine is configured to take up to
+120 seconds to start.** A call that initialises it can legitimately block longer
+than our fuse, so "timed out after 90.0s" measured this script's patience for a
+second time. Run 22 raised 20 to 90 by reading an upstream issue; the actual
+number was sitting in the user's own config, which we had not read.
+
+The spike now scans for `startup_timeout_sec` and **raises its own timeout to
+twice the largest value found**, saying so in Key facts.
+
+## 2. thread/list reads a database this spike never opened
+
+`thread/list` reads the *state* store.
+[#45246](https://github.com/openai/codex/issues/45246) names the file:
+`state_5.sqlite`, and says the call's cost scales with the number of unarchived
+threads in it. It is listed in step 0 of every run.
+
+Runs 22-25 probed `thread_history*.sqlite`, reported it healthy in 0.00s, and
+put that in Key facts as "state DB readable directly" — a label that claimed the
+state DB while reading a different file. The probe now opens **every** `.sqlite`
+in `CODEX_HOME` and counts thread rows in each.
+
+## 3. What step 0 rules out
+
+- `LEAKED spanreed-spike servers: 0` — the reaper works.
+- `codex processes running: 3`, none of them an `app-server`. The TUI does not
+  expose one, so there is no existing server to join; spawning is correct after
+  all.
+- `app-server-control/` holds one file, `app-server-startup.lock`, **empty**.
+- `thread-writer-locks/` holds a lock for `01a0a590-…`, a *different* thread
+  from the one we were driving.
+- `auth.json` is 124 hours old with keys `OPENAI_API_KEY, auth_mode,
+  last_refresh, tokens` and no recognised expiry field.
+
+## Two overstatements in this spike's own output, fixed
+
+Writing the above surfaced two labels that claimed more than the evidence:
+
+- `3 MCP server(s), 0 required  <-- documented cause of thread/start hanging`.
+  The documented cause is a **required** server failing. With zero required, the
+  correct statement is that startup may be *delayed* by up to
+  `startup_timeout_sec` — a different claim. It now says which one applies.
+- `thread_items: 201  <-- LARGE`. #45246 is about the number of **threads**, not
+  rows of item detail. 201 items is a chatty conversation, not a finding. The
+  flag now applies only to tables that count threads, at a threshold of 500.
+
 # Run 25: "codex works fine" — so the thing that is broken is ours
 
 The owner confirmed the Codex TUI works normally on the target machine. That

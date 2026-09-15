@@ -484,6 +484,10 @@ def probe_auth(home: Path) -> None:
 
 SECRETISH = ("key", "token", "secret", "password", "passwd", "credential", "authorization")
 
+# startup_timeout_sec values found in config.toml. Our own fuse has to clear the
+# largest of them or a timeout says nothing about Codex.
+CONFIG_TIMEOUTS: list[int] = []
+
 
 class Tee:
     """Write to the terminal and to a file at once.
@@ -543,6 +547,13 @@ def probe_config(home: Path) -> None:
             line = f"{line.split('=')[0]}= <redacted>"
         print(f"    {line[:150]}")
 
+    # A configured startup timeout is a floor on how long a call that starts MCP
+    # servers can block. Timing out below it measures our own patience.
+    for m in re.finditer(r"startup_timeout_sec\s*=\s*(\d+)", text):
+        secs = int(m.group(1))
+        CONFIG_TIMEOUTS.append(secs)
+        print(f"  startup_timeout_sec = {secs}  (an MCP server may block a call this long)")
+
     mcp = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("[mcp_servers")]
     required = [ln.strip() for ln in text.splitlines() if "required" in ln.lower()]
     print(f"\n  MCP servers configured: {len(mcp)}")
@@ -554,9 +565,21 @@ def probe_config(home: Path) -> None:
         for r in required:
             print(f"    {r}")
     # Unconditional, both ways: "configured: 0" is a result, not an absence.
+    # Be exact about which claim the evidence supports. The docs say a REQUIRED
+    # MCP server that fails to initialize makes thread/start fail; servers that
+    # are merely configured can DELAY a call by up to startup_timeout_sec, which
+    # is a different statement. Run 25 printed the strong one on a config with
+    # zero required servers.
+    if required:
+        verdict = "  <-- documented cause: a required server that fails kills thread/start"
+    elif mcp and CONFIG_TIMEOUTS:
+        verdict = f"  <-- none required, but startup may block up to {max(CONFIG_TIMEOUTS)}s"
+    elif mcp:
+        verdict = "  <-- none required; these can delay startup but not fail the call"
+    else:
+        verdict = "  <-- no MCP servers: this documented cause is RULED OUT"
     FACTS.append(
-        f"config.toml: {len(mcp)} MCP server(s), {len(required)} `required` line(s)"
-        + ("  <-- documented cause of thread/start hanging" if mcp else "")
+        f"config.toml: {len(mcp)} MCP server(s), {len(required)} `required` line(s){verdict}"
     )
 
 
@@ -570,9 +593,14 @@ def probe_state_db(home: Path) -> None:
     and not in this client. Opening read-only means this probe cannot be the
     thing that locks it.
     """
-    dbs = sorted(home.glob("thread_history*.sqlite"))
+    # Every .sqlite, not just thread_history*. thread/list reads the STATE db --
+    # openai/codex#45246 names state_5.sqlite specifically and says the call
+    # scales with the number of unarchived threads in it. Runs 22-25 read
+    # thread_history_1.sqlite, reported it healthy, and never opened the file
+    # the slow call actually uses.
+    dbs = sorted(home.glob("*.sqlite"))
     if not dbs:
-        print("  no thread_history*.sqlite under CODEX_HOME — nothing to read directly")
+        print("  no *.sqlite under CODEX_HOME — nothing to read directly")
         return
     for db in dbs:
         sidecars = [x.name for x in home.glob(db.name + "-*")]
@@ -593,10 +621,24 @@ def probe_state_db(home: Path) -> None:
                     f"    opened in {time.monotonic() - t0:.2f}s; tables: {', '.join(tables[:8])}"
                 )
                 for t in tables:
-                    if "thread" in t.lower():
-                        n = con.execute(f"select count(*) from {t}").fetchone()[0]
-                        print(f"    {t}: {n} row(s)")
-                        FACTS.append(f"state DB readable directly: {t} has {n} row(s)")
+                    if "thread" not in t.lower() and "session" not in t.lower():
+                        continue
+                    n = con.execute(f"select count(*) from {t}").fetchone()[0]
+                    # #45246: thread/list cost scales with unarchived threads.
+                    # A big number here is the measurement, not trivia.
+                    # #45246 is about the number of THREADS, not rows of item
+                    # or turn detail. Flagging thread_items at 201 would read as
+                    # a finding when it is just a chatty conversation.
+                    counts_threads = "thread" in t.lower() and not any(
+                        w in t.lower() for w in ("item", "turn", "projection", "realtime")
+                    )
+                    note = (
+                        "  <-- LARGE: thread/list scales with thread count (#45246)"
+                        if counts_threads and n >= 500
+                        else ""
+                    )
+                    print(f"    {t}: {n} row(s){note}")
+                    FACTS.append(f"{db.name}: {t} has {n} row(s){note}")
             finally:
                 con.close()
         except sqlite3.Error as exc:
@@ -1166,6 +1208,19 @@ def main() -> int:
 
     print("\n  Config — the three documented reasons these calls hang:")
     probe_config(home)
+
+    if CONFIG_TIMEOUTS and args.timeout <= max(CONFIG_TIMEOUTS):
+        raised = max(CONFIG_TIMEOUTS) * 2.0
+        print(
+            f"\n  RAISING --timeout from {args.timeout:.0f}s to {raised:.0f}s: config allows an "
+            f"MCP server {max(CONFIG_TIMEOUTS)}s to start,"
+        )
+        print("  so anything shorter measures this script's patience, not Codex.")
+        FACTS.append(
+            f"--timeout auto-raised {args.timeout:.0f}s -> {raised:.0f}s "
+            f"(config startup_timeout_sec={max(CONFIG_TIMEOUTS)})"
+        )
+        args.timeout = raised
 
     print("\n  Sign-in state (shapes and times only, never a credential):")
     probe_auth(home)
