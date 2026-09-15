@@ -98,7 +98,9 @@ possible but invisible, which is a different answer from either yes or no.
 
 ---
 
-# ANSWER: no, not today. Eight runs, codex-cli 0.154.0, macOS.
+# SUPERSEDED — see "The cause, found on run 13" at the end. The conclusion below was drawn while the client was still mis-calling the server.
+
+# ~~ANSWER: no, not today.~~ Eight runs, codex-cli 0.154.0, macOS.
 
 **A Codex TUI session cannot be reached by another process.** Not via IPC —
 nothing is listening. Not via a second app-server — it is locked out of the
@@ -163,3 +165,59 @@ What the script got right is that every one of those was reported as **the
 script being wrong**, never as Codex refusing. That distinction is why the
 conclusion above can be trusted: the failures that were mine were labelled mine,
 and the one that is Codex's is the only one left.
+
+
+---
+
+# The cause, found on run 13
+
+**`thread/list` consults remote sources by default, and that request never
+returns on this network.** Passing the flag the schema already named fixes it:
+
+```
+thread/list [local DB only]  {"useStateDbOnly": true}   ANSWERED in 0.0s
+thread/list [default]        {}                          4 timeouts, to t+115s
+```
+
+Same run, same server, same connection. The contrast is the measurement.
+
+And it returned a thread **this script did not create** —
+`01a0a1a9-7892-7292-b341-81998259f405`, persisted from an earlier session. So
+step 3 is a real pass, not a self-created substitute.
+
+## What this retracts
+
+Everything above about the TUI exposing nothing is **suspect and probably
+wrong**. Every attempt to enumerate a human's threads was made with a call that
+could not return, so "no threads visible" was never evidence about visibility.
+The earlier conclusion should not be cited until re-tested.
+
+## The wrong answers, in order
+
+Each was stated with more confidence than it had earned, and each was
+falsified by the next run:
+
+| # | explanation | killed by |
+|---|---|---|
+| 1 | sqlite lock contention with the TUI | zero codex processes, still hung |
+| 2 | startup warmup / network fetches in flight | retries to t+115s |
+| 3 | missing `initialized` handshake | real, and necessary — but not sufficient |
+| 4 | `experimentalApi` gate | accepted, hang persisted |
+| 5 | wrong/missing params | `required: []` — `{}` was always valid |
+| 6 | **remote lookups on a blocked network** | **confirmed: the flag fixes it** |
+
+Five wrong, one right. The right one came from reading the `accepts` list the
+script had been printing for two runs — `sourceKinds`, `originators`,
+`useStateDbOnly` — rather than from reasoning about the logs.
+
+## The transferable part
+
+The script's value was never its correctness. It was wrong repeatedly and in
+ways that produced confident, plausible failure reports. What made the answer
+reachable is that every failure named **which assumption** it implicated, so a
+wrong guess cost one run instead of becoming the conclusion.
+
+The thing that actually ended it was going back to primary sources — the docs
+for the handshake, and the machine's own schema for the parameters. Both had
+been available from the first run. Nine runs of inference from logs produced
+five wrong answers; two readings of the spec produced the two right ones.

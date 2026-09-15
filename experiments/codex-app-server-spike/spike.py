@@ -427,6 +427,33 @@ def dump_schema(codex: str) -> list[tuple[str, Any]]:
                 for field in req:
                     spec = (target.get("properties") or {}).get(field, {})
                     print(f"          {field}: {json.dumps(spec)[:140]}")
+                    # Follow one more level. turn/start's `input` is an array of
+                    # UserInput, and {"type":"text","text":...} has been assumed
+                    # since the first draft without ever being checked — the same
+                    # move that made thread/list's params invented for 12 runs.
+                    nested = (spec.get("items") or {}).get("$ref") or spec.get("$ref")
+                    if nested:
+                        inner = defs.get(nested.rsplit("/", 1)[-1])
+                        if inner is not None:
+                            SCHEMA_PARAMS[f"{want}.{field}"] = inner
+                            variants = inner.get("oneOf") or inner.get("anyOf") or []
+                            print(f"          {field} -> {nested.rsplit('/', 1)[-1]}:")
+                            if variants:
+                                for v in variants[:4]:
+                                    vp = list((v.get("properties") or {}).keys())
+                                    vr = v.get("required", [])
+                                    print(f"              variant required={vr} accepts={vp}")
+                                    for rf in vr:
+                                        sp = (v.get("properties") or {}).get(rf, {})
+                                        if "const" in sp or "enum" in sp:
+                                            print(
+                                                f"                {rf} = {json.dumps(sp.get('const', sp.get('enum')))}"
+                                            )
+                            else:
+                                print(
+                                    f"              required={inner.get('required', [])} "
+                                    f"accepts={list((inner.get('properties') or {}).keys())}"
+                                )
                 SCHEMA_PARAMS[want] = target
                 built = _minimal_params(target, str(Path.home()))
                 missing = [f for f in req if f not in built]
@@ -909,6 +936,12 @@ def main() -> int:
             "only shows you can look, not that you can act."
         )
     else:
+        user_input = SCHEMA_PARAMS.get("turn/start.input")
+        if user_input:
+            print("  UserInput schema was resolved — see step 2a for the accepted shape.")
+        else:
+            print("  UserInput schema NOT resolved; falling back to {'type':'text','text':...},")
+            print("  which is an assumption this spike has never verified.")
         prompt = (
             f"This is an automated connectivity probe. Reply with exactly "
             f"{SPIKE_MARKER} and nothing else. Do not use any tools, do not read "
