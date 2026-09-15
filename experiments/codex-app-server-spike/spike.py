@@ -178,6 +178,27 @@ def ws_decode(buf: bytearray) -> tuple[int, bytes, int] | None:
     return opcode, payload, off + n
 
 
+MISSING = object()
+
+
+def find_key(obj, key):
+    """First value for `key` anywhere in a nested JSON structure, else MISSING.
+
+    Returned as-is, so callers can tell False apart from absent -- the whole
+    point here is that an explicit false is a different answer from silence.
+    """
+    stack = [obj]
+    while stack:
+        cur = stack.pop(0)
+        if isinstance(cur, dict):
+            if key in cur:
+                return cur[key]
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return MISSING
+
+
 def frame(payload: bytes, style: str) -> bytes:
     """`jsonl` = one JSON object per line. `lsp` = a Content-Length header first,
     as LSP and MCP-over-stdio use. Run 1 assumed jsonl and the server hung up
@@ -442,6 +463,7 @@ def dump_schema(codex: str) -> list[tuple[str, Any]]:
                     # since the first draft without ever being checked — the same
                     # move that made thread/list's params invented for 12 runs.
                     nested = (spec.get("items") or {}).get("$ref") or spec.get("$ref")
+                    _ = nested  # (kept below)
                     if nested:
                         inner = defs.get(nested.rsplit("/", 1)[-1])
                         if inner is not None:
@@ -465,6 +487,19 @@ def dump_schema(codex: str) -> list[tuple[str, Any]]:
                                     f"accepts={list((inner.get('properties') or {}).keys())}"
                                 )
                 SCHEMA_PARAMS[want] = target
+                # Print the OPTIONAL fields that gate interactivity, resolving
+                # their refs. Run 18 blocked with no notifications and these are
+                # the only knobs that plausibly cause that.
+                for gate in ("approvalPolicy", "sandboxPolicy", "turnTrigger"):
+                    gspec = (target.get("properties") or {}).get(gate)
+                    if not gspec:
+                        continue
+                    gref = gspec.get("$ref")
+                    ginner = defs.get(gref.rsplit("/", 1)[-1]) if gref else gspec
+                    vals = (ginner or {}).get("enum") or (ginner or {}).get("oneOf")
+                    print(
+                        f"          {gate}: {json.dumps(vals)[:200] if vals else json.dumps(ginner)[:200]}"
+                    )
                 built = _minimal_params(target, str(Path.home()))
                 missing = [f for f in req if f not in built]
                 print(f"          -> will send: {json.dumps(built)}")
@@ -1063,8 +1098,88 @@ def main() -> int:
             detail = json.dumps(params)[:100]
             print(f"    <- {method}  {detail}")
 
-        print("  calling turn/start WITHOUT thread/resume (see comment)")
+        # Run 18: ZERO notifications in up to 300s, and the turn/start span is
+        # entered server-side. A turn that were running would emit turn/started.
+        # So it is blocked BEFORE starting — and `approvalPolicy` is in the
+        # accepts list. A turn awaiting an approval nobody will give blocks
+        # forever and emits nothing, which is exactly this shape.
+        turn_props = SCHEMA_PARAMS.get("turn/start", {}).get("properties") or {}
+        for field in ("approvalPolicy", "sandboxPolicy"):
+            spec = turn_props.get(field)
+            if not spec:
+                continue
+            opts = spec.get("enum") or spec.get("const")
+            if not opts and "$ref" in spec:
+                print(f"  {field}: {json.dumps(spec)[:120]} (ref — see step 2a)")
+                continue
+            print(f"  {field} accepts: {opts}")
+            if isinstance(opts, list) and opts:
+                # Prefer the least interactive value the schema offers.
+                pref = next(
+                    (
+                        o
+                        for o in opts
+                        if isinstance(o, str)
+                        and o.lower()
+                        in ("never", "none", "auto", "on-failure", "danger-full-access")
+                    ),
+                    None,
+                )
+                if pref:
+                    turn_extra[field] = pref
+                    print(f"  -> passing {field}={pref} (least interactive the schema offers)")
+
+        # Sequence taken from a WORKING third-party client (kcosr/codex-threads),
+        # not from another guess. Three things it does that this script did not:
+        #
+        #   1. thread/resume with excludeTurns: true. Paginated threads require
+        #      it — full-history resume is unavailable — which is why plain
+        #      resume hung. `excludeTurns` was in the accepts list I printed.
+        #   2. LOAD the thread before turn/start. thread/loaded/list returned 0
+        #      every run, so the thread was never loaded in this server; the
+        #      documented behaviour is an "unloaded thread error", and that
+        #      client resumes and retries once on seeing it.
+        #   3. Check `canAcceptDirectInput` on the thread first. That field is
+        #      step 4's question expressed as data — an explicit false means the
+        #      thread refuses direct input, which is an ANSWER rather than a
+        #      timeout.
+        print("  loading the thread first: thread/resume with excludeTurns=true")
+        loaded = None
+        try:
+            loaded = jsonrpc(
+                sock,
+                buf,
+                "thread/resume",
+                {"threadId": target, "excludeTurns": True},
+                4,
+                wire,
+                args.timeout,
+                watch,
+            )
+            print(f"  thread/resume OK: {json.dumps(loaded)[:200]}")
+            FACTS.append("thread/resume with excludeTurns=true SUCCEEDED")
+        except Exception as exc:
+            print(f"  thread/resume (excludeTurns) failed: {type(exc).__name__}: {exc}")
+
+        if loaded is not None:
+            # Look the field up structurally. A substring check on the dumped
+            # JSON would be fooled by nesting, by spacing, and by the key
+            # appearing inside some unrelated string.
+            accepts_input = find_key(loaded, "canAcceptDirectInput")
+            if accepts_input is not MISSING:
+                print(f"  canAcceptDirectInput = {accepts_input!r}")
+                FACTS.append(f"canAcceptDirectInput={accepts_input!r}")
+                if accepts_input is False:
+                    s4.no(
+                        "the thread reports canAcceptDirectInput=false — Codex DECLINES "
+                        "direct input on it. That is an answer, not a timeout."
+                    )
+                    print(f"  {s4.verdict}: {s4.detail}")
+                    return report(steps, args, proc, tmp, args.keep_socket)
+
+        print("  now calling turn/start on the loaded thread")
         print(f"  waiting up to {args.turn_timeout:.0f}s and printing every notification")
+        turn_t0 = time.monotonic()
         try:
             res = jsonrpc(
                 sock,
@@ -1109,8 +1224,9 @@ def main() -> int:
                 FACTS.append(f"turn/start streamed {seen_notifications[:4]} — the turn RAN")
                 print(f"  {s4.verdict}: {s4.detail}")
                 return report(steps, args, proc, tmp, args.keep_socket)
-            first = f"{type(exc).__name__}: {exc}"
+            first = f"{type(exc).__name__}: {exc} after {time.monotonic() - turn_t0:.0f}s"
             print(f"  turn/start alone failed: {first}")
+            print(f"  notifications received while waiting: {len(seen_notifications)}")
             print("  retrying on a FRESH connection, resume first — a wedged connection")
             print("  and a refused turn are otherwise indistinguishable")
             try:

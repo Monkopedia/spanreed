@@ -169,6 +169,28 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# The cause of the run-18 hang, found by reading a working client
+
+Runs 14-18 had `turn/start` hang with zero notifications. I burned five runs
+guessing parameters (`model`, `approvalPolicy`, `sandboxPolicy`). The answer was
+not a parameter. `kcosr/codex-threads` is a third-party client that drives
+app-server threads successfully, and its documented behaviour names all three
+mistakes:
+
+| What it does | What this spike did | Why it mattered |
+| --- | --- | --- |
+| `thread/resume` with `excludeTurns: true` | resumed without it | paginated threads *require* it; full-history resume is unavailable, so plain resume hangs |
+| loads the thread before driving it | never loaded it | `thread/loaded/list` returned **0** every run; app-server has an "unloaded thread error" for exactly this, and that client resumes-and-retries once on seeing it |
+| reads `canAcceptDirectInput` first | never read it | an explicit `false` is step 4's answer as *data* — a refusal, not a timeout |
+
+The signal was in the output the whole time: `thread/loaded/list` returned 0 on
+every single run, sitting next to a `thread/list` that returned a real thread. A
+thread that exists but is not loaded is the documented failure mode, and I read
+past it because I was looking at `turn/start`'s parameters instead.
+
+The same client waits **up to an hour** for a turn to reach terminal status, so a
+300s timeout was never on its own evidence of anything.
+
 # The cause, found on run 13
 
 **`thread/list` consults remote sources by default, and that request never
