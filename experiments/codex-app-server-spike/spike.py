@@ -275,6 +275,12 @@ def jsonrpc(
 
 SCHEMA_PARAMS: dict[str, dict[str, Any]] = {}
 
+# Facts worth seeing even when the middle of a 300-line run is lost to
+# truncation. Run 16 was pasted back with step 0 cut off — which is where the
+# reachability answer lives, the single thing that run existed to produce. A
+# diagnostic placed where it gets trimmed is one that was not produced.
+FACTS: list[str] = []
+
 
 def _minimal_params(target: dict[str, Any], cwd: str) -> dict[str, Any]:
     """Build the smallest params object satisfying `required`.
@@ -536,6 +542,24 @@ def main() -> int:
     ]
     s1, s2, s3, s4 = steps
 
+    # Reachability runs FIRST, before the codex check. It was inside step 0,
+    # which is gated behind codex being installed — a network probe that could
+    # not run unless an unrelated precondition held, in the step meant to
+    # establish what is true before anything else.
+    hr("Reachability — the dependency every hanging call shares")
+    for host, port in (("chatgpt.com", 443), ("api.openai.com", 443)):
+        t0 = time.monotonic()
+        try:
+            sk = socket.create_connection((host, port), timeout=6)
+            sk.close()
+            line = f"{host} TCP443 OK in {time.monotonic() - t0:.1f}s"
+        except Exception as exc:
+            line = f"{host} UNREACHABLE after {time.monotonic() - t0:.1f}s — {exc}"
+        FACTS.append(line)
+        print(f"  {line}")
+    print("  If these are blocked, turn/start cannot complete whatever params it gets,")
+    print("  and every finding here describes this network rather than Codex.")
+
     hr("Environment")
     codex = shutil.which("codex")
     print(f"  codex on PATH : {codex or 'NOT FOUND'}")
@@ -618,16 +642,6 @@ def main() -> int:
     # everything that answers is local (thread/loaded/list, initialize). If
     # these are blocked, no parameter fixes it and the spike has been measuring
     # the network rather than Codex.
-    print("\n  Reachability — the dependency every hanging call shares:")
-    for host, port in (("chatgpt.com", 443), ("api.openai.com", 443)):
-        t0 = time.monotonic()
-        try:
-            sk = socket.create_connection((host, port), timeout=6)
-            sk.close()
-            print(f"    {host:18} TCP 443 OK in {time.monotonic() - t0:.1f}s")
-        except Exception as exc:
-            print(f"    {host:18} UNREACHABLE after {time.monotonic() - t0:.1f}s — {exc}")
-            print("      ^ if this is blocked, turn/start cannot complete regardless of params")
 
     control = home / "app-server-control"
     if control.is_dir():
@@ -847,7 +861,9 @@ def main() -> int:
                 t0 = time.monotonic()
                 try:
                     res = jsonrpc(sock, buf, method, pr, attempt_id, wire, args.timeout)
-                    print(f"  {method:20} [{label}] ANSWERED in {time.monotonic() - t0:.1f}s")
+                    took = time.monotonic() - t0
+                    print(f"  {method:20} [{label}] ANSWERED in {took:.1f}s")
+                    FACTS.append(f"{method} [{label}] ANSWERED in {took:.1f}s")
                     break
                 except Exception as exc:
                     print(
@@ -1165,6 +1181,10 @@ def report(
             print(f"  {line[:200]}")
         total = len(server_output.strip().splitlines())
         print(f"  [{len(warns)} warn/error, {total} lines total; INFO deduped]")
+    if FACTS:
+        hr("Key facts (repeated here because the top of a long run gets truncated)")
+        for line in FACTS:
+            print(f"  {line}")
     hr("Result")
     for s in steps:
         print(f"  {s.n}. [{s.verdict:11}] {s.question}\n        {s.detail}")
