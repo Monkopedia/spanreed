@@ -169,6 +169,82 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# Run 28, resolved: the spike was strangling the server it was measuring
+
+The untruncated server log ends **7 milliseconds** after `thread/list` arrives,
+mid-span, on an `enter`, with no error — and then nothing for the remaining 240
+seconds.
+
+And the line this script printed at the end of every run since run 3:
+
+```
+[0 warn/error, 123 lines total; INFO deduped]
+```
+
+121, 123, 123, 121, 123. **Constant across every run.** That is not a property of
+Codex. That is a **64KB pipe buffer filling to the same point every time**, and
+it was printed in every report without once being questioned.
+
+## The cause
+
+The spike spawns app-server with `stdout=PIPE, stderr=STDOUT`, sets
+`RUST_LOG=info` **itself**, and then reads that pipe only at the very end, inside
+`report()` — which terminates the process first. So for the entire run, nobody
+reads it.
+
+A Rust server logging at INFO on every span poll fills 64KB in milliseconds. The
+pipe fills, `write()` blocks, and app-server stalls **inside whatever handler was
+logging when the buffer filled**. It never returns, never errors, and never logs
+again — because logging is the thing that is blocked.
+
+Everything fits, and fits only this:
+
+| Observation | Explanation |
+| --- | --- |
+| `initialize`, `thread/loaded/list` always work | they log almost nothing |
+| `thread/list`, `thread/start`, `turn/start` always hang | they log heavily |
+| the log always stops at the same line count | that is the buffer's capacity |
+| it stops 7ms after the request | that is how fast INFO fills what remains |
+| never a warn, never an error, never a timeout | a blocked writer is not a failure |
+| the TUI works fine | its stderr goes to a terminal, not to an unread pipe |
+| raising the timeout 20 → 90 → 240 changed nothing | the block is permanent |
+
+We turned the firehose on and then blocked the drain.
+
+## Demonstrated, not argued
+
+Controlled A/B against one stub server that writes ~510KB mid-handler:
+
+```
+old (pipe read only at the end) : thread/list failed after 20.0s -- TimeoutError
+new (reader thread)             : thread/list ANSWERED in 0.0s
+```
+
+An earlier attempt at this test wrote only ~28KB, stayed under the buffer, and
+showed both versions passing. That result proved nothing and was discarded
+rather than reported — a reproduction that does not reproduce is not evidence.
+
+## The honest tally
+
+Eight causes were proposed over twenty-eight runs. All eight were wrong:
+
+1. writer lock on the target thread
+2. unanswered server→client requests
+3. leaked app-servers from earlier runs
+4. sqlite contention on the thread store
+5. TLS interception by a corporate proxy
+6. thread volume (openai/codex#45246)
+7. a per-machine app-server singleton
+8. MCP startup timeout
+
+Each was proposed because it explained the evidence *available at the time*, and
+each was killed by a cheap probe. But the real cause was visible in every single
+run, in a number this script printed itself and treated as decoration.
+
+The pattern this README has now recorded six times — a diagnostic that cannot
+report its own failure — turns out to have a sibling that is worse: **a
+diagnostic that reports a constant, which nobody reads as a measurement.**
+
 # Run 28: the singleton is dead too, and one real answer fell out
 
 ```

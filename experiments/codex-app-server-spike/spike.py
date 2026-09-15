@@ -58,6 +58,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -1357,6 +1358,7 @@ def main() -> int:
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
         )
         SPAWNED.append(proc)
+        start_reader(proc)
 
         for _ in range(60):  # up to ~15s
             if sock_path.exists():
@@ -1970,12 +1972,59 @@ def extract_ids(result: Any) -> list[str]:
     return out
 
 
+# Output captured from spawned servers, keyed by pid. A pipe nobody reads fills
+# at 64KB and then BLOCKS THE WRITER -- so app-server, which we deliberately set
+# RUST_LOG=info on, would stall inside whatever handler was logging when the
+# buffer filled. That is what every hang in runs 3-28 actually was: the log
+# stopped at a constant ~121-123 lines every single run, which is the buffer, and
+# that constant was printed in every report without being questioned.
+CAPTURED: dict[int, list[str]] = {}
+
+
+def start_reader(proc: subprocess.Popen) -> None:
+    """Drain a spawned server's output continuously, on its own thread.
+
+    Nothing about this is optional. Reading only at the end means not reading at
+    all while the process runs, and a Rust server at INFO fills 64KB in
+    milliseconds.
+    """
+    CAPTURED[proc.pid] = []
+    sink = CAPTURED[proc.pid]
+
+    def pump() -> None:
+        stream = proc.stdout
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                sink.append(line)
+        except (ValueError, OSError):
+            pass  # closed underneath us at shutdown
+
+    t = threading.Thread(target=pump, daemon=True, name=f"drain-{proc.pid}")
+    t.start()
+
+
 def drain(proc: subprocess.Popen[str] | None) -> str:
     """Whatever app-server wrote to stdout/stderr. Run 1 printed this ONLY when
     the process died early, so a server that closed a connection and explained
     why had its explanation thrown away — the single most useful line in the
     run, discarded by the script meant to diagnose it."""
-    if not proc or not proc.stdout:
+    if not proc:
+        return ""
+    # Prefer what the reader thread already collected. It has been running since
+    # the spawn, so this is the whole log rather than whatever survived a full
+    # pipe -- and reading it does not require killing the process first.
+    if proc.pid in CAPTURED:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        time.sleep(0.3)  # let the pump finish the tail
+        return "".join(CAPTURED[proc.pid])
+    if not proc.stdout:
         return ""
     if proc.poll() is None:
         proc.terminate()
