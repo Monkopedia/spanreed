@@ -372,17 +372,28 @@ def dump_schema(codex: str) -> list[tuple[str, Any]]:
             text = f.read_text(errors="replace")
         except OSError:
             continue
-        if "initialize" not in text.lower():
+        # ClientRequest.json carries the params shapes and is processed
+        # unconditionally. It was previously reached only because it happens to
+        # contain the word "initialize" — an incidental filter that silently
+        # skipped it the moment that stopped being true, taking the params
+        # extraction with it and leaving only the invented fallback.
+        if f.name != "ClientRequest.json" and "initialize" not in text.lower():
             continue
         # Print small files in full rather than announcing their names. Five
         # runs listed ClientNotification.json at 431 bytes without opening it;
         # it names the handshake notification that was missing the whole time.
-        if len(text) <= 2500:
+        # Filename is checked BEFORE size. With the size test first, a small
+        # ClientRequest.json took the dump branch and never reached the
+        # extractor, so the params shapes were printed and not parsed — the
+        # branch order decided whether the step did its job.
+        if f.name == "ClientRequest.json":
+            pass  # falls through to the extractor below
+        elif len(text) <= 2500:
             print(f"  --- {f.name} ({len(text)} bytes) ---")
             for line in text.splitlines()[:40]:
                 print(f"      {line[:160]}")
-        elif f.name == "ClientRequest.json":
-            # 199KB, and the authoritative shape of every request. Run 10 printed
+        if f.name == "ClientRequest.json":
+            # The authoritative shape of every request. Run 10 printed
             # "too large to dump; grep it if needed" — telling the operator to go
             # and find the thing this step exists to find. Extract instead.
             print(f"  --- {f.name}: extracting the methods that are failing ---")
@@ -424,7 +435,7 @@ def dump_schema(codex: str) -> list[tuple[str, Any]]:
                     print(
                         f"          -> NO DEFAULT for required {missing}; request will be incomplete"
                     )
-        else:
+        elif len(text) > 2500:
             print(f"  {f.name}: {len(text)} bytes, not dumped")
         with contextlib.suppress(json.JSONDecodeError):
             found.append((f.name, json.loads(text)))
@@ -755,14 +766,57 @@ def main() -> int:
     # land ~230ms after the socket appears, while it is still in flight. One
     # attempt cannot tell "never works" from "not ready yet". A series can.
     attempt_id = 100
-    listed = SCHEMA_PARAMS.get("thread/list")
-    list_params = _minimal_params(listed, str(Path.home())) if listed else {"limit": 10}
-    if listed:
-        print(f"  using schema-derived params for thread/list: {json.dumps(list_params)}")
-    else:
-        print("  no schema for thread/list; falling back to an invented {'limit': 10}")
-    for _mid, method, params in ((2, "thread/loaded/list", {}), (3, "thread/list", list_params)):
+    # Run 12: thread/list has required: [] — {} is a VALID call, so the params
+    # hypothesis is dead along with contention, warmup and the experimental gate.
+    # What survives is in the ACCEPTS list, which was printed and not read:
+    #
+    #   'sourceKinds', 'originators', 'useStateDbOnly'
+    #
+    # A `useStateDbOnly` flag only exists if the default path reads something
+    # other than the local DB. The startup log shows
+    # remote_control_url=https://chatgpt.com/backend-api/ and a remote plugin
+    # catalog fetch, so the candidate is that thread/list consults CLOUD threads
+    # by default and that request hangs on this network — which would also
+    # explain why thread/loaded/list, purely in-memory, returns in 0s.
+    #
+    # These are fields the schema names, not invented ones, and the local-only
+    # variant is tried FIRST so a pass identifies the cause rather than merely
+    # working.
+    list_attempts: list[tuple[str, dict[str, Any]]] = []
+    if "thread/list" in SCHEMA_PARAMS:
+        accepts = (SCHEMA_PARAMS["thread/list"].get("properties") or {}).keys()
+        if "useStateDbOnly" in accepts:
+            list_attempts.append(("local DB only", {"useStateDbOnly": True}))
+        if "limit" in accepts:
+            list_attempts.append(("local DB only + limit", {"useStateDbOnly": True, "limit": 5}))
+    list_attempts.append(("schema-minimal", {}))
+
+    print("  thread/list attempts, local-first:")
+    for label, pr in list_attempts:
+        print(f"    {label:24} {json.dumps(pr)}")
+
+    for _mid, method, params in ((2, "thread/loaded/list", {}), (3, "thread/list", None)):
         res = None
+        if params is None:  # thread/list: try each schema-named variant once
+            for label, pr in list_attempts:
+                attempt_id += 1
+                t0 = time.monotonic()
+                try:
+                    res = jsonrpc(sock, buf, method, pr, attempt_id, wire, args.timeout)
+                    print(f"  {method:20} [{label}] ANSWERED in {time.monotonic() - t0:.1f}s")
+                    break
+                except Exception as exc:
+                    print(
+                        f"  {method:20} [{label}] failed after "
+                        f"{time.monotonic() - t0:.1f}s -- {type(exc).__name__}"
+                    )
+            if res is None:
+                print(f"  {method:20} every variant failed — not a params problem")
+                continue
+            ids = extract_ids(res)
+            found.extend(i for i in ids if i not in found)
+            print(f"  {method:20} {len(ids)} thread(s). Raw: {json.dumps(res)[:140]}")
+            continue
         for delay in (0, 5, 10, 20):
             if delay:
                 print(f"  {method:20} waiting {delay}s — server may still be warming up")
@@ -801,6 +855,11 @@ def main() -> int:
         print("  the protocol risk. It does NOT answer 'someone else's open thread'.")
         started = SCHEMA_PARAMS.get("thread/start")
         attempts = [_minimal_params(started, str(Path.home()))] if started else []
+        starts = (SCHEMA_PARAMS.get("thread/start", {}).get("properties") or {}).keys()
+        if "ephemeral" in starts:
+            # Same reasoning: schema-named, and skipping persistence is the
+            # cheapest way to find out whether the store is what blocks.
+            attempts.insert(0, {"ephemeral": True, "cwd": str(Path.home())})
         attempts += [{"cwd": str(Path.home())}, {}]
         for params in attempts:
             attempt_id += 1
