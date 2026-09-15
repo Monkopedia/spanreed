@@ -142,6 +142,74 @@ Out-of-scope explicitly:
 
 (Cross-host messaging was previously out-of-scope; it is now an in-design feature — see below.)
 
+(So were headless workers, in the first line of this section. A **Codex worker** is one: no human attached, woken only by mail. That is now an in-design feature too — see "Codex workers" below. The reason the original exclusion held was that headless agents had other handles and did not need the bus; a Codex session has no such handle, which is exactly why it needs one.)
+
+## Codex workers
+
+A **Codex worker** is a bus agent with no human attached: a long-lived process that owns one
+`codex app-server` thread and turns inbound mail into turns. Feasibility is settled empirically —
+see [findings.md](findings.md#test-5-can-a-foreign-process-drive-a-codex-turn-2026-09-15) — and this
+section is the design, not the evidence.
+
+```
+spanreed codex --name reviewer --cwd ~/git/foo
+  ├─ spawn `codex app-server --listen unix://<private socket>`
+  ├─ initialize + initialized          (the notification is mandatory)
+  ├─ thread/start --cwd                (one thread, owned for the worker's life)
+  ├─ register in the registry          (ordinary agent row; peers address it normally)
+  ├─ tail inbox → turn/start           (one turn per message, FIFO)
+  ├─ item/agentMessage/delta → reply back to the sender
+  └─ thread/status/changed → registry status
+```
+
+### Two properties a Claude session does not have
+
+**Status is authoritative.** `thread/status/changed` reports real `active`/`idle` transitions, so a
+Codex worker's status is observed rather than self-declared. Claude's is best-effort (see "Agent
+status" above), and `last_seen` has been shown unreliable in practice
+(`Monkopedia/spanreed#55`). Where the two disagree, the Codex mechanism is the one to copy.
+
+**Quota is observable.** `account/rateLimits/updated` arrives unprompted during a turn. A worker
+burning the owner's ChatGPT allowance can say so on the bus instead of failing opaquely later.
+
+### Controls
+
+Decided by the owner, 2026-09-15, in the session that closed the spike.
+
+| Control | Decision | Consequence accepted |
+|---|---|---|
+| Approvals | **Auto-approve within `--cwd`** | `execCommandApproval` / `applyPatchApproval` are answered `approve` when the target is inside `--cwd`, and `decline` otherwise. The worker can really edit and run, which is the point; the directory is the blast radius. |
+| Who may wake it | **Any registered agent** | Consistent with the trust model above — "if it's on the bus you can trust it". No allowlist. |
+| Concurrency | **Queue, FIFO** | One turn per message, each with its own reply. Senders may wait. Codex's native `steer` is deliberately *not* used: a steered turn produces one reply for two senders' messages, which the bus has no way to express. |
+| Thread lifetime | **One thread per worker** | Context accumulates, so a worker remembers its conversation the way a Claude session does. History growth is a token cost, not a correctness problem. |
+
+### `--cwd` is the security boundary, and it is required
+
+Auto-approval plus any-sender means **an unauthenticated inbox write becomes code execution**, and
+the only thing bounding it is `--cwd`. That is a deliberate choice and follows from the trust model,
+which was never a claim that the bus is *authenticated* — only that, single-user, it need not be. A
+Codex worker is the first thing on this bus where that distinction has teeth, because the other end
+of a message is now a shell rather than a model's judgement.
+
+Two rules follow, and they are not negotiable in the way the table above is:
+
+1. **`--cwd` has no default.** Not `$HOME`, not the process's working directory, not whatever
+   `config.toml` marks trusted. A worker started without `--cwd` refuses to start. The machine this
+   was validated on has `[projects."/Users/monk"] trust_level = "trusted"`, so an inherited default
+   would have scoped every worker to the entire home directory.
+2. **Approvals are logged, both outcomes.** Every `execCommandApproval` and `applyPatchApproval`, the
+   command or path, and whether it was approved or declined for being outside `--cwd`. Per rule 7,
+   verbose and legible: the owner wants to *see* what a Codex agent did on their behalf, and an
+   auto-approved command that appears nowhere is the one that cannot be reviewed.
+
+### Deliberately not decided yet
+
+- **Cross-host workers.** `conjoin` plus auto-approve means a write on host A executes on host B.
+  Not blocked here, but it has not been thought about, and #55 shows the bridge's registry sync is
+  not yet trustworthy in both directions.
+- **What a worker does with a turn that fails.** `turn/failed` and `turn/aborted` exist; whether the
+  sender gets the error, a retry, or silence is unspecified.
+
 ## Cross-host: the SSH bus-bridge
 
 Single-host spanreed coordinates through a shared local filesystem with no daemon. Cross-host can't share that filesystem safely (`flock` and append-atomicity don't hold over network FS) and the PID-based liveness model is local by definition. Rather than introduce a network broker or a shared mount, we **bridge two independent local buses over a persistent SSH duplex pipe**. SSH gives us authenticated, encrypted transport for free and makes "you can reach the box" the authorization model — which matches the single-user trust assumption exactly.
