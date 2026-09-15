@@ -169,6 +169,67 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# Run 26: 240s, four threads, and three of this spike's own probes found blind
+
+240s also timed out. And the state store now reads:
+
+```
+state_5.sqlite: threads has 4 row(s)
+```
+
+**Four threads.** [#45246](https://github.com/openai/codex/issues/45246) is about
+hosts with hundreds; its scaling story cannot apply here. `thread/list` is not
+slow on this machine, it is blocked — and raising the fuse from 20 to 90 to 240
+was chasing a number that was never the constraint.
+
+Three defects in this spike, all of the same family: a probe that reports
+success in the exact case it cannot see.
+
+## 1. The sqlite probe could not detect a lock, by construction
+
+`probe_state_db()` opened with `immutable=1`, chosen so the probe could not
+become the contention it was looking for. The cost, unstated until now, is that
+`immutable=1` **skips locking entirely** — so a database held exclusively by
+another process reads back clean.
+
+Demonstrated: with a real `BEGIN EXCLUSIVE` held by another process, the
+immutable open returns `opened in 0.00s; threads: 1 row(s)`. Five runs of "state
+DB readable directly" were produced by a check structurally incapable of
+reporting the thing most likely to block app-server.
+
+A plain read-only open with a 3s busy timeout now runs alongside it. A reader is
+refused only by an exclusive lock, so it detects contention without ever taking
+a write lock. Against the same held lock it reports
+`LOCKED: database is locked`.
+
+## 2. The server's own log was being truncated by this script
+
+The one artifact that knows what the server is stuck on was printed as: the last
+**12** distinct lines, each cut to **200 characters**. That cut lands inside the
+span fields — so `remote_control_url=…` and the `http.method`/URL of the two
+online calls that never complete (`list_models{refresh_strategy=online}` and
+`plugins.remote_catalog.list`) were removed by this printer, in every run.
+
+The screen keeps the summary; the raw output now goes whole to
+`spike-server.log`.
+
+## 3. The run ended on a traceback
+
+```
+Exception ignored while flushing sys.stdout:
+ValueError: I/O operation on closed file.
+```
+
+Python flushes `sys.stdout` during shutdown, after `atexit` closed the tee's
+handle. A crash printed after the report, in the lines read as the result.
+Guarded.
+
+## Also now reported
+
+`auth_mode`, whose value is a mode name rather than a credential, and which says
+whether Codex is taking the ChatGPT-token path or the API-key path. `auth.json`
+holds keys for both and has not been written in 125 hours.
+
 # Run 25 (full log): step 0 was the answer all along
 
 The owner sent a complete run for the first time. Step 0 — the section every

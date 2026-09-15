@@ -466,6 +466,12 @@ def probe_auth(home: Path) -> None:
         # Key NAMES only. Never a value: these files hold live credentials.
         keys = ", ".join(sorted(data.keys()))[:160]
         print(f"    keys: {keys}")
+        mode = find_key(data, "auth_mode")
+        if mode is not MISSING:
+            # A mode name is not a credential, and it says which path Codex
+            # takes: ChatGPT tokens or an API key.
+            print(f"    auth_mode = {mode!r}")
+            FACTS.append(f"auth_mode={mode!r}")
         for key in ("expires_at", "expiresAt", "expiry", "exp"):
             exp = find_key(data, key)
             if exp is not MISSING and isinstance(exp, (int, float)):
@@ -505,12 +511,18 @@ class Tee:
 
     def write(self, data: str) -> int:
         self.stream.write(data)
-        self.fh.write(data)
+        if not self.fh.closed:
+            self.fh.write(data)
         return len(data)
 
     def flush(self) -> None:
         self.stream.flush()
-        self.fh.flush()
+        # Python flushes sys.stdout during interpreter shutdown, after atexit
+        # has already closed this handle. Run 26 ended on a ValueError traceback
+        # for that reason -- a crash printed after the report, in the part the
+        # user reads as the result.
+        if not self.fh.closed:
+            self.fh.flush()
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -644,6 +656,31 @@ def probe_state_db(home: Path) -> None:
         except sqlite3.Error as exc:
             print(f"    sqlite refused it after {time.monotonic() - t0:.2f}s: {exc}")
             FACTS.append(f"state DB NOT readable directly: {exc}")
+
+        # The read above used immutable=1, which skips locking so the probe
+        # cannot itself become the contention it looks for. The cost is that it
+        # is also blind to contention: a database held exclusively by another
+        # process reads fine that way. So ask the question the other way, with a
+        # normal read-only connection and a short busy timeout. A reader is
+        # refused only by an EXCLUSIVE lock, and taking no write lock keeps this
+        # safe against the user's live store.
+        t3 = time.monotonic()
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+            try:
+                con.execute("select count(*) from sqlite_master").fetchone()
+                print(
+                    f"    not exclusively locked (plain read-only open in {time.monotonic() - t3:.2f}s)"
+                )
+            finally:
+                con.close()
+        except sqlite3.OperationalError as exc:
+            print(
+                f"    LOCKED: a plain read-only open failed after {time.monotonic() - t3:.2f}s: {exc}"
+            )
+            FACTS.append(f"{db.name} is EXCLUSIVELY LOCKED by another process: {exc}")
+        except sqlite3.Error as exc:
+            print(f"    read-only open failed: {exc}")
 
 
 def _minimal_params(target: dict[str, Any], cwd: str) -> dict[str, Any]:
@@ -1932,6 +1969,21 @@ def report(
             print(f"  {line[:200]}")
         total = len(server_output.strip().splitlines())
         print(f"  [{len(warns)} warn/error, {total} lines total; INFO deduped]")
+        # The screen view is a summary: last 12 distinct lines, each cut to 200
+        # chars. That cut lands inside the span fields -- remote_control_url and
+        # the http.method/url of the calls that never complete were being
+        # removed by this printer, in every run, from the one artifact that
+        # knows what the server is stuck on. Write it whole, to a file.
+        raw_path = (
+            Path(args.log).with_name("spike-server.log")
+            if args.log
+            else (Path.cwd() / "spike-server.log")
+        )
+        try:
+            raw_path.write_text(server_output, encoding="utf-8")
+            print(f"  FULL SERVER LOG (untruncated, not deduped): {raw_path}")
+        except OSError as exc:
+            print(f"  could not write the full server log: {exc}")
     if FACTS:
         hr("Key facts (repeated here because the top of a long run gets truncated)")
         for line in FACTS:
