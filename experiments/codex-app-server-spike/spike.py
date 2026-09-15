@@ -273,6 +273,40 @@ def jsonrpc(
         buf.extend(chunk)
 
 
+SCHEMA_PARAMS: dict[str, dict[str, Any]] = {}
+
+
+def _minimal_params(target: dict[str, Any], cwd: str) -> dict[str, Any]:
+    """Build the smallest params object satisfying `required`.
+
+    Reading the schema and then sending an invented shape anyway would repeat
+    the mistake the schema was fetched to fix. Values are chosen by declared
+    type; anything with no sensible default is left out and reported, so a gap
+    shows up as a gap rather than as a silently wrong request.
+    """
+    out: dict[str, Any] = {}
+    props = target.get("properties") or {}
+    for field in target.get("required", []):
+        spec = props.get(field, {})
+        types = spec.get("type", "")
+        types = types if isinstance(types, list) else [types]
+        if "cwd" in field.lower() or "path" in field.lower():
+            out[field] = cwd
+        elif "integer" in types or "number" in types:
+            out[field] = 10
+        elif "boolean" in types:
+            out[field] = False
+        elif "array" in types:
+            out[field] = []
+        elif "object" in types:
+            out[field] = {}
+        elif "string" in types:
+            out[field] = ""
+        elif "null" in types:
+            out[field] = None
+    return out
+
+
 def _find_method(node: Any, method: str, depth: int = 0) -> Any:
     """Find the sub-schema describing `method`, without assuming the layout.
 
@@ -357,12 +391,39 @@ def dump_schema(codex: str) -> list[tuple[str, Any]]:
             except json.JSONDecodeError:
                 print("      (not parseable)")
                 continue
+            defs = doc.get("definitions", {})
             for want in ("thread/list", "thread/start", "turn/start"):
                 hit = _find_method(doc, want)
-                if hit:
-                    print(f"      {want}: {json.dumps(hit)[:420]}")
-                else:
+                if not hit:
                     print(f"      {want}: not found by name in this schema")
+                    continue
+                # Resolve the params $ref. Run 11 printed
+                # params: {"$ref": "#/definitions/ThreadListParams"} and stopped
+                # there — which names the shape without showing it, while this
+                # client sends an invented one. Following the ref is the whole
+                # point of reading the schema.
+                params = (hit.get("properties") or {}).get("params") or {}
+                ref = params.get("$ref", "")
+                target = defs.get(ref.rsplit("/", 1)[-1]) if ref else params
+                if target is None:
+                    print(f"      {want}: params -> {ref} (not in definitions)")
+                    continue
+                req = target.get("required", [])
+                props = list((target.get("properties") or {}).keys())
+                print(f"      {want}")
+                print(f"          required: {req}")
+                print(f"          accepts : {props}")
+                for field in req:
+                    spec = (target.get("properties") or {}).get(field, {})
+                    print(f"          {field}: {json.dumps(spec)[:140]}")
+                SCHEMA_PARAMS[want] = target
+                built = _minimal_params(target, str(Path.home()))
+                missing = [f for f in req if f not in built]
+                print(f"          -> will send: {json.dumps(built)}")
+                if missing:
+                    print(
+                        f"          -> NO DEFAULT for required {missing}; request will be incomplete"
+                    )
         else:
             print(f"  {f.name}: {len(text)} bytes, not dumped")
         with contextlib.suppress(json.JSONDecodeError):
@@ -694,7 +755,13 @@ def main() -> int:
     # land ~230ms after the socket appears, while it is still in flight. One
     # attempt cannot tell "never works" from "not ready yet". A series can.
     attempt_id = 100
-    for _mid, method, params in ((2, "thread/loaded/list", {}), (3, "thread/list", {"limit": 10})):
+    listed = SCHEMA_PARAMS.get("thread/list")
+    list_params = _minimal_params(listed, str(Path.home())) if listed else {"limit": 10}
+    if listed:
+        print(f"  using schema-derived params for thread/list: {json.dumps(list_params)}")
+    else:
+        print("  no schema for thread/list; falling back to an invented {'limit': 10}")
+    for _mid, method, params in ((2, "thread/loaded/list", {}), (3, "thread/list", list_params)):
         res = None
         for delay in (0, 5, 10, 20):
             if delay:
@@ -732,7 +799,10 @@ def main() -> int:
         print("\n  No threads exist. Creating one so the turn path is still testable —")
         print("  this answers 'can this client drive a turn AT ALL', which is most of")
         print("  the protocol risk. It does NOT answer 'someone else's open thread'.")
-        for params in ({"cwd": str(Path.home())}, {}):
+        started = SCHEMA_PARAMS.get("thread/start")
+        attempts = [_minimal_params(started, str(Path.home()))] if started else []
+        attempts += [{"cwd": str(Path.home())}, {}]
+        for params in attempts:
             attempt_id += 1
             t0 = time.monotonic()
             try:
