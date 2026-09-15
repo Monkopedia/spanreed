@@ -545,6 +545,14 @@ def try_stdio(codex: str, params: Any) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument(
+        "--fresh",
+        action="store_true",
+        help="create a NEW thread with thread/start and drive that, instead of an "
+        "existing one. This is the question that actually matters for spanreed: it "
+        "would own its Codex thread, never hijack a human's. Runs 14-19 never tested "
+        "it, because thread/start only ran when thread/list came back empty.",
+    )
+    ap.add_argument(
         "--turn",
         metavar="THREAD_ID",
         help="also run step 4: start ONE short turn in this thread. "
@@ -586,6 +594,7 @@ def main() -> int:
         Step(2, "Can a separate process connect and `initialize`?"),
         Step(3, "Can it see threads — including ones a human has open?"),
         Step(4, "Can it start a turn in a thread someone else is using?"),
+        # reworded below when --fresh drives our own thread instead
     ]
     s1, s2, s3, s4 = steps
 
@@ -1004,7 +1013,53 @@ def main() -> int:
 
     # ---- step 4: start a turn ------------------------------------------------
     hr("Step 4 — start a turn in a thread someone else has open")
-    target = args.turn or (found[0] if created and found else None)
+    if args.fresh:
+        s4.question = "Can it create its OWN thread and drive a turn in it?"
+        # thread/start previously ran only when thread/list came back empty, so
+        # the own-thread path went untested for six runs while every run drove
+        # a thread a human had open -- the one case Codex is documented to
+        # refuse. Force it.
+        print("  --fresh: creating our own thread rather than driving an existing one")
+        started = SCHEMA_PARAMS.get("thread/start")
+        tries = [_minimal_params(started, str(Path.home()))] if started else []
+        tries += [{"cwd": str(Path.home())}, {}]
+        fresh_id = None
+        for params in tries:
+            attempt_id += 1
+            try:
+                res = jsonrpc(sock, buf, "thread/start", params, attempt_id, wire, args.timeout)
+            except Exception as exc:
+                print(f"    thread/start {json.dumps(params)[:28]:30} no -- {str(exc)[:60]}")
+                continue
+            ids = extract_ids(res)
+            print(f"    thread/start {json.dumps(params)[:28]:30} YES -- {json.dumps(res)[:90]}")
+            if ids:
+                fresh_id = ids[0]
+                FACTS.append(f"thread/start created our own thread {fresh_id}")
+                break
+        if fresh_id is None:
+            FACTS.append("thread/start FAILED — could not create even our own thread")
+        target = fresh_id
+    else:
+        target = args.turn or (found[0] if created and found else None)
+
+    if target:
+        # A lock held by a live process is the documented reason resume hangs
+        # instead of erroring, so name the holder rather than spending the
+        # timeout rediscovering it. See the README: this is an upstream bug
+        # with issues open against codex itself.
+        lockdir = home / "thread-writer-locks"
+        hits = sorted(lockdir.glob(f"*{target}*")) if lockdir.is_dir() else []
+        if hits:
+            for f in hits:
+                body = ""
+                with contextlib.suppress(OSError):
+                    body = f.read_text(errors="replace").strip()[:120]
+                print(f"  WRITER LOCK held on this thread: {f.name}  {body}")
+            FACTS.append(f"target thread {target} HAS a writer-lock file — expect a refusal/hang")
+        elif lockdir.is_dir():
+            print(f"  no writer-lock file for this thread in {lockdir}")
+            FACTS.append(f"target thread {target} has NO writer-lock file")
     if target and not args.turn:
         print(f"  no --turn given, but a thread was just created: using {target}")
         print("  NOTE: this is OUR thread, not one a human has open. A pass here means")
@@ -1364,12 +1419,24 @@ def report(
         print("    exposes no socket and locks the thread store, so there is nothing")
         print("    to join. See the README.")
     elif verdicts[4] == "PASS":
-        print("  A non-owning process can start a turn in an open thread.")
-        print(f"  CHECK THE HUMAN'S CODEX WINDOW: did it show a turn replying {SPIKE_MARKER}?")
-        print("  If it did, a Codex session can be a real peer on the bus, not a mailbox.")
-        print("  If the turn ran but the human saw nothing, that is the ANSWER TO A DIFFERENT")
-        print("  QUESTION and worth reporting separately — it would mean turns are possible")
-        print("  but invisible, which is not good enough.")
+        if getattr(args, "fresh", False):
+            # Do not let a pass on OUR OWN thread print as a pass on a human's.
+            # The two are different questions and Codex answers them differently:
+            # it holds a per-thread writer lock, so the second one is the one it
+            # refuses. Saying "a non-owning process can drive an open thread"
+            # here would be the spike lying about its own scope.
+            print("  A separate process can create a Codex thread and drive a turn in it.")
+            print("  That is the case spanreed actually needs: it would OWN its thread.")
+            print("  This says NOTHING about driving a thread a human has open — for that,")
+            print("  re-run with --turn <id>. Expect a refusal: Codex takes a writer lock")
+            print("  per thread, and a thread open in another client is already claimed.")
+        else:
+            print("  A non-owning process can start a turn in a thread a human has open.")
+            print(f"  CHECK THE HUMAN'S CODEX WINDOW: did it show a turn replying {SPIKE_MARKER}?")
+            print("  If it did, a Codex session can be a real peer on the bus, not a mailbox.")
+            print("  If the turn ran but the human saw nothing, that is the ANSWER TO A")
+            print("  DIFFERENT QUESTION and worth reporting separately — it would mean turns")
+            print("  are possible but invisible, which is not good enough.")
     elif verdicts[4] == "SKIP":
         print("  Steps 1-3 say you can connect and look. They do NOT answer the question.")
         print("  Re-run with --turn <thread-id> using an id from step 3.")

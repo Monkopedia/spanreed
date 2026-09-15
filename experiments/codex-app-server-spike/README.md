@@ -169,6 +169,47 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# Run 19: the hang is a writer lock, and the spike was asking the wrong question
+
+Run 19 added `thread/resume` with `excludeTurns: true` and it **also** timed out.
+The server log ends on the `thread/resume` span with 0 warn/error — entered,
+never returned. Same shape as `turn/start`, one call earlier.
+
+The cause is not in this script. Codex takes a **per-thread writer lock** at
+`$CODEX_HOME/thread-writer-locks/<thread>.lock`. A thread another client has open
+is already claimed, and resume blocks on the lock rather than failing, so the
+symptom is a hang with no error. This is a known upstream problem with issues
+open against codex itself and against several third-party clients:
+
+- openai/codex#44449 — threads viewed in the iOS app stay locked in the daemon; desktop fails with "already has an active writer"
+- openai/codex#40973 — remote cannot open a VS Code-owned thread; the writer stays held after the other client disconnects
+- manaflow-ai/cmux#11973, pingdotgg/t3code#8259, getpaseo/paseo#3573 — the same error from three unrelated clients
+
+So `--turn <a human's thread>` was testing the one case Codex is documented to
+refuse.
+
+## The question the spike never asked
+
+`thread/start` ran **only when `thread/list` came back empty**. Once step 3 began
+returning a real thread, the own-thread path stopped running entirely — six runs
+drove a locked thread and none created one.
+
+That inverted the priority. Spanreed does not need to hijack a human's Codex
+window; it would **own** its thread, the way it owns a Claude session. `--fresh`
+forces that path:
+
+```sh
+python3 spike.py --fresh                 # our own thread -- the case that matters
+python3 spike.py --turn <human-thread>   # the hijack -- expect a writer-lock refusal
+```
+
+Step 4 renames itself under `--fresh`, and the pass text no longer tells you to
+go look at the human's Codex window — a pass on our own thread is not a pass on
+someone else's, and the two must not print the same.
+
+The target's lock file is now checked before the attempt, so a held lock is named
+up front instead of rediscovered by spending the timeout.
+
 # The cause of the run-18 hang, found by reading a working client
 
 Runs 14-18 had `turn/start` hang with zero notifications. I burned five runs
