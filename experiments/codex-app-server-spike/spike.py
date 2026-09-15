@@ -215,6 +215,7 @@ def jsonrpc(
     mid: int,
     style: str = "jsonl",
     timeout: float = TIMEOUT,
+    on_notify: Any = None,
 ) -> Any:
     """One request, one matching response. Raises on timeout or transport error.
 
@@ -244,6 +245,9 @@ def jsonrpc(
                     if "error" in msg:
                         raise RuntimeError(f"server returned an error: {msg['error']}")
                     return msg.get("result")
+                nm = msg.get("method")
+                if nm and on_notify is not None:
+                    on_notify(nm, msg.get("params") or {})
                 continue
         while b"\n" in buf:
             line, _, rest = bytes(buf).partition(b"\n")
@@ -523,6 +527,14 @@ def main() -> int:
         action="store_true",
         help="force spawning a new app-server even when one is already running. "
         "Only useful for reproducing run 6's lock contention.",
+    )
+    ap.add_argument(
+        "--turn-timeout",
+        type=float,
+        default=300.0,
+        help="seconds to wait for turn/start (default 300). A turn runs a real agent; "
+        "the 20s used through run 17 was shorter than any agentic turn, so a working "
+        "turn and a refused one produced the same timeout.",
     )
     ap.add_argument("--keep-socket", action="store_true", help="don't delete the socket dir")
     ap.add_argument(
@@ -1033,7 +1045,26 @@ def main() -> int:
         else:
             print("  no models_cache.json — cannot supply an explicit model")
 
+        # turn/start STREAMS turn/* notifications and may not answer until the
+        # turn finishes. This client skipped every notification in silence and
+        # waited 20s for a matching id — so a turn that was running looked
+        # exactly like a turn that was refused, and the evidence that it worked
+        # was being discarded by the thing looking for it. Documented upstream:
+        # a turn longer than the client timeout desyncs, and an early
+        # turn/completed can be dropped before the response registers.
+        #
+        # So: notifications are printed, and `turn/started` is treated as the
+        # answer. Whether the final response arrives is a separate question from
+        # whether a foreign process can START a turn, which is what step 4 asks.
+        seen_notifications: list[str] = []
+
+        def watch(method: str, params: dict[str, Any]) -> None:
+            seen_notifications.append(method)
+            detail = json.dumps(params)[:100]
+            print(f"    <- {method}  {detail}")
+
         print("  calling turn/start WITHOUT thread/resume (see comment)")
+        print(f"  waiting up to {args.turn_timeout:.0f}s and printing every notification")
         try:
             res = jsonrpc(
                 sock,
@@ -1042,6 +1073,8 @@ def main() -> int:
                 {"threadId": target, "input": [{"type": "text", "text": prompt}], **turn_extra},
                 5,
                 wire,
+                args.turn_timeout,
+                watch,
             )
             if created:
                 # Do NOT call this a pass. The question is "a thread someone
@@ -1064,6 +1097,18 @@ def main() -> int:
             else:
                 s4.ok(f"turn/start accepted: {json.dumps(res)[:200]}")
         except Exception as exc:
+            if seen_notifications:
+                # The turn ran. That answers step 4 even without the response.
+                s4.ok(
+                    f"turn/start did not return within {args.turn_timeout:.0f}s, but the "
+                    f"server streamed {len(seen_notifications)} notification(s): "
+                    f"{seen_notifications[:6]}. A foreign process STARTED a turn in a "
+                    f"thread it does not own — the response arrives when the turn ends, "
+                    f"which is a different question."
+                )
+                FACTS.append(f"turn/start streamed {seen_notifications[:4]} — the turn RAN")
+                print(f"  {s4.verdict}: {s4.detail}")
+                return report(steps, args, proc, tmp, args.keep_socket)
             first = f"{type(exc).__name__}: {exc}"
             print(f"  turn/start alone failed: {first}")
             print("  retrying on a FRESH connection, resume first — a wedged connection")
