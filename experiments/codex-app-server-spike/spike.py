@@ -1689,7 +1689,9 @@ def main() -> int:
             # thread and then drove a turn in it successfully -- a warning that
             # its own run disproved four lines later.
             print(f"  writer lock on {target} is OURS (we just created it) — expected")
+            FACTS.append(f"target thread {target} is ours, its writer lock is expected")
             hits = []
+            lockdir = None  # nothing further to say; see below
         if hits:
             for f in hits:
                 body = ""
@@ -1697,7 +1699,11 @@ def main() -> int:
                     body = f.read_text(errors="replace").strip()[:120]
                 print(f"  WRITER LOCK held on this thread: {f.name}  {body}")
             FACTS.append(f"target thread {target} HAS a writer-lock file — expect a refusal/hang")
-        elif lockdir.is_dir():
+        elif lockdir is not None and lockdir.is_dir():
+            # Only reachable when the thread is NOT ours. Run 30 printed this
+            # immediately under "the lock is OURS", so the same thread was
+            # reported as both locked-by-us and not-locked, and the fact line
+            # kept the second one.
             print(f"  no writer-lock file for this thread in {lockdir}")
             FACTS.append(f"target thread {target} has NO writer-lock file")
     if target and not args.turn:
