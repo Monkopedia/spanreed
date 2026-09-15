@@ -44,6 +44,7 @@ import argparse
 import atexit
 import base64
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -593,6 +594,48 @@ def probe_config(home: Path) -> None:
     FACTS.append(
         f"config.toml: {len(mcp)} MCP server(s), {len(required)} `required` line(s){verdict}"
     )
+
+
+def probe_lock_files(home: Path) -> None:
+    """Ask the OS who holds Codex's advisory locks.
+
+    `app-server-control/app-server-startup.lock` is zero bytes, so printing its
+    contents -- which this spike has done since run 8 -- says nothing at all. A
+    zero-byte lock file carries its state in the kernel, not in the file, and
+    the only way to read it is to try to take it.
+
+    This matters because the machine runs several codex processes, including
+    ChatGPT.app's. If app-server is a per-machine singleton, a second one would
+    serve `initialize` and `thread/loaded/list` (transport and in-process) while
+    everything touching the shared thread store waits on the holder -- which is
+    exactly the split observed.
+
+    LOCK_NB throughout: never wait, and release immediately on success.
+    """
+    targets = sorted((home / "app-server-control").glob("*.lock")) + sorted(
+        (home / "thread-writer-locks").glob("*.lock")
+    )
+    if not targets:
+        print("  no .lock files to test")
+        return
+    for lf in targets:
+        try:
+            fh = lf.open("a")
+        except OSError as exc:
+            print(f"  {lf.name}: cannot open ({exc})")
+            continue
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            # EWOULDBLOCK/EAGAIN: somebody else has it right now.
+            print(f"  {lf.name}: HELD by another process ({exc.strerror})")
+            FACTS.append(f"{lf.name} is HELD by a live process — a singleton is in force")
+            fh.close()
+            continue
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+        print(f"  {lf.name}: free (nobody holds it)")
+        FACTS.append(f"{lf.name} free — not a held lock")
 
 
 def probe_state_db(home: Path) -> None:
@@ -1242,6 +1285,9 @@ def main() -> int:
         print("\n  Codex IS running but nothing is listening. If none of those command")
         print("  lines is an `app-server`, that is the answer: the TUI keeps its threads")
         print("  in-process and exposes no socket for another client to reach.")
+
+    print("\n  Who holds Codex's advisory locks (a 0-byte lock file says nothing):")
+    probe_lock_files(home)
 
     print("\n  Config — the three documented reasons these calls hang:")
     probe_config(home)
