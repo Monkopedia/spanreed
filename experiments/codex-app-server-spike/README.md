@@ -169,7 +169,63 @@ and the one that is Codex's is the only one left.
 
 ---
 
-# Run 22: the fuse was the bug, and every extra attempt made it worse
+# Run 23: 90s was not enough either, and the probe that said "OK" was the problem
+
+90s did not help. `thread/list` does not take 20-42s here; it never returns. The
+fuse mattered — runs 21-22 really were cut short by it — but it was not the
+cause, and raising it turned a wrong answer into a slower wrong answer.
+
+What survived 23 runs unexamined is this line:
+
+```
+chatgpt.com TCP443 OK in 0.0s
+```
+
+That probe opened a TCP socket and printed OK. **A TLS-inspecting proxy accepts
+the connection and then intercepts it**, so on the exact network where this
+fails, a TCP connect succeeds. Twenty-three runs reported the network healthy
+using a check that could not detect the thing most likely to be wrong — the same
+"probe that cannot fail" this README has already caught twice.
+
+And app-server's own first log line, present in every single run, says:
+
+```
+using system root certificates because no CA override environment variable was selected
+```
+
+That is `CODEX_CA_CERTIFICATE` being unset. OpenAI documents it for corporate
+TLS proxies and private root CAs
+([openai/codex#6849](https://github.com/openai/codex/issues/6849) is login
+failing behind exactly that). The target machine is a **work** Mac. The one
+environment where this spike is meant to run is the one environment where that
+setting is likely to be required, and the server has been saying so from line
+one of every run while the reachability check printed OK above it.
+
+## What now runs instead
+
+- A **full TLS handshake** to each host, timed separately from the TCP connect,
+  followed by a real HTTP request.
+- The **certificate issuer**, printed. A public CA (Let's Encrypt, DigiCert,
+  Google Trust Services, Amazon, ISRG) means the connection reached OpenAI.
+  Anything else means it was terminated and re-signed in the middle, and the
+  probe says so outright.
+- **Proxy environment variables**, and whether `CODEX_CA_CERTIFICATE` is set.
+- **Sign-in state** — which auth files exist, their age, their key *names*, and
+  whether a token is expired. Never a value: these files hold live credentials,
+  and the leak check for that is asserted, not eyeballed.
+
+Control run on a machine with no proxy: `issuer=Let's Encrypt`,
+`issuer=Google Trust Services`, handshakes in 0.0s. That is what an
+uninterrupted connection looks like.
+
+## The correction this makes to the earlier runs
+
+Every run from 14 onward carried "chatgpt.com TCP443 OK" in its Key facts, and
+several of the theories above were built on top of it — network ruled out,
+therefore the fault must be in the protocol, the lock, the client, the queue.
+The network was never ruled out. It was never tested.
+
+# Run 22: the fuse was A bug (run 23: not the cause — read on)
 
 Run 22 cleared the remaining environmental theories in one pass:
 

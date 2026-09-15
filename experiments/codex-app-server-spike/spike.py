@@ -52,6 +52,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import ssl
 import struct
 import subprocess
 import sys
@@ -439,6 +440,41 @@ def is_stray_spike_server(ps_line: str) -> bool:
     return "app-server" in cmd and SOCK_PREFIX in cmd
 
 
+def probe_auth(home: Path) -> None:
+    """Say whether codex is signed in, without ever printing a credential.
+
+    Only shapes and timestamps: which auth files exist, how big, how old, and
+    whether a token looks expired. app-server answering `initialize` proves the
+    process started, not that it has a usable account behind it -- and every
+    call that hangs is one that needs the account.
+    """
+    candidates = [home / "auth.json", home / "auth" / "auth.json"]
+    found = [c for c in candidates if c.is_file()]
+    if not found:
+        print(f"  no auth.json under {home} — this codex may not be signed in at all")
+        FACTS.append("no auth.json found — codex may not be signed in")
+        return
+    for f in found:
+        st = f.stat()
+        age_h = (time.time() - st.st_mtime) / 3600
+        print(f"  {f.name}: {st.st_size}B, last written {age_h:.1f}h ago")
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"    unreadable as JSON ({exc}) — cannot say whether it is valid")
+            continue
+        # Key NAMES only. Never a value: these files hold live credentials.
+        print(f"    keys: {', '.join(sorted(data.keys()))[:160]}")
+        for key in ("expires_at", "expiresAt", "expiry", "exp"):
+            exp = find_key(data, key)
+            if exp is not MISSING and isinstance(exp, (int, float)):
+                left = (exp - time.time()) / 60
+                state = "EXPIRED" if left < 0 else f"{left:.0f} min left"
+                print(f"    {key}: {state}")
+                FACTS.append(f"auth token {state}")
+                break
+
+
 def probe_state_db(home: Path) -> None:
     """Read the thread store directly, with no app-server in the way.
 
@@ -790,18 +826,68 @@ def main() -> int:
     # not run unless an unrelated precondition held, in the step meant to
     # establish what is true before anything else.
     hr("Reachability — the dependency every hanging call shares")
+    # This used to open a TCP socket and print "OK". Twenty-three runs reported
+    # both hosts reachable in 0.0s while every call that needed them hung.
+    # A TLS-inspecting proxy ACCEPTS the connection and then intercepts, so TCP
+    # success is not evidence of anything -- it is the probe that cannot fail.
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"):
+        if os.environ.get(name):
+            print(f"  {name} = {os.environ[name]}")
+            FACTS.append(f"{name} is set — traffic is proxied")
+    ca_override = os.environ.get("CODEX_CA_CERTIFICATE")
+    print(f"  CODEX_CA_CERTIFICATE: {ca_override or '(unset)'}")
+    if not ca_override:
+        print("    app-server logs 'using system root certificates because no CA override'")
+        print("    on every run. On a network that inspects TLS, that is the setting that")
+        print("    would be needed -- see openai/codex#6849.")
+
     for host, port in (("chatgpt.com", 443), ("api.openai.com", 443)):
         t0 = time.monotonic()
         try:
-            sk = socket.create_connection((host, port), timeout=6)
-            sk.close()
-            line = f"{host} TCP443 OK in {time.monotonic() - t0:.1f}s"
+            sk = socket.create_connection((host, port), timeout=10)
         except Exception as exc:
-            line = f"{host} UNREACHABLE after {time.monotonic() - t0:.1f}s — {exc}"
+            line = f"{host} TCP UNREACHABLE after {time.monotonic() - t0:.1f}s — {exc}"
+            FACTS.append(line)
+            print(f"  {line}")
+            continue
+        tcp = time.monotonic() - t0
+        # The handshake is the part a proxy changes. Its issuer names the proxy.
+        try:
+            ctx = ssl.create_default_context()
+            t1 = time.monotonic()
+            with ctx.wrap_socket(sk, server_hostname=host) as tls:
+                cert = tls.getpeercert() or {}
+                issuer = {k: v for part in cert.get("issuer", ()) for k, v in part}
+                org = issuer.get("organizationName") or issuer.get("commonName") or "?"
+                hs = time.monotonic() - t1
+                tls.settimeout(10)
+                tls.sendall(
+                    f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+                )
+                t2 = time.monotonic()
+                head = tls.recv(200).decode(errors="replace").splitlines()
+                status = head[0] if head else "(no response line)"
+            line = (
+                f"{host} TLS OK: tcp {tcp:.1f}s, handshake {hs:.1f}s, "
+                f"HTTP {time.monotonic() - t2:.1f}s -> {status[:40]} | issuer={org}"
+            )
+            # A cert issued by anything other than a public CA means the
+            # connection is being terminated and re-signed in the middle.
+            if not any(
+                k in org.lower() for k in ("digicert", "let's encrypt", "google", "amazon", "isrg")
+            ):
+                line += "  <-- NOT a public CA: this connection is being intercepted"
+        except ssl.SSLError as exc:
+            line = f"{host} TLS FAILED after {time.monotonic() - t0:.1f}s — {exc}"
+        except Exception as exc:
+            line = f"{host} TLS/HTTP FAILED after {time.monotonic() - t0:.1f}s — {exc!r}"
+        finally:
+            with contextlib.suppress(OSError):
+                sk.close()
         FACTS.append(line)
         print(f"  {line}")
-    print("  If these are blocked, turn/start cannot complete whatever params it gets,")
-    print("  and every finding here describes this network rather than Codex.")
+    print("  A TCP connect proves only that something answered on port 443.")
+    print("  The handshake and the issuer are what say whether it was OpenAI.")
 
     hr("Environment")
     codex = shutil.which("codex")
@@ -944,6 +1030,9 @@ def main() -> int:
         print("\n  Codex IS running but nothing is listening. If none of those command")
         print("  lines is an `app-server`, that is the answer: the TUI keeps its threads")
         print("  in-process and exposes no socket for another client to reach.")
+
+    print("\n  Sign-in state (shapes and times only, never a credential):")
+    probe_auth(home)
 
     print("\n  Reading the thread store directly, bypassing app-server entirely:")
     probe_state_db(home)
