@@ -41,6 +41,7 @@ If a step fails, the printed reason names the assumption, so you can tell
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import contextlib
 import hashlib
@@ -48,7 +49,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -324,6 +327,11 @@ FACTS: list[str] = []
 # one blocks the span forever with no error and no timeout -- which is exactly
 # what runs 14-20 looked like. Reported independently by at least four other
 # clients; see the README for the issue links.
+# The socket dir prefix, used both to CREATE our temp dir and to RECOGNISE a
+# server an earlier run left behind. One constant, because a detector that
+# drifts from the thing it detects silently stops detecting.
+SOCK_PREFIX = "spanreed-spike-"
+
 SEEN_SERVER_REQUESTS: list[str] = []
 
 
@@ -370,6 +378,109 @@ def handle_server_request(sock: socket.socket, msg: dict[str, Any], style: str) 
             error={"code": -32601, "message": f"spanreed-spike does not implement {method}"},
         )
         print("     -> answered -32601 method not found (a refusal beats a stall)")
+
+
+# Every app-server this process spawns. Cleanup used to live only at the end of
+# report(), so a Ctrl-C or an exception left the server running -- and each
+# survivor keeps contending for the same CODEX_HOME sqlite as the next run. That
+# is a leak whose symptom is the NEXT run looking broken, which is the hardest
+# kind to attribute.
+SPAWNED: list[subprocess.Popen] = []
+
+
+def _reap(*_: Any) -> None:
+    for proc in SPAWNED:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def install_reaper() -> None:
+    """Kill spawned servers on normal exit AND on the signals that skip it."""
+    atexit.register(_reap)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        prev = signal.getsignal(sig)
+
+        def handler(signum: int, frame: Any, _prev: Any = prev) -> None:
+            _reap()
+            if callable(_prev):
+                _prev(signum, frame)
+            else:
+                sys.exit(128 + signum)
+
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(sig, handler)
+
+
+def is_stray_spike_server(ps_line: str) -> bool:
+    """True only for an app-server THIS script leaked in an earlier run.
+
+    A substring test on the whole ps line is not identity: the first version of
+    this matched any process whose command line merely mentioned the socket
+    prefix, which included the shell running the test that found the bug. With
+    --kill-strays that is a SIGTERM to the user's shell.
+
+    So require all three: the executable is actually `codex`, it is running
+    `app-server`, and its socket is under our own prefix. A shell that merely
+    quotes any of those fails the first test.
+    """
+    parts = ps_line.split(None, 1)
+    if len(parts) != 2 or not parts[0].isdigit():
+        return False
+    pid, cmd = int(parts[0]), parts[1]
+    if pid == os.getpid():
+        return False
+    argv0 = cmd.split()[0] if cmd.split() else ""
+    if Path(argv0).name != "codex":
+        return False
+    return "app-server" in cmd and SOCK_PREFIX in cmd
+
+
+def probe_state_db(home: Path) -> None:
+    """Read the thread store directly, with no app-server in the way.
+
+    `thread/list` with useStateDbOnly answered in 0.0s for several runs and then
+    began timing out. That call is the one documented to stay local, so if the
+    file itself is readable here while app-server cannot answer from it, the
+    fault is in the server or in contention for the file -- not in the protocol,
+    and not in this client. Opening read-only means this probe cannot be the
+    thing that locks it.
+    """
+    dbs = sorted(home.glob("thread_history*.sqlite"))
+    if not dbs:
+        print("  no thread_history*.sqlite under CODEX_HOME — nothing to read directly")
+        return
+    for db in dbs:
+        sidecars = [x.name for x in home.glob(db.name + "-*")]
+        print(f"  {db.name}  {db.stat().st_size}B  sidecars={sidecars or 'none'}")
+        t0 = time.monotonic()
+        try:
+            # immutable=1 promises we will not write and skips locking entirely,
+            # so a writer holding the file cannot block this read.
+            con = sqlite3.connect(f"file:{db}?immutable=1", uri=True, timeout=5)
+            try:
+                tables = [
+                    r[0]
+                    for r in con.execute(
+                        "select name from sqlite_master where type='table'"
+                    ).fetchall()
+                ]
+                print(
+                    f"    opened in {time.monotonic() - t0:.2f}s; tables: {', '.join(tables[:8])}"
+                )
+                for t in tables:
+                    if "thread" in t.lower():
+                        n = con.execute(f"select count(*) from {t}").fetchone()[0]
+                        print(f"    {t}: {n} row(s)")
+                        FACTS.append(f"state DB readable directly: {t} has {n} row(s)")
+            finally:
+                con.close()
+        except sqlite3.Error as exc:
+            print(f"    sqlite refused it after {time.monotonic() - t0:.2f}s: {exc}")
+            FACTS.append(f"state DB NOT readable directly: {exc}")
 
 
 def _minimal_params(target: dict[str, Any], cwd: str) -> dict[str, Any]:
@@ -595,6 +706,7 @@ def try_stdio(codex: str, params: Any) -> str:
         stderr=subprocess.PIPE,
         text=True,
     )
+    SPAWNED.append(proc)
     req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
     try:
         out, err = proc.communicate(req + "\n", timeout=20)
@@ -609,6 +721,13 @@ def try_stdio(codex: str, params: Any) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument(
+        "--kill-strays",
+        action="store_true",
+        help="SIGTERM app-servers left behind by earlier runs of this script. They "
+        "are identified by our own socket prefix in their command line, so the TUI "
+        "and anything you started are never touched.",
+    )
     ap.add_argument(
         "--fresh",
         action="store_true",
@@ -653,6 +772,7 @@ def main() -> int:
         "spawned server; a shorter fuse fails faster when contention is the cause.",
     )
     args = ap.parse_args()
+    install_reaper()
 
     steps = [
         Step(1, "Does `codex app-server` start under this machine's sign-in?"),
@@ -777,20 +897,54 @@ def main() -> int:
     procs = subprocess.run(["pgrep", "-af", "codex"], capture_output=True, text=True)
     raw = [ln.strip() for ln in (procs.stdout or "").splitlines() if ln.strip()]
     lines: list[str] = []
+    strays: list[str] = []
     for ln in raw:
         if ln.isdigit():  # macOS pgrep has no -a; it printed bare pids on run 7
             cmd = subprocess.run(["ps", "-p", ln, "-o", "command="], capture_output=True, text=True)
             ln = f"{ln} {cmd.stdout.strip()}"
+        if is_stray_spike_server(ln):
+            # A leak from an EARLIER run. Nothing of ours is spawned yet at step
+            # 0, so every one of these is a server a previous run failed to kill
+            # -- and they all contend on the same CODEX_HOME sqlite.
+            #
+            # This used to be `if "spike" in ln: continue`, which silently
+            # dropped exactly these from the inventory. Twenty runs reported
+            # "codex processes running: N" with our own leaked servers excluded
+            # from N, while the calls that touch that sqlite got slower and then
+            # stopped answering at all.
+            strays.append(ln)
+            continue
         if "spike" in ln:
             continue
         lines.append(ln)
     print(f"\n  codex processes running: {len(lines)}")
     for ln in lines[:8]:
         print(f"    {ln[:160]}")
+    print(f"  LEAKED spanreed-spike servers from earlier runs: {len(strays)}")
+    for ln in strays[:10]:
+        print(f"    {ln[:160]}")
+    if strays:
+        FACTS.append(f"{len(strays)} LEAKED spike app-server(s) contending on this CODEX_HOME")
+        print("    These hold the same thread_history sqlite this run needs. Re-run with")
+        print("    --kill-strays to end them, or kill them by hand. Only processes whose")
+        print("    command line contains our own socket prefix are listed, so nothing")
+        print("    here is the TUI or anything you started.")
+        if args.kill_strays:
+            for ln in strays:
+                pid = ln.split()[0]
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                    print(f"    killed {pid}")
+                except (OSError, ValueError) as exc:
+                    print(f"    could not kill {pid}: {exc}")
+            time.sleep(1.5)
     if lines and not live:
         print("\n  Codex IS running but nothing is listening. If none of those command")
         print("  lines is an `app-server`, that is the answer: the TUI keeps its threads")
         print("  in-process and exposes no socket for another client to reach.")
+
+    print("\n  Reading the thread store directly, bypassing app-server entirely:")
+    probe_state_db(home)
 
     # ---- step 1: start the server -------------------------------------------
     hr("Step 1 — start app-server on a unix socket")
@@ -814,7 +968,7 @@ def main() -> int:
         s1.ok(f"using existing socket {sock_path} (not spawned by this script)")
         print(f"  {s1.verdict}: {s1.detail}")
     else:
-        tmp = Path(tempfile.mkdtemp(prefix="spanreed-spike-"))
+        tmp = Path(tempfile.mkdtemp(prefix=SOCK_PREFIX))
         sock_path = tmp / "app.sock"
         cmd = [codex, "app-server", "--listen", f"unix://{sock_path}"]
         print(f"  $ {' '.join(cmd)}")
@@ -824,6 +978,7 @@ def main() -> int:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
         )
+        SPAWNED.append(proc)
 
         for _ in range(60):  # up to ~15s
             if sock_path.exists():

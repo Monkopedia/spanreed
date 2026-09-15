@@ -169,7 +169,72 @@ and the one that is Codex's is the only one left.
 
 ---
 
-# Run 20: the writer lock was wrong, and the client was never holding up its end
+# Run 21: the server-request theory is dead, and the spike was hiding its own mess
+
+Run 21 answered the previous run's question cleanly, in the negative:
+
+```
+server->client REQUESTS seen: NONE.
+```
+
+app-server asked this client nothing. Unanswered server requests are **ruled
+out**. The responder stays — it is correct, and four other clients needed it —
+but it is not what hangs this spike.
+
+Run 21 also produced a regression that is more informative than the theory it
+killed. `thread/list` with `useStateDbOnly: true` **answered in 0.0s in every
+earlier run and now times out**. That call is the one documented to stay local.
+The protocol did not change between runs; the machine did.
+
+## What the spike was hiding
+
+The process inventory contained this:
+
+```python
+if "spike" in ln:
+    continue
+```
+
+Intended to skip the current run. It also skipped **every app-server leaked by
+the twenty runs before it**. Each run spawns a server against the same
+`CODEX_HOME`, cleanup lived only at the end of `report()`, and any Ctrl-C or
+exception skipped it. So the inventory printed "codex processes running: N"
+with our own survivors excluded from N — while the calls that touch that store
+got slower, and then stopped answering.
+
+Three fixes, in order of how much trouble they were:
+
+1. **Leaked servers are counted and named**, not filtered out.
+2. **`install_reaper()`** terminates spawned servers from `atexit` and from
+   SIGINT/SIGTERM/SIGHUP, so the paths that skip `report()` no longer leak.
+   Verified by sending SIGINT mid-run and counting survivors: zero.
+3. **`--kill-strays`** ends the ones already out there.
+
+### The bug inside the fix
+
+The first version of the detector tested `if "spanreed-spike" in ps_line`. Run
+against a test harness, it reported **3** strays where 1 existed — it had matched
+the shell running the test, whose command line merely quoted the string. With
+`--kill-strays` that is a SIGTERM to the user's shell.
+
+`is_stray_spike_server()` now requires all three of: argv[0] whose basename is
+`codex`, `app-server` in the arguments, and our own socket prefix. A shell
+quoting any of those fails the first test. Six cases are asserted, including the
+exact line that fooled the first version.
+
+The same bug then bit the test harness itself — `pkill -f "sleep 999"` killed
+the shell running it, for the identical reason. Substring is not identity, in
+either direction.
+
+## Reading the store without app-server in the way
+
+`probe_state_db()` opens `thread_history*.sqlite` directly with `immutable=1`,
+which skips locking entirely so the probe cannot itself become the contention it
+is looking for. If the file reads fine here while app-server cannot answer from
+it, the fault is in the server or in contention for the file — not in the
+protocol, and not in this client.
+
+# Run 20: the client was never holding up its end (run 21 ruled this out as the cause — read on)
 
 Run 20 killed the writer-lock theory in one line: `thread/start` **also** timed
 out. A thread that does not exist yet cannot be locked. The lock is real and
