@@ -267,6 +267,12 @@ def jsonrpc(
                         raise RuntimeError(f"server returned an error: {msg['error']}")
                     return msg.get("result")
                 nm = msg.get("method")
+                if nm and msg.get("id") is not None:
+                    # A request, not a notification. Unanswered, it hangs the
+                    # server -- this is the bug that made every backend-touching
+                    # call time out with the span still open.
+                    handle_server_request(sock, msg, style)
+                    continue
                 if nm and on_notify is not None:
                     on_notify(nm, msg.get("params") or {})
                 continue
@@ -287,7 +293,13 @@ def jsonrpc(
                 if "error" in msg:
                     raise RuntimeError(f"server returned an error: {msg['error']}")
                 return msg.get("result")
-            # else: a notification or another id — keep reading.
+            nm = msg.get("method")
+            if nm and msg.get("id") is not None:
+                handle_server_request(sock, msg, style)
+                continue
+            if nm and on_notify is not None:
+                on_notify(nm, msg.get("params") or {})
+            # else: a response to another id — keep reading.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"no response to {method} within {timeout}s")
@@ -305,6 +317,59 @@ SCHEMA_PARAMS: dict[str, dict[str, Any]] = {}
 # reachability answer lives, the single thing that run existed to produce. A
 # diagnostic placed where it gets trimmed is one that was not produced.
 FACTS: list[str] = []
+
+
+# Every server->client REQUEST this run saw. This is the headline finding when
+# a call hangs: app-server asks the client questions mid-call, and an unanswered
+# one blocks the span forever with no error and no timeout -- which is exactly
+# what runs 14-20 looked like. Reported independently by at least four other
+# clients; see the README for the issue links.
+SEEN_SERVER_REQUESTS: list[str] = []
+
+
+def server_reply(
+    sock: socket.socket, rid: Any, style: str, result: Any = None, error: Any = None
+) -> None:
+    """Answer a server-initiated request.
+
+    The `"jsonrpc": "2.0"` member is omitted deliberately: app-server leaves it
+    off its own frames, and clients that require it drop the peer's messages.
+    """
+    msg: dict[str, Any] = {"id": rid}
+    if error is not None:
+        msg["error"] = error
+    else:
+        msg["result"] = result
+    sock.sendall(frame(json.dumps(msg).encode(), style))
+
+
+def handle_server_request(sock: socket.socket, msg: dict[str, Any], style: str) -> None:
+    """Reply to a server request, and say out loud that it happened.
+
+    Declining is the right default for a probe -- the prompt tells the model to
+    touch nothing, so any approval ask is already off-script. A decline ends the
+    turn with an answer; silence ends it with a hang, and an answer is the thing
+    this spike exists to produce.
+    """
+    rid = msg.get("id")
+    method = msg.get("method") or ""
+    SEEN_SERVER_REQUESTS.append(method)
+    print(f"  <= SERVER REQUEST  {method}  {json.dumps(msg.get('params') or {})[:110]}")
+    low = method.lower()
+    if "approval" in low:
+        server_reply(sock, rid, style, result={"decision": "decline"})
+        print("     -> answered decision=decline")
+    elif "elicitation" in low:
+        server_reply(sock, rid, style, result={"action": "decline"})
+        print("     -> answered action=decline")
+    else:
+        server_reply(
+            sock,
+            rid,
+            style,
+            error={"code": -32601, "message": f"spanreed-spike does not implement {method}"},
+        )
+        print("     -> answered -32601 method not found (a refusal beats a stall)")
 
 
 def _minimal_params(target: dict[str, Any], cwd: str) -> dict[str, Any]:
@@ -1401,6 +1466,20 @@ def report(
         hr("Key facts (repeated here because the top of a long run gets truncated)")
         for line in FACTS:
             print(f"  {line}")
+    # Printed unconditionally, including the zero case. "the server asked us
+    # nothing" and "we never looked" have to be distinguishable, or the next run
+    # re-argues a question this one already settled.
+    if SEEN_SERVER_REQUESTS:
+        uniq = sorted(set(SEEN_SERVER_REQUESTS))
+        print(f"\n  server->client REQUESTS seen ({len(SEEN_SERVER_REQUESTS)} total):")
+        for m in uniq:
+            print(f"    {m}  x{SEEN_SERVER_REQUESTS.count(m)}")
+        print("    Each was answered. An unanswered one is the documented cause of")
+        print("    a span that stays open with no error -- which is what hung before.")
+    else:
+        print("\n  server->client REQUESTS seen: NONE.")
+        print("    The client answered everything asked of it, so an unanswered server")
+        print("    request is RULED OUT as the cause of any hang in this run.")
     hr("Result")
     for s in steps:
         print(f"  {s.n}. [{s.verdict:11}] {s.question}\n        {s.detail}")

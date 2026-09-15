@@ -169,7 +169,66 @@ and the one that is Codex's is the only one left.
 
 ---
 
-# Run 19: the hang is a writer lock, and the spike was asking the wrong question
+# Run 20: the writer lock was wrong, and the client was never holding up its end
+
+Run 20 killed the writer-lock theory in one line: `thread/start` **also** timed
+out. A thread that does not exist yet cannot be locked. The lock is real and
+documented, but it is not what hangs this spike.
+
+What the 20 runs actually show is a clean split:
+
+| Answers instantly | Hangs forever, span open, no error |
+| --- | --- |
+| `initialize` | `thread/list` without `useStateDbOnly` |
+| `thread/loaded/list` | `thread/resume` |
+| `thread/list` with `useStateDbOnly: true` | `thread/start` |
+| | `turn/start` |
+
+The right-hand column is every call that reaches the backend. The left-hand
+column is every call that does not.
+
+## The cause: app-server asks the client questions, and this client never answered
+
+app-server is **bidirectional** JSON-RPC. It sends *requests* to the client —
+`execCommandApproval`, `applyPatchApproval`, `mcpServer/elicitation/request` —
+and blocks until the client responds. There is no timeout on the server side.
+
+This spike's `jsonrpc()` matched inbound frames by `id` and dropped everything
+else. A server request has a `method` *and* an `id`, so it fell through to the
+notification branch and was discarded — and `on_notify` was only ever wired up
+during `turn/start`, so during `thread/start` the discard was silent.
+
+At least four other clients shipped this same bug:
+
+- [Clubhouse#1720](https://github.com/Agent-Clubhouse/Clubhouse/issues/1720) — "drops 7 of 9 server requests with no response, hanging the turn"
+- [signalxjs/ai#126](https://github.com/signalxjs/ai/issues/126) — "no default response, so an unmapped request leaves the thread hanging"
+- [solenta#1171](https://github.com/currentbits/solenta/issues/1171) — "left unanswered never times out; the thread stays in waitingOnApproval indefinitely"
+- [memql-cockpit#446](https://github.com/znasllc-io/memql-cockpit/issues/446) — a framing variant of the same stall
+
+Their recommended fix is the one taken here: answer *everything*, and answer
+unknown methods with `-32601` rather than silence, because a refusal is
+diagnosable and a stall is not.
+
+## What changed
+
+`handle_server_request()` replies to every server-initiated request on every
+call, not just during turns: approvals get `decision=decline`, elicitation gets
+`action=decline`, anything unrecognised gets `-32601`. Declining is correct for a
+probe whose prompt tells the model to touch nothing — it ends the turn with an
+answer instead of a hang.
+
+Per the app-server protocol the `"jsonrpc": "2.0"` member is **omitted** on
+replies; app-server leaves it off its own frames.
+
+Every server request is printed as it arrives, and the report prints the
+**zero case explicitly** — "REQUESTS seen: NONE" rules the theory out, where
+silence would leave the next run re-arguing it.
+
+Verified against a stub that reproduces the reported bug: a server that blocks
+`thread/start` until the client answers now gets its answer and completes, where
+before it timed out exactly as run 20 did.
+
+# Run 19: a writer lock looked like the cause (run 20 disproved this — read on)
 
 Run 19 added `thread/resume` with `excludeTurns: true` and it **also** timed out.
 The server log ends on the `thread/resume` span with 0 warn/error — entered,
