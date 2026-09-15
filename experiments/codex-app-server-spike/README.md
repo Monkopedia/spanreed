@@ -169,6 +169,65 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# Run 22: the fuse was the bug, and every extra attempt made it worse
+
+Run 22 cleared the remaining environmental theories in one pass:
+
+- **The store is fine.** Read directly with `immutable=1`: `thread_turns` 36 rows,
+  `thread_items` 201, `thread_history_projection_state` 2. Instant, unlocked.
+- **No leaked servers.** The stray count was zero.
+- **No server requests.** Ruled out in run 21 and still true.
+- **Network reachable**, both hosts, under 0.1s.
+
+And `thread/list` failed on all three variants at **exactly 20.0s** — which is
+this script's `--timeout` default, not a property of Codex.
+
+## The measured cost is 20-42s; the fuse was 20
+
+[openai/codex#45246](https://github.com/openai/codex/issues/45246) clocks
+`thread/list` at **20-42 seconds** on a host with many unarchived threads — it
+scales with thread count. [#36416](https://github.com/openai/codex/issues/36416)
+reports the same shape when the call scans rollouts.
+
+Runs 1-20 sat under that line and got 0.0s answers. The store then grew — 201
+items, largely from these runs — and crossed it. Nothing about the protocol
+changed between run 20 and run 21. The DB got bigger and the fuse stayed at 20.
+
+Default is now **90s**, above the reported ceiling.
+
+## Why the failures after the first one meant nothing
+
+A client-side timeout does **not** cancel the server-side work. app-server keeps
+the slot, and it has about six;
+[#36189](https://github.com/openai/codex/issues/36189) describes one slow call
+filling the queue until everything behind it expires.
+
+Runs 21 and 22 fired three `thread/list` variants and four `thread/start`
+attempts *after* the first timeout — seven requests into six slots, each queued
+behind a call still running. The script then printed:
+
+```
+thread/list  every variant failed — not a params problem
+```
+
+which is true, and not for the reason it implies. The variants were never
+reached. That line is now `no variant answered`, and a timeout stops the loop
+with the queue explained, in all three places that used to keep going.
+
+Verified both directions against a stub with a deliberately slow `thread/list`:
+a fuse below the server's cost stops after one attempt instead of seven; a fuse
+above it answers normally.
+
+## What this retracts
+
+The run-19 heading and the run-20 heading both named a cause that later runs
+disproved. They are kept, marked, because the sequence is the point — four
+plausible mechanisms (writer lock, unanswered server request, leaked servers,
+DB contention) each explained the evidence available when it was proposed, and
+each was killed by a cheap probe rather than by argument. The one that survived
+was visible in every run since run 14: the timeouts all landed on the same
+round number, and a round number is a fuse, not a finding.
+
 # Run 21: the server-request theory is dead, and the spike was hiding its own mess
 
 Run 21 answered the previous run's question cleanly, in the negative:

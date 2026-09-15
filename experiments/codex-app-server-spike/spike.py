@@ -767,9 +767,11 @@ def main() -> int:
     ap.add_argument(
         "--timeout",
         type=float,
-        default=20.0,
-        help="seconds to wait per operation (default 20). Run 6 hung 3x60s against a "
-        "spawned server; a shorter fuse fails faster when contention is the cause.",
+        default=90.0,
+        help="seconds to wait per operation (default 90). It was 20, which sat exactly "
+        "on the boundary of a measured upstream cost: openai/codex#45246 clocks "
+        "thread/list at 20-42s on a host with many unarchived threads. Runs 21-22 "
+        "timed out at 20.0s on every call, which was this fuse, not a refusal.",
     )
     args = ap.parse_args()
     install_reaper()
@@ -1146,8 +1148,34 @@ def main() -> int:
                         f"  {method:20} [{label}] failed after "
                         f"{time.monotonic() - t0:.1f}s -- {type(exc).__name__}"
                     )
+                    if isinstance(exc, TimeoutError):
+                        # A client-side timeout does NOT cancel the server-side
+                        # work. app-server keeps the slot, and it has only six;
+                        # openai/codex#36189 describes exactly this, one slow
+                        # call filling the queue until everything behind it
+                        # expires. Runs 21-22 fired three list variants and four
+                        # thread/start attempts after the first timeout and read
+                        # the resulting wall of failures as "not a params
+                        # problem" -- which was true, and not for that reason.
+                        print(
+                            f"  {method:20} STOPPING after a timeout: the server is still "
+                            "working on that call"
+                        )
+                        print(
+                            "                       and holds one of ~6 request slots. More "
+                            "attempts queue behind it"
+                        )
+                        print(
+                            "                       and fail for that reason alone. See "
+                            "openai/codex#36189, #45246."
+                        )
+                        FACTS.append(
+                            f"{method} timed out at {args.timeout:.0f}s — remaining variants "
+                            "NOT tried, to avoid filling the server's request queue"
+                        )
+                        break
             if res is None:
-                print(f"  {method:20} every variant failed — not a params problem")
+                print(f"  {method:20} no variant answered")
                 continue
             ids = extract_ids(res)
             found.extend(i for i in ids if i not in found)
@@ -1207,6 +1235,10 @@ def main() -> int:
                     f"  thread/start {json.dumps(params)[:28]:30} no after "
                     f"{time.monotonic() - t0:.1f}s -- {str(exc)[:70]}"
                 )
+                if isinstance(exc, TimeoutError):
+                    print("  thread/start STOPPING after a timeout — see the note above;")
+                    print("  further attempts only queue behind the one still running.")
+                    break
                 continue
             ids = extract_ids(res)
             print(f"  thread/start {json.dumps(params)[:30]:32} YES -- {json.dumps(res)[:110]}")
@@ -1250,6 +1282,9 @@ def main() -> int:
                 res = jsonrpc(sock, buf, "thread/start", params, attempt_id, wire, args.timeout)
             except Exception as exc:
                 print(f"    thread/start {json.dumps(params)[:28]:30} no -- {str(exc)[:60]}")
+                if isinstance(exc, TimeoutError):
+                    print("    STOPPING: a timed-out call still holds a server slot.")
+                    break
                 continue
             ids = extract_ids(res)
             print(f"    thread/start {json.dumps(params)[:28]:30} YES -- {json.dumps(res)[:90]}")
