@@ -612,6 +612,23 @@ def main() -> int:
         print("    the thread/list and thread/start hangs — NOT a diagnosis. The last")
         print("    time a lock file was treated as evidence of contention it was wrong.")
 
+    # Reachability. Fifteen runs of tuning parameters, and nobody checked
+    # whether this machine can reach OpenAI at all. Everything that hangs needs
+    # the network (thread/list's remote sources, turn/start's model call);
+    # everything that answers is local (thread/loaded/list, initialize). If
+    # these are blocked, no parameter fixes it and the spike has been measuring
+    # the network rather than Codex.
+    print("\n  Reachability — the dependency every hanging call shares:")
+    for host, port in (("chatgpt.com", 443), ("api.openai.com", 443)):
+        t0 = time.monotonic()
+        try:
+            sk = socket.create_connection((host, port), timeout=6)
+            sk.close()
+            print(f"    {host:18} TCP 443 OK in {time.monotonic() - t0:.1f}s")
+        except Exception as exc:
+            print(f"    {host:18} UNREACHABLE after {time.monotonic() - t0:.1f}s — {exc}")
+            print("      ^ if this is blocked, turn/start cannot complete regardless of params")
+
     control = home / "app-server-control"
     if control.is_dir():
         print("\n  app-server-control/ — a running server may advertise itself here:")
@@ -965,13 +982,48 @@ def main() -> int:
             print(f"  thread/resume accepts: {acc}")
             if local:
                 print(f"  -> it has a local-only flag too: {local}")
+        # turn/start accepts `model` and `modelProvider`. Startup fetches the
+        # model list online; if that never completes, a turn with no explicit
+        # model has nothing to run on. models_cache.json in CODEX_HOME holds ids
+        # the machine has already seen, so this reads one rather than inventing
+        # it — the move that finally worked for thread/list.
+        turn_extra: dict[str, Any] = {}
+        cache = home / "models_cache.json"
+        if cache.is_file():
+            try:
+                blob = json.loads(cache.read_text())
+            except (json.JSONDecodeError, OSError):
+                blob = None
+            ids: list[str] = []
+
+            def collect(node: Any) -> None:
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        if k in ("id", "slug", "model") and isinstance(v, str) and v:
+                            ids.append(v)
+                        else:
+                            collect(v)
+                elif isinstance(node, list):
+                    for item in node:
+                        collect(item)
+
+            collect(blob)
+            uniq = list(dict.fromkeys(ids))
+            print(f"  models_cache.json offers {len(uniq)} id(s): {uniq[:6]}")
+            turn_params = SCHEMA_PARAMS.get("turn/start", {}).get("properties") or {}
+            if uniq and "model" in turn_params:
+                turn_extra["model"] = uniq[0]
+                print(f"  passing an explicit model: {uniq[0]}")
+        else:
+            print("  no models_cache.json — cannot supply an explicit model")
+
         print("  calling turn/start WITHOUT thread/resume (see comment)")
         try:
             res = jsonrpc(
                 sock,
                 buf,
                 "turn/start",
-                {"threadId": target, "input": [{"type": "text", "text": prompt}]},
+                {"threadId": target, "input": [{"type": "text", "text": prompt}], **turn_extra},
                 5,
                 wire,
             )
