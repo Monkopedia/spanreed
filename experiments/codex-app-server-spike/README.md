@@ -169,6 +169,56 @@ and the one that is Codex's is the only one left.
 
 ---
 
+# Run 24: TLS is clean, and the official docs name three causes — all in a file we never opened
+
+The real TLS probe came back clean: `issuer=Let's Encrypt`,
+`issuer=Google Trust Services`, handshakes in 0.0s, identical to an unproxied
+control machine. **No interception.** The proxy/CA theory is dead — and unlike
+the first twenty-three runs, the network is now actually tested rather than
+assumed.
+
+So the score on causes proposed: five offered, five wrong.
+
+## What the official documentation says
+
+From OpenAI's app-server docs, on `thread/list` and `thread/start`:
+
+> Neither operation typically hangs unless:
+> - Upstream model service is unavailable
+> - Sandbox initialization fails
+> - Required MCP servers fail to initialize (causes `thread/start`/`thread/resume` to fail entirely)
+
+All three are decided by `$CODEX_HOME/config.toml`. Twenty-four runs never
+opened it. The spike inventoried that directory by *name and size* from run 8
+onward — `config.toml` was listed, every run, unread.
+
+The docs also confirm the handshake this spike already does
+(`initialize` then `initialized`), and confirm `thread/list` is **not** supposed
+to block: *"It does not block — returns immediately with cursor-based
+pagination results."* So the hang is abnormal, not a slow path, which also
+retires what was left of the run-22 timing theory.
+
+## What now runs
+
+`probe_config()` prints `config.toml` with any key whose name looks like a
+credential redacted, then counts MCP servers and flags every line mentioning
+`required`. Both counts go to Key facts, including the zero case — "0 MCP
+servers" rules the documented cause out, and that is worth as much as finding
+one.
+
+Redaction is asserted against a config containing three planted secrets, not
+eyeballed.
+
+## The inconclusive probe that read as a pass
+
+Run 24's sign-in probe found `auth.json`, recognised none of its expiry field
+names, and appended **nothing** to Key facts. So the pasted output carried no
+auth line at all — indistinguishable from a machine where sign-in was checked
+and fine.
+
+That is the same defect as the TCP "OK": a check that cannot report its own
+failure. It now emits `expiry UNKNOWN` with the key names it did see.
+
 # Run 23: 90s was not enough either, and the probe that said "OK" was the problem
 
 90s did not help. `thread/list` does not take 20-42s here; it never returns. The

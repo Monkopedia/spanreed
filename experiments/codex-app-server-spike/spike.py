@@ -464,7 +464,8 @@ def probe_auth(home: Path) -> None:
             print(f"    unreadable as JSON ({exc}) — cannot say whether it is valid")
             continue
         # Key NAMES only. Never a value: these files hold live credentials.
-        print(f"    keys: {', '.join(sorted(data.keys()))[:160]}")
+        keys = ", ".join(sorted(data.keys()))[:160]
+        print(f"    keys: {keys}")
         for key in ("expires_at", "expiresAt", "expiry", "exp"):
             exp = find_key(data, key)
             if exp is not MISSING and isinstance(exp, (int, float)):
@@ -473,6 +474,62 @@ def probe_auth(home: Path) -> None:
                 print(f"    {key}: {state}")
                 FACTS.append(f"auth token {state}")
                 break
+        else:
+            # Run 24 hit this branch and contributed NOTHING to Key facts, so
+            # the paste read as if sign-in had been checked and was fine. An
+            # inconclusive probe has to say it is inconclusive.
+            print("    no expiry field recognised — cannot say if this token is valid")
+            FACTS.append(f"auth.json present ({age_h:.0f}h old, keys: {keys[:60]}), expiry UNKNOWN")
+
+
+SECRETISH = ("key", "token", "secret", "password", "passwd", "credential", "authorization")
+
+
+def probe_config(home: Path) -> None:
+    """Print config.toml, redacted, and name the settings documented to hang.
+
+    The official docs say thread/list and thread/start do not block, "unless:
+    upstream model service is unavailable, sandbox initialization fails,
+    required MCP servers fail to initialize". All three of those are decided by
+    this file, which twenty-four runs never opened.
+    """
+    cfg = home / "config.toml"
+    if not cfg.is_file():
+        print(f"  no config.toml under {home} — defaults everywhere")
+        FACTS.append("no config.toml — MCP/sandbox config RULED OUT")
+        return
+    try:
+        text = cfg.read_text(errors="replace")
+    except OSError as exc:
+        print(f"  config.toml unreadable: {exc}")
+        FACTS.append(f"config.toml unreadable: {exc}")
+        return
+
+    print(f"  config.toml — {len(text)} bytes, redacted:")
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        key = line.split("=")[0].strip().lower()
+        if "=" in line and any(w in key for w in SECRETISH):
+            line = f"{line.split('=')[0]}= <redacted>"
+        print(f"    {line[:150]}")
+
+    mcp = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("[mcp_servers")]
+    required = [ln.strip() for ln in text.splitlines() if "required" in ln.lower()]
+    print(f"\n  MCP servers configured: {len(mcp)}")
+    for m in mcp:
+        print(f"    {m}")
+    if required:
+        print("  lines mentioning `required` — a required MCP server that fails to")
+        print("  initialize makes thread/start and thread/resume fail outright:")
+        for r in required:
+            print(f"    {r}")
+    # Unconditional, both ways: "configured: 0" is a result, not an absence.
+    FACTS.append(
+        f"config.toml: {len(mcp)} MCP server(s), {len(required)} `required` line(s)"
+        + ("  <-- documented cause of thread/start hanging" if mcp else "")
+    )
 
 
 def probe_state_db(home: Path) -> None:
@@ -1030,6 +1087,9 @@ def main() -> int:
         print("\n  Codex IS running but nothing is listening. If none of those command")
         print("  lines is an `app-server`, that is the answer: the TUI keeps its threads")
         print("  in-process and exposes no socket for another client to reach.")
+
+    print("\n  Config — the three documented reasons these calls hang:")
+    probe_config(home)
 
     print("\n  Sign-in state (shapes and times only, never a credential):")
     probe_auth(home)
