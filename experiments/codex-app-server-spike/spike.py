@@ -403,7 +403,7 @@ def dump_schema(codex: str) -> list[tuple[str, Any]]:
                 print("      (not parseable)")
                 continue
             defs = doc.get("definitions", {})
-            for want in ("thread/list", "thread/start", "turn/start"):
+            for want in ("thread/list", "thread/resume", "thread/start", "turn/start"):
                 hit = _find_method(doc, want)
                 if not hit:
                     print(f"      {want}: not found by name in this schema")
@@ -949,12 +949,23 @@ def main() -> int:
         )
         print(f"  thread : {target}")
         print(f"  prompt : {prompt[:80]}...")
-        try:
-            jsonrpc(sock, buf, "thread/resume", {"threadId": target}, 4, wire)
-        except Exception as exc:
-            print(
-                f"  thread/resume FAILED  {type(exc).__name__}: {exc}  (may be fine — trying turn/start anyway)"
-            )
+        # Run 14: thread/resume timed out and the turn/start behind it timed out
+        # too. The server logs the resume span entering and never exiting, so if
+        # it handles a connection serially the turn may never have been attempted
+        # — making "turns are refused" and "the connection was already wedged"
+        # indistinguishable, which is the one distinction this step exists for.
+        #
+        # turn/start goes FIRST now. The thread id came from thread/list; resume
+        # was my assumption about what turn/start needs, never a requirement the
+        # schema stated.
+        resume_schema = SCHEMA_PARAMS.get("thread/resume")
+        if resume_schema:
+            acc = list((resume_schema.get("properties") or {}).keys())
+            local = [k for k in acc if "statedb" in k.lower() or "local" in k.lower()]
+            print(f"  thread/resume accepts: {acc}")
+            if local:
+                print(f"  -> it has a local-only flag too: {local}")
+        print("  calling turn/start WITHOUT thread/resume (see comment)")
         try:
             res = jsonrpc(
                 sock,
@@ -985,9 +996,36 @@ def main() -> int:
             else:
                 s4.ok(f"turn/start accepted: {json.dumps(res)[:200]}")
         except Exception as exc:
-            s4.no(
-                f"{type(exc).__name__}: {exc}  (A5 — or turns from a non-owning client are refused)"
-            )
+            first = f"{type(exc).__name__}: {exc}"
+            print(f"  turn/start alone failed: {first}")
+            print("  retrying on a FRESH connection, resume first — a wedged connection")
+            print("  and a refused turn are otherwise indistinguishable")
+            try:
+                alt = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                alt.settimeout(args.timeout)
+                abuf = ws_handshake(alt) if wire == "ws" else bytearray()
+                jsonrpc(alt, abuf, "initialize", {"clientInfo": client}, 1, wire, args.timeout)
+                notify(alt, "initialized", {}, wire)
+                rp: dict[str, Any] = {"threadId": target}
+                if resume_schema and "useStateDbOnly" in (resume_schema.get("properties") or {}):
+                    rp["useStateDbOnly"] = True
+                print(f"  thread/resume params: {json.dumps(rp)}")
+                jsonrpc(alt, abuf, "thread/resume", rp, 20, wire, args.timeout)
+                res = jsonrpc(
+                    alt,
+                    abuf,
+                    "turn/start",
+                    {"threadId": target, "input": [{"type": "text", "text": prompt}]},
+                    21,
+                    wire,
+                    args.timeout,
+                )
+                s4.ok(f"turn/start accepted after an explicit resume: {json.dumps(res)[:160]}")
+            except Exception as exc2:
+                s4.no(
+                    f"alone: {first} | with resume on a fresh connection: "
+                    f"{type(exc2).__name__}: {exc2}  (A5, or non-owning clients are refused)"
+                )
     print(f"  {s4.verdict}: {s4.detail}")
 
     return report(steps, args, proc, tmp, args.keep_socket)
