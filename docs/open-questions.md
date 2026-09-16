@@ -5,7 +5,7 @@ Things still to test, design, or decide.
 ## Behavioral / empirical
 - **A structural close for boundary prose** (recommended by the review of #56, not taken there): the
   guard in `tests/unit/test_codex_worker.py` is total on the *generator* axis — it walks every
-  emitted string in every module of the package — and a **six-phrase substring blacklist** on the
+  emitted string in every module of the package — and a **substring blacklist** (`FORBIDDEN`) on the
   *predicate* axis, so a newly-worded sentence making the same claim passes. Five review rounds
   produced five instances, and the last one shipped on a one-word difference (`the` worker vs
   `this` worker). The proposed close: *every emitted string containing `cwd` must be one of an

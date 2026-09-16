@@ -829,7 +829,7 @@ class TestNoBoundaryClaimInAnyEmittedString:
     **THIS IS A REGRESSION RATCHET OVER PHRASINGS ALREADY SHIPPED, NOT A
     DECISION PROCEDURE FOR THE CLAIM.** The generator is total -- every emitted
     string in every listed module is walked -- and the *predicate* is a
-    six-phrase substring blacklist, so a newly-worded sentence making the same
+    substring blacklist (see FORBIDDEN), so a newly-worded sentence making the same
     claim passes. The review of #56 demonstrated exactly that: a fresh sentence
     in the DEFAULT mode's preamble, green across the whole suite. It also
     demonstrated the one-word hole: "the only bound on what THE worker may
@@ -907,4 +907,57 @@ class TestNoBoundaryClaimInAnyEmittedString:
         assert any("REFUSING THE TURN" in t for t in found), "missed a real emitted string"
         assert not any(t.lstrip().startswith("Sent as ``developerInstructions``") for t in found), (
             "a docstring leaked into the emitted set"
+        )
+
+
+def test_no_prose_states_the_size_of_the_blacklist() -> None:
+    """A count written in prose is a fact that drifts.
+
+    FORBIDDEN grew by two entries while two docstrings and an open-questions
+    entry went on stating the original count. That is the defect this whole
+    guard exists to catch -- prose asserting something the code contradicts --
+    inside the guard's own description of itself, which is the one place nobody
+    thinks to check.
+
+    Note that this docstring does not quote the stale figure either. It could
+    be defended as a citation rather than a claim, and a guard that accepts
+    "quoted counts are fine" has a hole shaped exactly like the thing it
+    forbids. Describing it costs nothing.
+
+    The fix is not to correct the number. It is to stop stating it: the list is
+    right there and can be counted.
+
+    **DECLARED LIMIT: this refuses a CONSTRUCT, not a claim.** It cannot
+    distinguish an assertion from a citation, so it will also refuse a
+    legitimate quotation of the old wording, or a sentence explaining that the
+    count used to be wrong. That is the same defect shape as the doctor's step 3
+    passing on its own prompt -- a predicate that cannot tell who is speaking.
+
+    Kept blunt deliberately: the scope is the three files that describe this
+    guard, where a citation of the old count is exactly the thing that drifts
+    back into being a claim. If a fourth file ever needs to quote one, narrow
+    the scope rather than adding a quote exemption -- an exemption would be a
+    hole shaped like the thing it forbids.
+    """
+    import re
+
+    from spanreed import codex_worker
+
+    sources = {
+        "test_codex_worker.py": Path(__file__).read_text(),
+        "codex_worker.py": Path(codex_worker.__file__ or "").read_text(),
+        "open-questions.md": (Path(__file__).parents[2] / "docs" / "open-questions.md").read_text(),
+    }
+    # Match a COUNT only -- a digit or a number word. The first version matched
+    # any word before "phrase" against an allowlist of innocent ones, and
+    # immediately flagged "retracted phrase" in this very file: a guard whose
+    # own first run was a false positive is not one to keep.
+    numbers = r"\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+    pattern = re.compile(rf"\b({numbers})[- ]phrase", re.I)
+    for name, text in sources.items():
+        match = pattern.search(text)
+        assert match is None, (
+            f"{name} states a blacklist size ({match.group(0)!r}); "
+            f"FORBIDDEN has {len(TestNoBoundaryClaimInAnyEmittedString.FORBIDDEN)} "
+            f"entries and can be counted"
         )
