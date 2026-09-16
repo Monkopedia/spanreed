@@ -913,11 +913,19 @@ class TestNoBoundaryClaimInAnyEmittedString:
 def test_no_prose_states_the_size_of_the_blacklist() -> None:
     """A count written in prose is a fact that drifts.
 
-    FORBIDDEN grew by two entries while two docstrings and an open-questions
-    entry went on stating the original count. That is the defect this whole
-    guard exists to catch -- prose asserting something the code contradicts --
-    inside the guard's own description of itself, which is the one place nobody
-    thinks to check.
+    FORBIDDEN gained entries while the prose describing it went on stating the
+    original size. That is the defect this whole guard exists to catch -- prose
+    asserting something the code contradicts -- inside the guard's own
+    description of itself, which is the one place nobody thinks to check.
+
+    This paragraph used to say "two docstrings and an open-questions entry",
+    which was three sites where there were two: one docstring and one doc entry.
+    A miscounted claim about counts, in the commit whose purpose was to stop
+    making unverified count claims, and invisible to the guard below because
+    that guard checks claims about the blacklist's SIZE, not claims about how
+    many places repeated them. The lesson generalises one level up and is
+    applied here: do not state a count in prose. Not of the list, and not of the
+    sites either.
 
     Note that this docstring does not quote the stale figure either. It could
     be defended as a citation rather than a claim, and a guard that accepts
