@@ -272,7 +272,7 @@ Decided by the owner, 2026-09-15, in the session that closed the spike.
 
 | Control | Decision | Consequence accepted |
 |---|---|---|
-| Approvals | **Auto-approve within `--cwd`** | `execCommandApproval` / `applyPatchApproval` are answered `approve` when the target is inside `--cwd`, and `decline` otherwise. The worker can really edit and run, which is the point; the directory is the blast radius. |
+| Approvals | **Auto-approve within `--cwd`** | A **patch** approval is answered yes when every path it names is inside `--cwd`. An **exec** approval is answered yes when the *working directory* of the command is inside `--cwd` — the command's arguments are never examined, so `rm -rf /elsewhere` launched from `--cwd` is approved. Confinement for commands comes from `sandboxPolicy`, not from this check. |
 | Who may wake it | **Any registered agent** | Consistent with the trust model above — "if it's on the bus you can trust it". No allowlist. |
 | Concurrency | **Queue, FIFO** | One turn per message, each with its own reply. Senders may wait. Codex's native `steer` is deliberately *not* used: a steered turn produces one reply for two senders' messages, which the bus has no way to express. |
 | Thread lifetime | **One thread per worker** | Context accumulates, so a worker remembers its conversation the way a Claude session does. History growth is a token cost, not a correctness problem. |

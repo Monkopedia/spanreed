@@ -492,6 +492,15 @@ def _render_elicitation(params: object) -> str:
 
 
 MODES = ("read-only", "workspace", "danger")
+CONFINED_MODES = tuple(m for m in MODES if m != "danger")
+"""The modes that ask Codex for *some* confinement.
+
+Named here rather than written out in a test, because the guard that keeps
+mode-specific prose honest has to cover every confined mode including ones that
+do not exist yet. The review of #56 added a fourth mode with a freshly-worded
+false sentence and the guards passed: they iterated a literal list, so the new
+mode was simply not looked at. A hardcoded mode list inside the guard against
+mode drift is the thing the guard was supposed to replace."""
 
 
 def sandbox_policy(root: Path, mode: str = "workspace") -> dict[str, object]:

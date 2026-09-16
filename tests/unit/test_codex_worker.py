@@ -26,6 +26,7 @@ wrong:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from collections.abc import Callable
@@ -35,7 +36,7 @@ from typing import Any
 import pytest
 
 from spanreed import cli
-from spanreed.codex_approvals import MODES
+from spanreed.codex_approvals import CONFINED_MODES, MODES
 from spanreed.codex_worker import (
     AGENT_MESSAGE_DELTA,
     AUTH_TOKENS_REFRESH,
@@ -700,10 +701,16 @@ class TestBoundaryInstructionMatchesTheMode:
     """What the model is told must match what the code enforces.
 
     The preamble used to claim unconditionally that writes outside --cwd are
-    "declined by the worker before they reach you". True in workspace mode;
-    false in danger, where approval_policy() is "never" and nothing is ever
-    declined -- while DANGER_BANNER, in the same file, told the operator exactly
-    that. Found by the cross-repo review of #56.
+    "declined by the worker before they reach you". That is false in EVERY mode,
+    the default included: _decide_exec reads params["cwd"] and never what the
+    command targets, so `rm -rf /elsewhere` launched from --cwd is approved. It
+    is false a second way in danger, where approval_policy() is "never" and
+    nothing is asked at all.
+
+    An earlier version of this docstring said the claim was "true in workspace
+    mode", which is the belief that produced rounds three and four of the review
+    of #56 -- the defect kept reappearing in whichever branch nobody had
+    executed. Nothing here is true in workspace mode.
     """
 
     def test_danger_does_not_promise_a_boundary_it_does_not_have(self) -> None:
@@ -758,7 +765,10 @@ class TestBoundaryInstructionMatchesTheMode:
         # The durable form of all three: these templates may say what the worker
         # asks Codex for, because that is observable here. They may not assert
         # what Codex then does.
-        for mode in ("workspace", "read-only"):
+        # Derived, NOT a literal. The review added a fourth mode with a newly
+        # worded false sentence and this class reported 9 passed, because the
+        # loop iterated a hand-written list and never saw it.
+        for mode in CONFINED_MODES:
             text = BOUNDARY_BY_MODE[mode].format(cwd="/w")
             assert "asks Codex for" in text, mode
 
@@ -798,3 +808,81 @@ class TestApprovalReachesTheLogFile:
         log = log_of(worker)
         assert "DECLINE execCommandApproval" in log
         assert worker.log.failures == 0
+
+
+class TestNoBoundaryClaimInAnyEmittedString:
+    """The guard's generator is "prose the worker emits", not one dict.
+
+    Four review rounds, four instances, each somewhere the previous round's
+    guard did not reach: the danger template, the read-only template, the
+    workspace template, and then the --cwd-is-gone refusal 400 lines away --
+    emitted both to the operator's log AND onto the bus, where a peer agent
+    reads it exactly as the model reads the preamble.
+
+    So this walks the AST and checks every string the module can emit, skipping
+    docstrings: a docstring SAYING a phrase was retracted is this codebase
+    documenting its own history, while the same phrase in an emitted string is
+    the defect. A raw text scan cannot tell those apart and flagged the
+    explanation as the crime.
+    """
+
+    FORBIDDEN = (
+        "declined outside it",
+        "granted inside it",
+        "only bound on what the worker may touch",
+        "declines approvals for paths outside",
+        "declines every approval",
+        "buys you nothing",
+    )
+
+    @staticmethod
+    def _emitted_strings(path: Path) -> list[str]:
+        """Every string constant the module can emit, docstrings excluded."""
+        tree = ast.parse(path.read_text())
+        docstrings: set[int] = set()
+        for node in ast.walk(tree):
+            # Any string standing alone as a statement is documentation: a
+            # module/class/function docstring, or a PEP 258 attribute docstring
+            # following an assignment. The first version of this walk handled
+            # only the first-statement kind and flagged _BUS_PREAMBLE's
+            # attribute docstring -- which is where this codebase RECORDS the
+            # retracted phrases -- as an emitted claim. The meta-test below
+            # caught that, which is the only reason this comment exists.
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                docstrings.add(id(node.value))
+        out: list[str] = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in docstrings
+            ):
+                out.append(node.value)
+        return out
+
+    def test_no_emitted_string_makes_a_retracted_claim(self) -> None:
+        import spanreed.cli as cli_mod
+        import spanreed.codex_approvals as approvals_mod
+        import spanreed.codex_worker as worker_mod
+
+        for mod in (worker_mod, approvals_mod, cli_mod):
+            path = Path(mod.__file__ or "")
+            for text in self._emitted_strings(path):
+                for phrase in self.FORBIDDEN:
+                    assert phrase not in text, f"{path.name}: {phrase!r} in {text[:70]!r}"
+
+    def test_the_scan_sees_emitted_strings_and_not_docstrings(self) -> None:
+        # A guard that scans nothing passes everything. Prove both halves on a
+        # module whose shape is known.
+        import spanreed.codex_worker as worker_mod
+
+        found = self._emitted_strings(Path(worker_mod.__file__ or ""))
+        assert len(found) > 50, "the walk found almost nothing; it is not reading the module"
+        assert any("REFUSING THE TURN" in t for t in found), "missed a real emitted string"
+        assert not any(t.lstrip().startswith("Sent as ``developerInstructions``") for t in found), (
+            "a docstring leaked into the emitted set"
+        )

@@ -183,14 +183,15 @@ per round produced the next one:
   decision, so an approval plausibly *can* lift a sandbox restriction. Nobody
   has run this against a real app-server, so these templates say what is sent
   and stop there.
- The sentence used to
-be unconditional and claimed that writes outside ``--cwd`` are declined before
-they reach the model -- true in ``workspace``, and FALSE in ``danger``, where
-``approval_policy()`` returns ``"never"`` so the worker is never asked and
-declines nothing. DANGER_BANNER says exactly that, three lines from here: the
-operator was being warned while the model was told the opposite. This repo's own
-standard is that a log which is fiction is worse than no log; instructions to a
-model are held to it too."""
+
+The history is worth keeping because the same defect returned four times, each
+in a branch the previous round had not read. It started as one unconditional
+sentence claiming writes outside ``--cwd`` are declined before they reach the
+model -- false in ``danger``, where nothing is ever asked, and false in
+``workspace`` too, where the check never reads what a command targets. Each
+round fixed the branch under discussion and shipped the next one. The rule that
+came out of it is the one above: say what is sent, and let the guards in
+``tests/unit/test_codex_worker.py`` decide whether a new sentence is allowed."""
 
 _BOUNDARY_CONFINED = """\
 You work in {cwd}. The worker asks Codex for a workspaceWrite sandbox scoped to that
@@ -647,17 +648,18 @@ class CodexWorker:
             self.log.write(
                 f"[codex-worker] REFUSING THE TURN for {message.msg_id} from "
                 f"{message.from_agent}: --cwd {config.cwd} IS NO LONGER A DIRECTORY. That "
-                f"directory is this worker's entire security boundary — approvals are granted "
-                f"inside it and declined outside it — so with it gone no turn can be bounded. "
+                f"directory is what this worker checks approvals against and what it asks "
+                f"Codex to sandbox, so with it gone a turn cannot be bounded at all. "
                 f"No turn was started and nothing was retried. Restore the directory or "
                 f"restart the worker with a --cwd that exists."
             )
             self._reply(
                 message,
                 f"[codex-worker {config.name}] this worker refused to run your message: its "
-                f"--cwd ({config.cwd}) is no longer a directory, and that directory is the "
-                f"only bound on what the worker may touch. Nothing was run. The worker is "
-                f"still on the bus and will answer again once the directory is restored.",
+                f"--cwd ({config.cwd}) is no longer a directory, and that directory is what "
+                f"it checks approvals against and asks Codex to sandbox. Nothing was run. The "
+                f"worker is still on the bus and will answer again once the directory is "
+                f"restored.",
             )
             self.store.set_status(config.agent_id, "idle")
             return
