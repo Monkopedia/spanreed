@@ -31,12 +31,14 @@ design constraints here, not anecdotes:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -48,6 +50,7 @@ from .codex_client import CodexClient
 from .store import default_state_root
 
 MARKER = "SPANREED_DOCTOR_OK"
+ESCAPE_MARKER = "SPANREED_DOCTOR_ESCAPED"
 """What the model is asked to reply. Specific enough that it cannot appear by
 chance, and checked for rather than assumed -- the spike once reported a turn as
 driven when only `turn/start` had been *accepted*, with the reply never seen."""
@@ -523,59 +526,96 @@ def _run_protocol_steps(
 
         rep.rule("Step 4 - a REAL approval round-trip")
         rep.say("  This is the step that cannot be tested against a stub: it asks a live")
-        rep.say("  server to run a command, so the server itself decides whether the")
-        rep.say("  decision value we send back is one it accepts.")
+        rep.say("  server to do something the sandbox forbids, so the server itself decides")
+        rep.say("  whether the decision value we send back is one it accepts.")
+
+        # The probe must cross a boundary the sandbox ACTUALLY GUARDS, and two
+        # earlier versions did not.
+        #
+        #   `pwd` inside --cwd  -> app-server has no reason to ask. The first
+        #                          live run proved it: the command ran, no
+        #                          approval arrived, step 4 never executed.
+        #   `ls /etc`           -> outside --cwd and STILL not an escape.
+        #                          workspaceWrite confines WRITES to
+        #                          writableRoots and blocks the network; it does
+        #                          not stop a read. This would have reported
+        #                          "never exercised" a second time while looking
+        #                          like the question had been asked.
+        #
+        # A WRITE outside writableRoots is guarded by construction -- it is the
+        # precise thing --cwd maps onto in the policy this worker sends.
+        probe = Path(tempfile.gettempdir()) / f"spanreed-doctor-escape-{os.getpid()}.txt"
+        with contextlib.suppress(OSError):
+            probe.unlink()
+        resolved_cwd, resolved_probe = cwd.resolve(), probe.resolve()
+        if resolved_cwd == resolved_probe or resolved_cwd in resolved_probe.parents:
+            s4.skip(
+                f"the escape probe {probe} is INSIDE --cwd {cwd}, so writing it would test "
+                f"nothing. Re-run with a --cwd that does not contain the temp directory."
+            )
+            return finish(rep, fh, log_path)
+        rep.say(f"  escape probe: {probe}")
+        rep.say("  (outside --cwd, and removed by this doctor whatever happens)")
+
         before = len(seen_requests)
         try:
             client.turn_start(
                 thread_id,
-                # `pwd` is INSIDE the sandbox, so app-server never asks -- which
-                # is exactly what the first live run showed: the command ran, no
-                # approval arrived, and the one step that cannot be stubbed went
-                # unexercised.
-                #
-                # The approval channel is for going BEYOND the sandbox
-                # (ClientRequest.json documents ApprovalsReviewer as covering
-                # "sandbox escapes"). So ask for something outside --cwd, and
-                # deliberately a READ of a directory present on every unix: it
-                # exercises the escape path without writing anything, on a
-                # machine the author cannot inspect.
-                f"Run the shell command `ls /etc` -- note that path is OUTSIDE {cwd} -- "
-                f"and reply with the first line of its output. If you are not permitted "
-                f"to run it, reply with exactly why, in one line.",
+                f"Write the single line {ESCAPE_MARKER} to the file {probe} -- note that "
+                f"path is OUTSIDE {cwd}, which is the only directory this session is "
+                f"sandboxed to write in. If you cannot, reply with exactly why, one line.",
                 **turn_params,
             )
             r2 = client.wait_for_turn()
         except Exception as exc:
             s4.no(f"{type(exc).__name__}: {exc}")
             return finish(rep, fh, log_path)
+
         new_requests = seen_requests[before:]
         methods = sorted({m for m, _ in new_requests})
-        rep.fact(f"approval requests during the exec turn: {methods or 'NONE'}")
-        ran = str(cwd) in json.dumps([p for _, p in r2.events])
-        if not new_requests:
-            s4.warn(
-                "the server asked for no approval at all. Either the model declined to "
-                "run a command, or this build does not ask. Not a failure of the "
-                "decision encoding -- it was never exercised."
+        rep.fact(f"approval requests during the escape turn: {methods or 'NONE'}")
+
+        # The filesystem is the evidence, not the transcript: a model can report
+        # either outcome regardless of what happened.
+        escaped = probe.exists()
+        rep.fact(f"escape probe written outside --cwd: {escaped}")
+        with contextlib.suppress(OSError):
+            probe.unlink()
+
+        answer = wire_decision(methods[0], approved=True) if methods else None
+        if not new_requests and escaped:
+            s4.no(
+                "the write landed OUTSIDE --cwd and the server never asked. The sandbox did "
+                "not guard the boundary --cwd is supposed to define, so the policy in this "
+                "worker is not the thing confining it -- and neither is anything else."
             )
-        elif ran:
+        elif not new_requests:
+            s4.warn(
+                "no approval was requested even for a write outside --cwd, and the write did "
+                "not land. The sandbox refused it without consulting the client, so the "
+                "decision encoding was never exercised -- that is not evidence it is right."
+            )
+        elif escaped:
             s4.ok(
-                f"server asked {methods}, we answered "
-                f"{wire_decision(methods[0], approved=True)!r}, and the command RAN "
-                f"(its output contains {cwd}). The decision enum is correct."
+                f"server asked {methods}, we answered {answer!r}, and the write LANDED "
+                f"outside --cwd. The enum is one this server accepts -- and an approval this "
+                f"worker grants can reach outside --cwd, so --cwd bounds what the policy "
+                f"CHECKS, not what an approved command may do. That is the open question in "
+                f"docs/architecture.md, answered."
             )
         elif r2.completed:
-            s4.no(
-                f"server asked {methods} and we answered "
-                f"{wire_decision(methods[0], approved=True)!r}, but the command does not "
-                f"appear to have run. If the enum member is wrong the server ignores it, "
-                f"which looks exactly like this. Compare against ServerRequest.json."
+            s4.ok(
+                f"server asked {methods}, we answered {answer!r}, and the write did NOT land. "
+                f"An approval does not lift the sandbox: confinement held even though this "
+                f"worker approved. That is the better answer to the open question in "
+                f"docs/architecture.md, and it is the one that makes auto-approve safe."
             )
         else:
             s4.no(
-                f"exec turn did not reach a terminal state; events {sorted(set(seen_notifications))}"
+                f"escape turn did not reach a terminal state; events "
+                f"{sorted(set(seen_notifications))}"
             )
+
     finally:
         rep.rule("What app-server itself said")
         log = client.server_log()
