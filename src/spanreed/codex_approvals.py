@@ -491,7 +491,7 @@ def _render_elicitation(params: object) -> str:
     return message if isinstance(message, str) and message.strip() else "(elicitation)"
 
 
-MODES = ("read-only", "workspace", "danger")
+MODES = ("workspace", "danger")
 CONFINED_MODES = tuple(m for m in MODES if m != "danger")
 """The modes that ask Codex for *some* confinement.
 
@@ -509,7 +509,7 @@ def sandbox_policy(root: Path, mode: str = "workspace") -> dict[str, object]:
     Taken from ``SandboxPolicy`` in ``ClientRequest.json``, produced by ``codex
     app-server generate-json-schema``. The four variants are discriminated by a
     ``type`` field: ``workspaceWrite``, ``readOnly``, ``dangerFullAccess``,
-    ``externalSandbox``.
+    ``externalSandbox``. Only two are offered as ``--mode``: see MODES.
 
     An earlier version of this function guessed ``{"mode": "workspace-write"}``
     — wrong key *and* wrong value. That is worth remembering rather than just
@@ -527,8 +527,6 @@ def sandbox_policy(root: Path, mode: str = "workspace") -> dict[str, object]:
         raise ValueError(f"root must be absolute; got {root!r}")
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}; got {mode!r}")
-    if mode == "read-only":
-        return {"type": "readOnly", "networkAccess": False}
     if mode == "danger":
         # No confinement at all. The worker is responsible for warning loudly;
         # this function will not silently downgrade the caller's request.

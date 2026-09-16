@@ -17,8 +17,10 @@ spanreed codex --name reviewer --cwd ~/some/project
 - `--cwd` is **required and has no default**. It is the worker's entire blast
   radius: approvals are auto-approved inside it, any registered agent may wake
   the worker, and the bus does not authenticate senders.
-- `--mode read-only | workspace | danger` selects confinement. `danger` removes
-  the sandbox entirely and warns at startup and on every turn.
+- `--mode workspace | danger` selects confinement. `danger` removes the sandbox
+  entirely and warns at startup and on every turn. (A `read-only` mode was cut
+  before release: it auto-approved inside `--cwd` like every other mode, so its
+  name made a guarantee this project has not verified.)
 - `--doctor` exercises the whole path once and writes a single self-contained
   log, for machines where attaching a debugger is not an option.
 

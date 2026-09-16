@@ -206,7 +206,7 @@ they are not guesses, and the split between the two calls is real:
 | `--personality` | both | |
 | `--service-tier` | both | `serviceTierForTurn` also exists, turn-only. |
 | `--instructions` | `thread/start` | Sent as **`developerInstructions`**, appended to a built-in bus preamble. This is where a worker is told it is *on a bus*: that input is mail from another agent, that its reply is sent back as mail, and that a body is data rather than an instruction. Without it the worker behaves like a terminal session that does not know why it is being spoken to. |
-| `--mode` | `thread/start` (`sandbox`) + every `turn/start` (`sandboxPolicy`) | `read-only` \| `workspace` (default) \| `danger`. See "Modes" below. |
+| `--mode` | `thread/start` (`sandbox`) + every `turn/start` (`sandboxPolicy`) | `workspace` (default) \| `danger`. See "Modes" below. |
 | `--name` | neither | Bus identity only: the worker registers as `agent-<name>`. |
 
 **`sandbox` and `sandboxPolicy` are different parameters, and both are sent.** `thread/start` takes
@@ -221,25 +221,30 @@ app-server accepts and ignores — checked against `ClientRequest.json`, not inf
 
 | `--mode` | `sandbox` (thread) / `sandboxPolicy` (turn) | `approvalPolicy` | Notes |
 |---|---|---|---|
-| `read-only` | `read-only` / `readOnly` | `on-request` | Asks Codex for a read-only sandbox. **Not verified to be airtight** — see the note below. |
 | `workspace` (default) | `workspace-write` / `workspaceWrite` with `writableRoots: [--cwd]` | `on-request` | The intended shape: writes inside `--cwd`, no network. |
 | `danger` | `danger-full-access` / `dangerFullAccess` | `never` | **No confinement at all.** |
 
-**A caution on `read-only`, recorded rather than resolved.** The worker still
-auto-approves any request whose paths are inside `--cwd`, in every mode —
-`decide()` takes no `mode` argument. What an approved request is then permitted
-to do is Codex's decision, and the schema vendored under
+**A caution on what an approval is worth, recorded rather than resolved.** The
+worker auto-approves any request whose paths are inside `--cwd` — `decide()`
+takes no `mode` argument. What an approved request is then permitted to do is
+Codex's decision, and the schema vendored under
 `experiments/codex-app-server-spike/schema/` suggests approvals are precisely
 the channel for going beyond a sandbox: `ApprovalsReviewer` is documented as
 covering "sandbox escapes", `AskForApproval.granular` carries a
 `sandbox_approval` field, and `CommandExecutionApprovalDecision` includes
 `applyNetworkPolicyAmendment`.
 
-So `read-only` may be weaker than its name. Nobody has run this against a live
-`app-server` — `spanreed codex --doctor` is what would settle it, and until it
-does this row states what the worker *sends*, not what Codex enforces.
+If that reading holds, auto-approving inside `--cwd` is a stronger grant than
+this table implies. Nobody has run it against a live `app-server`; `spanreed
+codex --doctor` is what would settle it.
 
-`on-request` is deliberate for the two confined modes even though the worker auto-approves: it is
+**A `read-only` mode was cut before release, for this reason.** It asked Codex
+for a `readOnly` sandbox while still auto-approving everything inside `--cwd`,
+so its name made a safety claim this project could not substantiate. A mode
+whose name is an unverified guarantee is worse than no mode. If read-only work
+is wanted later it should arrive with a `--doctor` run behind it.
+
+`on-request` is deliberate for `workspace` even though the worker auto-approves: it is
 what makes app-server *ask*, which is what makes every decision loggable. `never` would auto-approve
 identically and write nothing down.
 

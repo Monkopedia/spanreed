@@ -673,17 +673,14 @@ class TestCwdBoundary:
         model reporting its own failure — so the reason is named once, up top."""
         worker_cwd.chmod(0o500)
         try:
-            # Different names, so the two workers do not share one log file.
             _stub, worker = make_worker(mode="workspace", name="writer")
-            _stub2, readonly = make_worker(mode="read-only", name="reader")
         finally:
             worker_cwd.chmod(0o700)
         log = log_of(worker)
         assert "is NOT WRITABLE by this process" in log
-        assert "--mode read-only" in log
-        assert "is NOT WRITABLE by this process" not in log_of(readonly), (
-            "read-only work in a directory this user cannot write is legitimate"
-        )
+        # It warns and carries on: nothing here decides what the sandbox
+        # permits, and a worker that only reads is a legitimate thing to run.
+        assert "REFUSING" not in log
 
 
 # ------------------------------------------------------------------- auth

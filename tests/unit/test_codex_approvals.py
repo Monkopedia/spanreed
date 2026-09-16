@@ -335,11 +335,6 @@ class TestModePolicies:
         assert pol["writableRoots"] == [str(tmp_path.resolve())]
         assert pol["networkAccess"] is False
 
-    def test_read_only_is_read_only(self, tmp_path: Path) -> None:
-        pol = sandbox_policy(tmp_path, "read-only")
-        assert pol["type"] == "readOnly"
-        assert "writableRoots" not in pol
-
     def test_danger_is_full_access_and_is_not_downgraded(self, tmp_path: Path) -> None:
         # If a caller asks for danger they get danger; quietly confining it
         # would make the loud warning a lie.
@@ -347,7 +342,6 @@ class TestModePolicies:
 
     def test_confined_modes_ask_so_decisions_can_be_logged(self) -> None:
         assert approval_policy("workspace") == "on-request"
-        assert approval_policy("read-only") == "on-request"
 
     def test_danger_does_not_ask(self) -> None:
         assert approval_policy("danger") == "never"

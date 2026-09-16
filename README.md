@@ -108,8 +108,8 @@ spanreed codex --name reviewer --cwd ~/some/project
 `--cwd` is **required and has no default**. It is the worker's entire blast
 radius: approvals are auto-approved inside it, any registered agent may wake the
 worker, and the bus does not authenticate senders. `--mode` picks the
-confinement — `read-only`, `workspace` (default, writes confined to `--cwd`), or
-`danger` (no sandbox at all, which warns on startup and on every turn).
+confinement — `workspace` (default, writes confined to `--cwd`) or `danger` (no
+sandbox at all, which warns on startup and on every turn).
 
 **Experimental, and specifically so.** The protocol work is verified against
 Codex's own schemas, and the failure paths are covered by fault-injection tests,

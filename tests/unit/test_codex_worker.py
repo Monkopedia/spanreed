@@ -187,7 +187,6 @@ class TestStartup:
     @pytest.mark.parametrize(
         ("mode", "sandbox", "policy"),
         [
-            ("read-only", "read-only", "on-request"),
             ("workspace", "workspace-write", "on-request"),
             ("danger", "danger-full-access", "never"),
         ],
@@ -727,10 +726,6 @@ class TestBoundaryInstructionMatchesTheMode:
         assert "workspaceWrite" in text
         assert "/w" in text
 
-    def test_read_only_names_the_sandbox_it_asks_for(self) -> None:
-        text = BOUNDARY_BY_MODE["read-only"].format(cwd="/w")
-        assert "readOnly sandbox" in text
-
     # ---------------------------------------------------------------- claims
     # Three review rounds found three false sentences here, each in a branch the
     # previous round had not looked at, because nothing executed the prose. One
@@ -748,8 +743,8 @@ class TestBoundaryInstructionMatchesTheMode:
             assert "declined by the worker" not in text, mode
 
     def test_no_branch_claims_the_worker_declines_everything(self) -> None:
-        # FALSE in read-only: decide() takes no mode and approves in-cwd
-        # requests in every one.
+        # decide() takes no mode and approves in-cwd requests in every one,
+        # so no branch may claim the worker declines everything.
         for mode, template in BOUNDARY_BY_MODE.items():
             assert "declines every approval" not in template.format(cwd="/w"), mode
 
@@ -814,7 +809,8 @@ class TestNoBoundaryClaimInAnyEmittedString:
     """The guard's generator is "prose the worker emits", not one dict.
 
     Four review rounds, four instances, each somewhere the previous round's
-    guard did not reach: the danger template, the read-only template, the
+    guard did not reach: the danger template, a since-removed read-only
+    template, the
     workspace template, and then the --cwd-is-gone refusal 400 lines away --
     emitted both to the operator's log AND onto the bus, where a peer agent
     reads it exactly as the model reads the preamble.

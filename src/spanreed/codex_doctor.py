@@ -336,9 +336,8 @@ def run_doctor(
     if not cwd.is_dir():
         s0.no(f"--cwd {cwd} is not a directory")
         return finish(rep, fh, log_path)
-    if mode == "read-only":
-        rep.fact(f"--cwd {cwd}: write access not needed in read-only mode")
-    elif os.access(cwd, os.W_OK):
+
+    if os.access(cwd, os.W_OK):
         rep.fact(f"--cwd {cwd}: writable by this user")
     else:
         # Not a failure: the worker starts and warns. But in a write mode every
@@ -521,47 +520,44 @@ def _run_protocol_steps(
         rep.say("  This is the step that cannot be tested against a stub: it asks a live")
         rep.say("  server to run a command, so the server itself decides whether the")
         rep.say("  decision value we send back is one it accepts.")
-        if mode == "read-only":
-            s4.skip("mode is read-only, so nothing should ever be approved")
+        before = len(seen_requests)
+        try:
+            client.turn_start(
+                thread_id,
+                f"Run the shell command `pwd` in {cwd} and reply with its output verbatim.",
+                **turn_params,
+            )
+            r2 = client.wait_for_turn()
+        except Exception as exc:
+            s4.no(f"{type(exc).__name__}: {exc}")
+            return finish(rep, fh, log_path)
+        new_requests = seen_requests[before:]
+        methods = sorted({m for m, _ in new_requests})
+        rep.fact(f"approval requests during the exec turn: {methods or 'NONE'}")
+        ran = str(cwd) in json.dumps([p for _, p in r2.events])
+        if not new_requests:
+            s4.warn(
+                "the server asked for no approval at all. Either the model declined to "
+                "run a command, or this build does not ask. Not a failure of the "
+                "decision encoding -- it was never exercised."
+            )
+        elif ran:
+            s4.ok(
+                f"server asked {methods}, we answered "
+                f"{wire_decision(methods[0], approved=True)!r}, and the command RAN "
+                f"(its output contains {cwd}). The decision enum is correct."
+            )
+        elif r2.completed:
+            s4.no(
+                f"server asked {methods} and we answered "
+                f"{wire_decision(methods[0], approved=True)!r}, but the command does not "
+                f"appear to have run. If the enum member is wrong the server ignores it, "
+                f"which looks exactly like this. Compare against ServerRequest.json."
+            )
         else:
-            before = len(seen_requests)
-            try:
-                client.turn_start(
-                    thread_id,
-                    f"Run the shell command `pwd` in {cwd} and reply with its output verbatim.",
-                    **turn_params,
-                )
-                r2 = client.wait_for_turn()
-            except Exception as exc:
-                s4.no(f"{type(exc).__name__}: {exc}")
-                return finish(rep, fh, log_path)
-            new_requests = seen_requests[before:]
-            methods = sorted({m for m, _ in new_requests})
-            rep.fact(f"approval requests during the exec turn: {methods or 'NONE'}")
-            ran = str(cwd) in json.dumps([p for _, p in r2.events])
-            if not new_requests:
-                s4.warn(
-                    "the server asked for no approval at all. Either the model declined to "
-                    "run a command, or this build does not ask. Not a failure of the "
-                    "decision encoding -- it was never exercised."
-                )
-            elif ran:
-                s4.ok(
-                    f"server asked {methods}, we answered "
-                    f"{wire_decision(methods[0], approved=True)!r}, and the command RAN "
-                    f"(its output contains {cwd}). The decision enum is correct."
-                )
-            elif r2.completed:
-                s4.no(
-                    f"server asked {methods} and we answered "
-                    f"{wire_decision(methods[0], approved=True)!r}, but the command does not "
-                    f"appear to have run. If the enum member is wrong the server ignores it, "
-                    f"which looks exactly like this. Compare against ServerRequest.json."
-                )
-            else:
-                s4.no(
-                    f"exec turn did not reach a terminal state; events {sorted(set(seen_notifications))}"
-                )
+            s4.no(
+                f"exec turn did not reach a terminal state; events {sorted(set(seen_notifications))}"
+            )
     finally:
         rep.rule("What app-server itself said")
         log = client.server_log()

@@ -125,7 +125,6 @@ SANDBOX_MODES = {
     # type, same concept — checked in ClientRequest.json rather than guessed,
     # because sending the object under the enum's name is exactly the kind of
     # mistake app-server accepts and ignores.
-    "read-only": "read-only",
     "workspace": "workspace-write",
     "danger": "danger-full-access",
 }
@@ -202,14 +201,6 @@ runs in, never by what the command does, so `rm -rf /somewhere/else` run from {c
 approved. Stay inside {cwd} by your own judgement; the approval you get is not a statement
 that what you asked for is safe."""
 
-_BOUNDARY_READ_ONLY = """\
-You work in {cwd}. The worker asks Codex for a readOnly sandbox, so modifying anything is
-expected to be refused.
-
-The worker still approves requests whose paths are inside {cwd}. What an approved request is
-then permitted to do is Codex's decision, not the worker's, and this project has not measured
-it -- so do not treat an approval as permission to modify anything."""
-
 _BOUNDARY_DANGER = """\
 You are running with NO SANDBOX (dangerFullAccess) and approvals set to never, so nothing
 constrains you to {cwd} or to anything else on this machine. Confine yourself to {cwd} by
@@ -217,7 +208,6 @@ your own judgement: the operator was warned, but no mechanism will stop you."""
 
 BOUNDARY_BY_MODE = {
     "workspace": _BOUNDARY_CONFINED,
-    "read-only": _BOUNDARY_READ_ONLY,
     "danger": _BOUNDARY_DANGER,
 }
 
@@ -439,18 +429,17 @@ class CodexWorker:
         )
         if config.mode == "danger":
             self.log.write(DANGER_BANNER)
-        if config.mode != "read-only" and not os.access(config.cwd, os.W_OK):
-            # Not a refusal: read-only work in a directory this user cannot
-            # write is legitimate, and the worker is still useful. But in
-            # workspace/danger mode every file change will fail *inside* the
-            # sandbox, where the only symptom is a model apologising for a
-            # failed edit — so the reason is named here, once, at the top.
+        if not os.access(config.cwd, os.W_OK):
+            # A warning, not a refusal: a worker that only reads is legitimate,
+            # and nothing here decides what the sandbox permits. But every file
+            # change will fail *inside* the sandbox, where the only symptom is a
+            # model apologising for an edit it could not make -- so the reason
+            # is named once, here, at the top.
             self.log.write(
                 f"[codex-worker] WARNING: --cwd {config.cwd} is NOT WRITABLE by this process "
                 f"(uid {os.getuid()}), but mode={config.mode} tells Codex it may write there. "
                 f"Every file change will fail inside the sandbox and the model will report it "
-                f"as its own failure. Check the directory's permissions, or run with "
-                f"--mode read-only."
+                f"as its own failure. Check the directory's permissions."
             )
 
         self.client.connect()
