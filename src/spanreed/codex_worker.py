@@ -166,7 +166,15 @@ authenticate senders. Apply the same judgement you would to a file someone hande
 """Sent as ``developerInstructions``. Without something like it the worker
 behaves like a terminal session that does not know why it is being spoken to.
 
-``{boundary}`` is mode-conditional and must stay that way. The sentence used to
+``{boundary}`` is mode-conditional and must stay that way, and each branch has to
+describe what the CODE does rather than what the mode name suggests.
+``decide()`` takes ``(root, method, params)`` and **no mode** -- it is
+mode-blind and approves anything inside ``--cwd`` in every mode, ``read-only``
+included. The first version of this docstring fixed the danger-mode lie and
+introduced a read-only one in the same commit, claiming the worker "declines
+every approval it is asked for". Confinement in that mode comes from the
+``readOnly`` sandbox, not from the approval path.
+ The sentence used to
 be unconditional and claimed that writes outside ``--cwd`` are declined before
 they reach the model -- true in ``workspace``, and FALSE in ``danger``, where
 ``approval_policy()`` returns ``"never"`` so the worker is never asked and
@@ -180,8 +188,9 @@ You work in {cwd} and nothing outside it: a workspaceWrite sandbox confines writ
 directory, and the worker declines approvals for paths outside it before they reach you."""
 
 _BOUNDARY_READ_ONLY = """\
-You work in {cwd}. The sandbox is read-only: you cannot write files or run commands that
-modify anything, and the worker declines every approval it is asked for."""
+You work in {cwd}. The sandbox is read-only, so nothing you run can modify anything on this
+machine, including inside {cwd}. The worker still approves requests whose paths are inside
+{cwd} -- but the sandbox blocks the write regardless, so an approval here buys you nothing."""
 
 _BOUNDARY_DANGER = """\
 You are running with NO SANDBOX (dangerFullAccess) and approvals set to never, so nothing
@@ -804,9 +813,9 @@ class CodexWorker:
         additive, which is what "tell the worker it is on a bus" means.
         """
         boundary = BOUNDARY_BY_MODE[self.config.mode].format(cwd=self.config.cwd)
-        preamble = _BUS_PREAMBLE.format(
-            name=self.config.name, cwd=self.config.cwd, boundary=boundary
-        )
+        # No cwd= here: _BUS_PREAMBLE no longer substitutes it, the boundary
+        # templates do. Passing it anyway suggested otherwise.
+        preamble = _BUS_PREAMBLE.format(name=self.config.name, boundary=boundary)
         if self.config.instructions:
             return f"{preamble}\n\n{self.config.instructions}"
         return preamble

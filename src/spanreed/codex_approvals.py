@@ -468,7 +468,14 @@ def _render_permissions(params: object) -> str:
         items = cast("list[object]", perms)
         named = [str(x) for x in items if isinstance(x, str)]
         if named:
-            return "permissions: " + ", ".join(named[:6])
+            # Say when the list is cut. This was the only capped renderer in a
+            # module whose whole argument is that the approval log must be
+            # complete -- _render_command uses shlex.join uncapped and
+            # _patch_paths returns every path -- and a silent cap means an
+            # operator reading six of nine cannot tell.
+            shown = ", ".join(named[:6])
+            extra = len(named) - 6
+            return f"permissions: {shown}" + (f" (+{extra} more)" if extra > 0 else "")
     cwd = fields.get("cwd")
     return f"permissions request (cwd {cwd})" if isinstance(cwd, str) else "permissions request"
 

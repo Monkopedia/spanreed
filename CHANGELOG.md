@@ -47,7 +47,7 @@ Fixes [#55](https://github.com/Monkopedia/spanreed/issues/55).
   belief that the agent had stopped.
 - **BREAKING: `spanreed list` now prints a human bus report by default, not JSON.**
   It shows attached peers and sync state; `--json` returns the previous array.
-  See Upgrading below — this is the only breaking change in the release. Every surface that prints `last_seen`
+  See Upgrading below. Every surface that prints `last_seen`
   now prints beside it that nothing infers liveness from it.
 - `list_peers()` added to the MCP surface.
 
@@ -64,11 +64,21 @@ non-reproduction is recorded in `docs/findings.md`.
 
 ### Upgrading
 
-**Anything parsing `spanreed list` must add `--json`.** The default output is now a
+**Two CLI contracts changed. Both have live consumers in this fleet.**
+
+**1. Anything parsing `spanreed list` must add `--json`.** The default output is now a
 human report; a script doing `spanreed list | json.load` will fail to parse it. This
 was found by the review of #56, which identified a live consumer that takes its
 unparseable-input path and renders an empty roster on upgrade — failing closed, but
 failing.
+
+**2. `spanreed send` no longer always exits 0.** It now exits **2** when the recipient
+cannot be resolved (nothing was written) and **3** when the message was queued to a
+registered agent whose session is not running. At `v0.1.0` it returned 0
+unconditionally. A script branching on `spanreed send`'s exit status will now take its
+failure path for mail that was in fact queued and will be delivered on restart — and if
+it discards stderr, the line explaining that is lost with it. Treat exit 3 as *queued*,
+not as failed; exit 2 is the only status that means nothing was written.
 
 ```bash
 uv tool upgrade spanreed-bus

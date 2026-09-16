@@ -484,14 +484,18 @@ class TestReviewFindings:
     them worth pinning rather than shrugging at.
     """
 
-    def test_an_embedded_nul_still_produces_a_logged_decision(self, tmp_path: Path) -> None:
+    def test_an_embedded_nul_produces_a_decision_instead_of_raising(self, tmp_path: Path) -> None:
         # Path.resolve() raises ValueError for an embedded NUL, which was not in
         # contains()'s catch tuple. The request was still answered -- the client
         # wraps handlers and replies -32603 -- but decision.log_line() never ran,
         # so the approval appeared in no log at all.
         d = decide(tmp_path, EXEC_COMMAND_APPROVAL, {"command": ["ls"], "cwd": "/etc\x00/passwd"})
         assert d.approved is False
-        assert d.log_line()  # the whole point: there IS a line to write
+        assert d.log_line()  # there IS a line to write
+        # NOTE: this pins decide() only. That the line reaches the log FILE is
+        # pinned in test_codex_worker.py, driving a real worker -- the reviewer
+        # of #56 pointed out that this test's original name claimed the second
+        # thing while checking the first.
 
     def test_a_permissions_request_is_not_called_unrecognised(self, tmp_path: Path) -> None:
         # It is a named constant and a member of APPROVAL_METHODS, so telling

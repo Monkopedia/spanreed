@@ -42,6 +42,7 @@ from spanreed.codex_worker import (
     BOUNDARY_BY_MODE,
     DANGER_BANNER,
     RATE_LIMITS_UPDATED,
+    SANDBOX_MODES,
     THREAD_STATUS_CHANGED,
     CodexWorker,
     WorkerConfig,
@@ -726,3 +727,35 @@ class TestBoundaryInstructionMatchesTheMode:
         # A mode added without one would fall back to a KeyError at start(),
         # which is loud -- but this makes the omission visible at test time.
         assert set(BOUNDARY_BY_MODE) == set(MODES)
+
+    def test_every_mode_has_a_sandbox_mode(self) -> None:
+        # SANDBOX_MODES is indexed with the same KeyError-at-start shape as
+        # BOUNDARY_BY_MODE and had no test anywhere. Its sibling got one in the
+        # commit that introduced it; leaving this half pinned is how the next
+        # mode gets added with only one of the two tables updated.
+        assert set(SANDBOX_MODES) == set(MODES)
+
+
+class TestApprovalReachesTheLogFile:
+    """decide() returning a Decision is not the same as the log receiving it.
+
+    The ValueError gap in contains() was exactly this distinction: the request
+    was still answered (-32603 from the client's handler wrapper), so nothing
+    hung and nothing was unconfined — but log_line() never ran, and the approval
+    existed nowhere. Pinning it at the decide() level would have missed that,
+    which is why this drives a real worker and reads the file.
+    """
+
+    def test_an_embedded_nul_is_written_to_the_approval_log(
+        self, make_worker: MakeWorker, worker_cwd: Path
+    ) -> None:
+        _stub, worker = make_worker(app_server())
+        reply = worker.handle_server_request(
+            "execCommandApproval", {"command": ["ls"], "cwd": "/etc\x00/passwd"}
+        )
+        # Answered on the wire with a real ReviewDecision member...
+        assert reply == {"decision": "abort"}
+        # ...and, the part that was missing, recorded.
+        log = log_of(worker)
+        assert "DECLINE execCommandApproval" in log
+        assert worker.log.failures == 0
