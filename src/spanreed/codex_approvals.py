@@ -89,6 +89,44 @@ class Decision:
         )
 
 
+# The value that goes back on the wire, per request family. Both were wrong
+# before: the code sent "approve", which appears in NEITHER enum.
+#
+#   v1 ExecCommandApprovalResponse / ApplyPatchApprovalResponse use ReviewDecision:
+#       approved | approved_for_session | approved_mcp_policy_amendment
+#       | timed_out | abort
+#     -- note there is no "decline"; the negative is `abort`.
+#   v2 CommandExecutionRequestApprovalResponse / FileChangeRequestApprovalResponse
+#     use CommandExecutionApprovalDecision / FileChangeApprovalDecision:
+#       accept | acceptForSession | decline | cancel
+#
+# Read from the vendored ServerRequest.json. An invalid enum value is the worst
+# available outcome here: the server either errors or ignores it, and a worker
+# that believes it approved something the server never let through is a worker
+# whose log is fiction.
+_V1_APPROVE, _V1_DENY = "approved", "abort"
+_V2_APPROVE, _V2_DENY = "accept", "decline"
+
+_V1_METHODS = frozenset({EXEC_COMMAND_APPROVAL, APPLY_PATCH_APPROVAL})
+_V2_METHODS = frozenset(
+    {EXEC_COMMAND_APPROVAL_V2, APPLY_PATCH_APPROVAL_V2, PERMISSIONS_APPROVAL_V2}
+)
+
+
+def wire_decision(method: str, approved: bool) -> str:
+    """The enum member to send for ``method``. Raises for a method with no enum.
+
+    Kept separate from :func:`decide` because the *policy* (may this happen?)
+    and the *spelling* (what does this server call yes?) are different
+    questions, and only the second one changes between API versions.
+    """
+    if method in _V1_METHODS:
+        return _V1_APPROVE if approved else _V1_DENY
+    if method in _V2_METHODS:
+        return _V2_APPROVE if approved else _V2_DENY
+    raise ValueError(f"no approval decision enum for {method!r}")
+
+
 def contains(root: Path, target: Path) -> bool:
     """Is ``target`` inside ``root``? The security-critical question.
 
@@ -170,7 +208,7 @@ def decide(root: Path, method: str, params: object) -> Decision:
     if method in (EXEC_COMMAND_APPROVAL, EXEC_COMMAND_APPROVAL_V2):
         return _decide_exec(root, params)
     if method in (APPLY_PATCH_APPROVAL, APPLY_PATCH_APPROVAL_V2):
-        return _decide_patch(root, params)
+        return _decide_patch(root, params, method)
     if method == ELICITATION_REQUEST:
         return Decision(
             approved=False,
@@ -232,20 +270,44 @@ def _decide_exec(root: Path, params: object) -> Decision:
     )
 
 
-def _decide_patch(root: Path, params: object) -> Decision:
-    """``applyPatchApproval``: every path it writes must be inside ``root``.
+def _decide_patch(root: Path, params: object, method: str = APPLY_PATCH_APPROVAL) -> Decision:
+    """A file-change approval: every path it writes must be inside ``root``.
 
-    Unlike exec, this one really is a boundary: the request names the files, and
-    a file outside ``--cwd`` is refused outright.
+    On **v1** this really is a boundary: ``ApplyPatchApprovalParams.fileChanges``
+    is an object keyed by path, so the request names its files and one outside
+    ``--cwd`` is refused outright.
+
+    On **v2** it is not. ``FileChangeRequestApprovalParams`` carries
+    ``itemId``/``threadId``/``turnId``/``reason``/``startedAtMs`` and a nullable
+    ``grantRoot`` — **no paths at all**. When ``grantRoot`` is absent there is
+    nothing here to check, and the only thing actually confining the write is
+    the ``workspaceWrite`` sandbox with ``writableRoots: [--cwd]`` that the
+    worker sets on every turn.
+
+    So v2-without-grantRoot is approved *on the sandbox's authority, not this
+    module's*, and says so in its reason. The alternative — declining — makes a
+    workspace-mode worker unable to write anything, which is safe and useless
+    and looks exactly like a deliberate policy rather than a missing field.
     """
     fields = _as_mapping(params)
     if fields is None:
-        return _malformed(APPLY_PATCH_APPROVAL)
+        return _malformed(method)
     paths = _patch_paths(fields)
     if paths is None:
+        if method == APPLY_PATCH_APPROVAL_V2:
+            return Decision(
+                approved=True,
+                method=method,
+                subject="(v2 file change; params name no path)",
+                reason=(
+                    "v2 FileChangeRequestApprovalParams carries no paths and no grantRoot, "
+                    "so containment here is impossible; approved on the authority of the "
+                    f"workspaceWrite sandbox scoped to {root}, which is the real boundary"
+                ),
+            )
         return Decision(
             approved=False,
-            method=APPLY_PATCH_APPROVAL,
+            method=method,
             subject="(no readable paths in params)",
             reason="params named no path this policy could read; a patch whose targets are unknown is not approvable",
         )
@@ -254,14 +316,14 @@ def _decide_patch(root: Path, params: object) -> Decision:
     if outside:
         return Decision(
             approved=False,
-            method=APPLY_PATCH_APPROVAL,
+            method=method,
             subject=subject,
             reason=f"{len(outside)} of {len(paths)} path(s) outside --cwd {root}: {' '.join(outside)}",
             paths=tuple(paths),
         )
     return Decision(
         approved=True,
-        method=APPLY_PATCH_APPROVAL,
+        method=method,
         subject=subject,
         reason=f"all {len(paths)} path(s) inside --cwd {root}",
         paths=tuple(paths),
@@ -317,17 +379,31 @@ def _patch_paths(fields: dict[str, object]) -> list[str] | None:
     """
     found: list[str] = []
     saw_key = False
+    # `grantRoot` asks to widen writable access to a whole directory for the
+    # rest of the session. On v2 it is the ONLY path-ish field there is --
+    # FileChangeRequestApprovalParams carries itemId/threadId/turnId/reason and
+    # nothing else -- so a grantRoot outside --cwd is precisely the request to
+    # refuse, and its absence leaves nothing for this module to check.
+    grant_root = fields.get("grantRoot")
+    if isinstance(grant_root, str) and grant_root.strip():
+        saw_key = True
+        found.append(grant_root)
     # `changes` keyed by path is the shape reported for apply-patch; the others
     # are the obvious variants. All are read defensively: a non-string where a
     # path belongs makes the whole request unreadable rather than half-checked.
-    changes = fields.get("changes")
-    if isinstance(changes, dict):
-        saw_key = True
-        keyed = cast("dict[object, object]", changes)
-        for key in keyed:
-            if not isinstance(key, str) or not key.strip():
-                return None
-            found.append(key)
+    # `fileChanges` is an OBJECT keyed by path -- ApplyPatchApprovalParams says
+    # {"additionalProperties": {"$ref": "FileChange"}}. It was read here only as
+    # a list, so v1 patches produced no paths and were declined: safe, and
+    # indistinguishable from a policy decision.
+    for object_key in ("changes", "fileChanges"):
+        keyed_value = fields.get(object_key)
+        if isinstance(keyed_value, dict):
+            saw_key = True
+            keyed = cast("dict[object, object]", keyed_value)
+            for key in keyed:
+                if not isinstance(key, str) or not key.strip():
+                    return None
+                found.append(key)
     for key_name in ("fileChanges", "paths", "files"):
         value = fields.get(key_name)
         if isinstance(value, list):

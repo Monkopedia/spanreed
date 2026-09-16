@@ -36,6 +36,7 @@ from spanreed.codex_approvals import (
     contains,
     decide,
     sandbox_policy,
+    wire_decision,
 )
 
 
@@ -389,3 +390,86 @@ class TestV2ApprovalNames:
         # Not a path-scoped request, so containment cannot judge it. Default deny.
         d = decide(tmp_path, PERMISSIONS_APPROVAL_V2, {})
         assert not d.approved
+
+
+class TestWireDecisionValues:
+    """The value sent back must be a member of the response's own enum.
+
+    Read from the vendored ServerRequest.json. The code previously sent
+    "approve", which is in NEITHER enum, so every approval and every decline
+    was an invalid value -- the failure being guarded is a worker whose log
+    records approvals the server never honoured.
+    """
+
+    def test_v1_uses_reviewdecision_spellings(self) -> None:
+        # ReviewDecision: approved | approved_for_session |
+        # approved_mcp_policy_amendment | timed_out | abort. No "decline".
+        assert wire_decision(EXEC_COMMAND_APPROVAL, True) == "approved"
+        assert wire_decision(EXEC_COMMAND_APPROVAL, False) == "abort"
+        assert wire_decision(APPLY_PATCH_APPROVAL, True) == "approved"
+        assert wire_decision(APPLY_PATCH_APPROVAL, False) == "abort"
+
+    def test_v2_uses_accept_decline(self) -> None:
+        assert wire_decision(EXEC_COMMAND_APPROVAL_V2, True) == "accept"
+        assert wire_decision(APPLY_PATCH_APPROVAL_V2, False) == "decline"
+
+    def test_approve_is_never_emitted(self) -> None:
+        # The exact string that was wrong. Belt and braces: if someone
+        # reintroduces it, this fails rather than a real server ignoring us.
+        every = {
+            wire_decision(m, ok)
+            for m in (
+                EXEC_COMMAND_APPROVAL,
+                APPLY_PATCH_APPROVAL,
+                EXEC_COMMAND_APPROVAL_V2,
+                APPLY_PATCH_APPROVAL_V2,
+                PERMISSIONS_APPROVAL_V2,
+            )
+            for ok in (True, False)
+        }
+        assert "approve" not in every
+
+    def test_a_method_with_no_enum_raises(self) -> None:
+        with pytest.raises(ValueError):
+            wire_decision("mcpServer/elicitation/request", True)
+
+
+class TestFileChangeShapes:
+    """v1 names its files; v2 does not. They cannot be judged the same way."""
+
+    def test_v1_filechanges_is_an_object_keyed_by_path(self, tmp_path: Path) -> None:
+        # ApplyPatchApprovalParams.fileChanges is
+        # {"additionalProperties": {"$ref": "FileChange"}} -- an object whose
+        # KEYS are paths. Reading it only as a list made every v1 patch
+        # unreadable and therefore declined.
+        inside = {str(tmp_path / "a.py"): {"type": "add", "content": "x"}}
+        assert decide(tmp_path, APPLY_PATCH_APPROVAL, {"fileChanges": inside}).approved
+
+    def test_v1_filechanges_outside_is_declined(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "elsewhere"
+        outside.mkdir(exist_ok=True)
+        changes = {str(outside / "a.py"): {"type": "add", "content": "x"}}
+        assert not decide(tmp_path, APPLY_PATCH_APPROVAL, {"fileChanges": changes}).approved
+
+    def test_grant_root_outside_is_refused(self, tmp_path: Path) -> None:
+        # grantRoot asks to widen writable access for the rest of the session.
+        # Outside --cwd that is exactly the request to refuse.
+        assert not decide(tmp_path, APPLY_PATCH_APPROVAL_V2, {"grantRoot": "/"}).approved
+        assert not decide(tmp_path, APPLY_PATCH_APPROVAL_V2, {"grantRoot": "/etc"}).approved
+
+    def test_grant_root_inside_is_allowed(self, tmp_path: Path) -> None:
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        assert decide(tmp_path, APPLY_PATCH_APPROVAL_V2, {"grantRoot": str(sub)}).approved
+
+    def test_v2_without_paths_is_approved_on_the_sandbox_authority(self, tmp_path: Path) -> None:
+        # FileChangeRequestApprovalParams carries no paths. Declining would make
+        # a workspace-mode worker unable to write anything; approving leans on
+        # the workspaceWrite sandbox, and the reason must say so out loud.
+        d = decide(tmp_path, APPLY_PATCH_APPROVAL_V2, {"itemId": "i", "threadId": "t"})
+        assert d.approved
+        assert "sandbox" in d.reason
+
+    def test_v1_without_paths_is_still_declined(self, tmp_path: Path) -> None:
+        # v1 does name its files, so silence there is malformed, not structural.
+        assert not decide(tmp_path, APPLY_PATCH_APPROVAL, {"reason": "x"}).approved

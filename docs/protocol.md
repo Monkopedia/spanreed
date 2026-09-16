@@ -14,7 +14,14 @@ inboxes/<agent_id>.jsonl    per-agent append-only message log
 cursors/<session_id>    per-session "last-seen msg_id" marker
 config.json             bus-wide flags (status_tracking, activity_log)
 activity-log.jsonl      append-only focus/status transition log (opt-in)
+codex/<name>.log        per-Codex-worker log: startup config, every turn, every
+                        approval decision (both outcomes). Never a credential.
 ```
+
+`codex/<name>.log` is written only by `spanreed codex` (see
+[`architecture.md`](architecture.md#codex-workers)). It is append-only, plain text, one timestamped
+line per event, and is for a human to read — nothing parses it. A Codex worker is otherwise an
+ordinary registry row: `agent-<name>`, its own pid, no new fields.
 
 ### `registry.json`
 
@@ -251,6 +258,7 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed status-tracking [on\|off]` | Enable/disable bus-wide status tracking, or show the setting |
 | `spanreed activity-log [on\|off]` | Enable/disable bus-wide activity logging, or show the setting |
 | `spanreed log [--since AGE] [--agent ID\|NAME]` | Dump the activity log as JSON lines |
+| `spanreed codex --name N --cwd DIR [--model M] [--effort E] [--mode MODE] [--instructions TEXT]` | Run a Codex worker: a headless bus agent that turns inbound mail into `codex` turns. `--cwd` is required and has no default. |
 | `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
 
 ## Cross-host bridge wire-format

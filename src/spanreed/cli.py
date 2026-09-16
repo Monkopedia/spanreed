@@ -23,6 +23,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from spanreed.codex_approvals import MODES
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.protocol import Agent
 from spanreed.store import StateStore, default_state_root
@@ -468,6 +469,45 @@ def _cmd_conjoin(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_codex(args: argparse.Namespace) -> int:
+    """Run a Codex worker: a bus agent with no human attached.
+
+    ``--cwd`` is checked *here*, before anything is spawned, and refused with
+    the reason rather than argparse's generic "required" line. It is the
+    worker's entire security boundary: auto-approval plus unauthenticated
+    senders means an inbox write becomes code execution, and nothing else bounds
+    it. See ``docs/architecture.md``, "``--cwd`` is the security boundary".
+    """
+    # Local import (as in _cmd_conjoin): the worker drags in the app-server
+    # client — sockets, subprocess, threads — and every session's SessionStart
+    # hook goes through this module.
+    from spanreed.codex_worker import CodexWorker, WorkerConfig
+
+    if not args.cwd:
+        print(
+            "spanreed codex: --cwd is required and has no default. It is the only bound on "
+            "what this worker may touch: approvals are auto-approved inside it, any registered "
+            "agent may wake the worker, and the bus does not authenticate senders. Inheriting a "
+            "default (the process cwd, $HOME, or whatever config.toml marks trusted) would scope "
+            "the worker to a whole home directory. Pass --cwd <the one repo this worker owns>.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        config = WorkerConfig(
+            name=args.name,
+            cwd=Path(args.cwd),
+            model=args.model,
+            effort=args.effort,
+            mode=args.mode,
+            instructions=args.instructions,
+        )
+    except ValueError as exc:
+        print(f"spanreed codex: {exc}", file=sys.stderr)
+        return 2
+    return CodexWorker(config).serve()
+
+
 def _cmd_session_start(_args: argparse.Namespace) -> int:
     """Register this session and emit the SessionStart hook output to stdout."""
     agent_id, name = derive_agent_identity()
@@ -593,6 +633,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_log.add_argument("--agent", help="Only entries for this agent_id or display name")
 
+    p_codex = sub.add_parser(
+        "codex",
+        help="Run a Codex worker: a headless bus agent that turns inbound mail into codex turns",
+    )
+    p_codex.add_argument("--name", required=True, help="Display name and bus id (agent-<name>)")
+    p_codex.add_argument(
+        "--cwd",
+        help="REQUIRED. The one directory this worker may work in — its whole blast radius",
+    )
+    p_codex.add_argument(
+        "--model", help="Model id (from models_cache.json); server default if omitted"
+    )
+    p_codex.add_argument("--effort", help="Reasoning effort, re-sent on every turn")
+    p_codex.add_argument(
+        "--mode",
+        choices=list(MODES),
+        default="workspace",
+        help="Sandbox/approval mode. danger removes all confinement and warns on every turn.",
+    )
+    p_codex.add_argument(
+        "--instructions",
+        help="Extra persona text appended to the worker's bus instructions",
+    )
+
     p_conjoin = sub.add_parser(
         "conjoin", help="Conjoin this bus to a peer host's bus over a persistent SSH bridge"
     )
@@ -635,6 +699,7 @@ _DISPATCH = {
     "status-tracking": _cmd_status_tracking,
     "activity-log": _cmd_activity_log,
     "log": _cmd_log,
+    "codex": _cmd_codex,
     "conjoin": _cmd_conjoin,
 }
 

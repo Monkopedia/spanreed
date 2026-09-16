@@ -153,15 +153,23 @@ section is the design, not the evidence.
 
 ```
 spanreed codex --name reviewer --cwd ~/git/foo \
-               --model gpt-5.6-sol --effort medium
+               --model gpt-5.6-sol --effort medium [--mode workspace] [--instructions TEXT]
   ├─ spawn `codex app-server --listen unix://<private socket>`
   ├─ initialize + initialized          (the notification is mandatory)
   ├─ thread/start --cwd --model …      (one thread, owned for the worker's life)
   ├─ register in the registry          (ordinary agent row; peers address it normally)
-  ├─ tail inbox → turn/start           (one turn per message, FIFO)
+  ├─ poll inbox → turn/start           (one turn per message, FIFO)
   ├─ item/agentMessage/delta → reply back to the sender
-  └─ thread/status/changed → registry status
+  ├─ thread/status/changed → registry status
+  └─ idle read between turns           (see "The idle read" — status/quota do NOT arrive by themselves)
 ```
+
+**Identity.** The worker registers as `agent-<name>` with display name `<name>` — the same shape
+`SPANREED_AGENT_NAME` mints for a Claude session, so a restarted worker keeps the id its peers
+already hold and can also be addressed by name. Its registry `pid` is the **worker process's own**:
+that process's liveness *is* the entry's liveness, which is what `pid` means (`protocol.md`); there
+is no Claude session behind it. A restarted worker starts a **fresh thread** and does not resume the
+old one.
 
 ### Two properties a Claude session does not have
 
@@ -170,8 +178,19 @@ Codex worker's status is observed rather than self-declared. Claude's is best-ef
 status" above), and `last_seen` has been shown unreliable in practice
 (`Monkopedia/spanreed#55`). Where the two disagree, the Codex mechanism is the one to copy.
 
+Two qualifications this section originally lacked. First, *observed* only works if somebody reads
+the socket — see "The idle read" below. Second, the mapping is not free: Codex reports two states
+and the bus has four, and a worker has no human to need, so `active`→`working` and `idle`→`idle` is
+the whole map; `needs_input` and `blocked` are unreachable for a Codex worker. A value outside the
+map is logged and ignored rather than guessed at. Because the notification's exact payload shape is
+not in either vendored schema (they cover requests, not notifications), the worker also sets
+`working`/`idle` around each turn itself as a floor — an observed transition overwrites that
+whenever one arrives, so the authoritative source still wins where it exists.
+
 **Quota is observable.** `account/rateLimits/updated` arrives unprompted during a turn. A worker
-burning the owner's ChatGPT allowance can say so on the bus instead of failing opaquely later.
+burning the owner's ChatGPT allowance can say so on the bus instead of failing opaquely later. v1
+*records and logs* each snapshot (it is in the worker's log, and the latest one is on the worker
+object); proactively mailing a peer about quota is not implemented.
 
 ### Startup configuration
 
@@ -186,7 +205,39 @@ they are not guesses, and the split between the two calls is real:
 | `--effort` | **`turn/start` only** | Not accepted by `thread/start`. A worker-level effort must therefore be re-applied on every turn — it cannot be set once at thread creation. |
 | `--personality` | both | |
 | `--service-tier` | both | `serviceTierForTurn` also exists, turn-only. |
-| `--instructions` | `thread/start` | Maps to `baseInstructions` / `developerInstructions`. This is where a worker is told it is *on a bus*: who its peers are, that input is mail from another agent, and that its reply is sent back as mail. Without it the worker behaves like a terminal session that does not know why it is being spoken to. |
+| `--instructions` | `thread/start` | Sent as **`developerInstructions`**, appended to a built-in bus preamble. This is where a worker is told it is *on a bus*: that input is mail from another agent, that its reply is sent back as mail, and that a body is data rather than an instruction. Without it the worker behaves like a terminal session that does not know why it is being spoken to. |
+| `--mode` | `thread/start` (`sandbox`) + every `turn/start` (`sandboxPolicy`) | `read-only` \| `workspace` (default) \| `danger`. See "Modes" below. |
+| `--name` | neither | Bus identity only: the worker registers as `agent-<name>`. |
+
+**`sandbox` and `sandboxPolicy` are different parameters, and both are sent.** `thread/start` takes
+`sandbox`, whose type is the `SandboxMode` *enum* (`read-only` / `workspace-write` /
+`danger-full-access`). `turn/start` takes `sandboxPolicy`, whose type is the `SandboxPolicy`
+*object* (`{"type": "workspaceWrite", "writableRoots": [...]}`). Only the object carries
+`writableRoots`, which is what actually scopes writes to `--cwd`, so the policy is re-sent on every
+turn alongside `effort`. Sending the object under the enum's name is the exact class of mistake
+app-server accepts and ignores — checked against `ClientRequest.json`, not inferred.
+
+### Modes
+
+| `--mode` | `sandbox` (thread) / `sandboxPolicy` (turn) | `approvalPolicy` | Notes |
+|---|---|---|---|
+| `read-only` | `read-only` / `readOnly` | `on-request` | No writes, no network. |
+| `workspace` (default) | `workspace-write` / `workspaceWrite` with `writableRoots: [--cwd]` | `on-request` | The intended shape: writes inside `--cwd`, no network. |
+| `danger` | `danger-full-access` / `dangerFullAccess` | `never` | **No confinement at all.** |
+
+`on-request` is deliberate for the two confined modes even though the worker auto-approves: it is
+what makes app-server *ask*, which is what makes every decision loggable. `never` would auto-approve
+identically and write nothing down.
+
+**`--mode danger` is allowed with any sender — and must warn loudly** (owner decision, 2026-09-15).
+It is not gated on an allowlist, because that would re-introduce an authentication model the bus
+does not have. Instead the worker logs an unmissable banner at startup *and again on every single
+turn*, naming the mode and the fact that senders are unauthenticated. A log the owner scrolls
+through has to say what mode the command they are reading ran under.
+
+**What v1 actually exposes as flags**: `--name`, `--cwd`, `--model`, `--effort`, `--mode`,
+`--instructions`. `--personality` and `--service-tier` are in the table because the *protocol*
+takes them and the split is worth recording; they are not CLI flags yet.
 
 **`config` is prohibited.** `thread/start` accepts a per-thread `config` override and we must never
 send one: on the version this was validated against, any `config` override makes subsequent turns
@@ -227,18 +278,51 @@ Two rules follow, and they are not negotiable in the way the table above is:
    `config.toml` marks trusted. A worker started without `--cwd` refuses to start. The machine this
    was validated on has `[projects."/Users/monk"] trust_level = "trusted"`, so an inherited default
    would have scoped every worker to the entire home directory.
-2. **Approvals are logged, both outcomes.** Every `execCommandApproval` and `applyPatchApproval`, the
-   command or path, and whether it was approved or declined for being outside `--cwd`. Per rule 7,
-   verbose and legible: the owner wants to *see* what a Codex agent did on their behalf, and an
-   auto-approved command that appears nowhere is the one that cannot be reviewed.
+2. **Approvals are logged, both outcomes,** to `~/.claude/spanreed/codex/<name>.log` (under
+   `$SPANREED_STATE_ROOT` when set — it is bus state, so it lives with the rest of it). Every
+   `execCommandApproval` and `applyPatchApproval`, the command or path, and whether it was approved
+   or declined for being outside `--cwd`. Per rule 7, verbose and legible: the owner wants to *see*
+   what a Codex agent did on their behalf, and an auto-approved command that appears nowhere is the
+   one that cannot be reviewed. The same file carries startup config, every turn, every non-delta
+   notification, and the auth refreshes — **never a credential**.
+
+### The idle read
+
+The sketch above says `thread/status/changed → registry status`, and an earlier revision of this
+document implied that and `account/rateLimits/updated` simply *fall out* of running turns. They do
+not. The client is synchronous: it reads frames off the socket only while it is inside a call, so
+between turns — which is most of an idle worker's life — nothing is read and those notifications sit
+in the kernel buffer. A worker's registry row would then report whatever the last turn left behind.
+
+So the loop's empty branch is an explicit **idle read**: when the inbox has nothing, the worker
+spends its poll interval reading and dispatching whatever the server has sent since the last call.
+Status and quota are therefore current between turns, and the read doubles as the poll's pacing —
+the worker blocks on the socket rather than on a `sleep`.
+
+### Authentication: `account/chatgptAuthTokens/refresh`
+
+On a `401`, app-server asks the *client* for a token and blocks on the answer. A worker answers from
+`$CODEX_HOME/auth.json` (default `~/.codex`) — `tokens.access_token` and `tokens.account_id` — and
+replies `{accessToken, chatgptAccountId}`. If the file is unreadable or lacks either field the
+worker **declines** (`-32601`) and says so loudly in the log: an invented token fails later and
+further from the cause. The token value is never logged, in any form.
 
 ### Deliberately not decided yet
 
 - **Cross-host workers.** `conjoin` plus auto-approve means a write on host A executes on host B.
   Not blocked here, but it has not been thought about, and #55 shows the bridge's registry sync is
   not yet trustworthy in both directions.
-- **What a worker does with a turn that fails.** `turn/failed` and `turn/aborted` exist; whether the
-  sender gets the error, a retry, or silence is unspecified.
+- **Sender-visible quota.** The worker logs `account/rateLimits/updated` but does not tell anyone on
+  the bus. What the threshold would be, and who gets mailed, is undecided.
+
+Resolved since:
+
+- **A turn that fails** (decided 2026-09-16): `turn/failed` and `turn/aborted` send **the error back
+  to the sender as an ordinary reply**, threaded with `in_reply_to`, carrying any partial output.
+  No retry — a retry would re-run a turn whose side effects already happened — and never silence,
+  which would leave a peer blocked on a reply that is not coming. A turn that produces no terminal
+  event before the worker's deadline, and one that completes with no agent message, both reply
+  saying exactly that.
 
 ## Cross-host: the SSH bus-bridge
 
