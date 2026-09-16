@@ -483,6 +483,34 @@ def _cmd_codex(args: argparse.Namespace) -> int:
     # hook goes through this module.
     from spanreed.codex_worker import CodexWorker, WorkerConfig
 
+    if getattr(args, "doctor", False):
+        # Runs the same calls a worker makes, then reports and exits. Kept in
+        # its own module because its job is the opposite of the worker's: the
+        # worker should be quiet and long-lived, the doctor should be loud and
+        # finish. See docs/architecture.md, "Codex workers".
+        from spanreed.codex_doctor import run_doctor
+
+        if not args.cwd:
+            print(
+                "spanreed codex --doctor: --cwd is required. The doctor sends the same "
+                "sandboxPolicy a worker would, and that policy is built from --cwd.",
+                file=sys.stderr,
+            )
+            return 2
+        return run_doctor(
+            cwd=Path(args.cwd).expanduser().resolve(),
+            mode=args.mode,
+            model=args.model,
+            effort=args.effort,
+        )
+
+    if not args.name:
+        print(
+            "spanreed codex: --name is required to run a worker (it is the bus id other "
+            "agents address). Only --doctor may omit it.",
+            file=sys.stderr,
+        )
+        return 2
     if not args.cwd:
         print(
             "spanreed codex: --cwd is required and has no default. It is the only bound on "
@@ -637,7 +665,13 @@ def build_parser() -> argparse.ArgumentParser:
         "codex",
         help="Run a Codex worker: a headless bus agent that turns inbound mail into codex turns",
     )
-    p_codex.add_argument("--name", required=True, help="Display name and bus id (agent-<name>)")
+    # Not required at the parser, because --doctor does not register on the bus
+    # and has no use for a name. Demanding one would make the first command a
+    # new user runs fail on an argument it ignores -- friction in exactly the
+    # place where a machine is already suspect.
+    p_codex.add_argument(
+        "--name", help="Display name and bus id (agent-<name>); required to run a worker"
+    )
     p_codex.add_argument(
         "--cwd",
         help="REQUIRED. The one directory this worker may work in — its whole blast radius",
@@ -655,6 +689,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_codex.add_argument(
         "--instructions",
         help="Extra persona text appended to the worker's bus instructions",
+    )
+    p_codex.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Exercise the whole path once against the real Codex and write a single "
+        "self-contained log, instead of running as a worker. Use this first on a new "
+        "machine: it is designed so one pasted file answers every question.",
     )
 
     p_conjoin = sub.add_parser(
