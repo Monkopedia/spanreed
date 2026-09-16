@@ -31,7 +31,10 @@ Fixes to `spanreed codex --doctor`. **If you ran 0.2.0's doctor, re-run this one
   timeout, and prints the effective `RUST_LOG` rather than claiming one.
 - A `SKIP`ped or `WARN`ed step no longer prints `Everything passed`; that
   summary is derived from every step passing rather than from a list of
-  known-bad verdicts.
+  known-bad verdicts. **The exit code is unchanged by this** — it is still 1
+  only for a failed step or a finding, so a run whose step 4 was skipped exits
+  0 with a banner saying so. If you gate on `--doctor`'s exit code, read the
+  banner too.
 
 ### Upgrading
 
