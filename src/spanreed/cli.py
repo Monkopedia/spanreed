@@ -704,7 +704,17 @@ def _cmd_codex(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"spanreed codex: {exc}", file=sys.stderr)
         return 2
-    return CodexWorker(config).serve()
+    try:
+        worker = CodexWorker(config)
+    except (OSError, RuntimeError) as exc:
+        # Building a worker touches the filesystem twice before anything runs:
+        # the state root (registry, inboxes, cursors) and the approval log. A
+        # read-only state root or an unwritable log directory fails here, and
+        # the failure has to read as a sentence rather than as a traceback —
+        # this ships to a machine whose only channel back is a pasted screen.
+        print(f"spanreed codex: {exc}", file=sys.stderr)
+        return 1
+    return worker.serve()
 
 
 def _cmd_session_start(_args: argparse.Namespace) -> int:

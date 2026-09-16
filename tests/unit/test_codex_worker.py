@@ -28,14 +28,13 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from spanreed import cli
-from spanreed.codex_client import CodexClient
 from spanreed.codex_worker import (
     AGENT_MESSAGE_DELTA,
     AUTH_TOKENS_REFRESH,
@@ -104,67 +103,6 @@ def params_of(stub: StubServer, method: str) -> dict[str, Any]:
 def turn_text(frame: dict[str, Any]) -> str:
     """The text a ``turn/start`` frame carried."""
     return str(frame["params"]["input"][0]["text"])
-
-
-# ---------------------------------------------------------------- fixtures
-
-
-@pytest.fixture
-def worker_cwd(monkeypatch: pytest.MonkeyPatch, state_root: Path, tmp_path: Path) -> Path:
-    """Per-test state root, a private CODEX_HOME, and the worker's --cwd."""
-    monkeypatch.setenv("SPANREED_STATE_ROOT", str(state_root))
-    # Never the developer's real ~/.codex: the auth tests read this path.
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
-    work = tmp_path / "repo"
-    work.mkdir()
-    return work
-
-
-@pytest.fixture
-def make_worker(tmp_path: Path, store: StateStore, worker_cwd: Path) -> Iterator[MakeWorker]:
-    """Build a worker wired to a fresh stub app-server, started by default."""
-    workers: list[CodexWorker] = []
-    stubs: list[StubServer] = []
-    counter = [0]
-
-    def make(
-        handler: Handler | None = None, *, start: bool = True, **config_kw: Any
-    ) -> tuple[StubServer, CodexWorker]:
-        counter[0] += 1
-        stub = StubServer(
-            tmp_path / f"worker-stub-{counter[0]}.sock",
-            handler if handler is not None else app_server(),
-        )
-        stubs.append(stub)
-        config_kw.setdefault("name", "reviewer")
-        config = WorkerConfig(cwd=worker_cwd, **config_kw)
-
-        def factory(on_request: Any, on_notification: Any) -> CodexClient:
-            return CodexClient(
-                socket_path=stub.path,
-                timeout=5.0,
-                turn_timeout=5.0,
-                on_server_request=on_request,
-                on_notification=on_notification,
-            )
-
-        worker = CodexWorker(
-            config,
-            store=store,
-            client_factory=factory,
-            log_stream=None,
-            poll_interval=0.3,
-        )
-        workers.append(worker)
-        if start:
-            worker.start()
-        return stub, worker
-
-    yield make
-    for worker in workers:
-        worker.close()
-    for stub in stubs:
-        stub.close()
 
 
 def register_sender(store: StateStore) -> None:

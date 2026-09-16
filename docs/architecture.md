@@ -284,7 +284,47 @@ Two rules follow, and they are not negotiable in the way the table above is:
    or declined for being outside `--cwd`. Per rule 7, verbose and legible: the owner wants to *see*
    what a Codex agent did on their behalf, and an auto-approved command that appears nowhere is the
    one that cannot be reviewed. The same file carries startup config, every turn, every non-delta
-   notification, and the auth refreshes — **never a credential**.
+   notification, and the auth refreshes — **never a credential**. A worker whose log **cannot be
+   written** — an unwritable state root, a `codex/` directory it may not create — **refuses to
+   start**, with the reason as a sentence on stderr rather than a traceback. A worker that
+   auto-approves commands for unauthenticated senders and cannot record what it approved is not a
+   degraded worker, it is an unreviewable one.
+
+### When things break
+
+Fault-injected and pinned by `tests/unit/test_codex_worker_faults.py`. The ordering behind every
+row: a worker that wedges silently is the worst outcome (that is `Monkopedia/spanreed#55`, which
+cost three days), a worker that exits loudly is acceptable, a worker that recovers is best. Every
+row produces a log line naming what happened, what the worker did, and what to check.
+
+| Fault | What the worker does |
+|---|---|
+| app-server dies or closes the socket **mid-turn** | Replies to that sender saying the turn was lost and not retried, logs the drop *and the child's exit status*, then **exits 1**. The queue behind it cannot run without a thread. |
+| app-server never binds its socket, or exits after the handshake | `FAILED TO START`, with the server's own captured output and its exit status, then exit 1. Nothing is left in the registry. |
+| the socket **file** is unlinked while connected | Nothing. An established unix socket is a descriptor, not a path. |
+| a colossal write during a turn | Absorbed by the drain thread, which runs from the moment the child is spawned. This is the 64KB-pipe hang that cost the spike thirty runs; it is now pinned at 1MB *mid-turn* as well as before the bind. |
+| a malformed frame, a JSON frame that is not an object, or a `params` member that is not an object | **Skipped and reported** as a `PROTOCOL FAULT` line in the worker's log. WebSocket frames are self-delimiting, so one bad frame does not desynchronise the stream — but a skip nobody is told about is exactly #55's shape. A non-object `params` becomes `{}`, which every approval path already treats as a decline. |
+| a response for an id we never sent, or a late one for an id we did | Discarded, and logged as *which of the two it was*: an id outside the range we have issued means something else is on this socket; an id inside it means the server answered a call we had already timed out. |
+| `turn/start` returns a JSON-RPC error | The sender gets the error as its reply; the worker stays up. |
+| no terminal turn event before the deadline | The sender is told the turn **did not finish**, with any partial text. Accepted is not completed. |
+| an unknown server→client request | Answered `-32601`. Never dropped: app-server blocks on these with no timeout. |
+| the inbox is unreadable (a truncated line, bytes that are not UTF-8) | Logs the file, the error, and how to repair it, then **exits 1**. Polling an inbox that answers with an exception is the "alive and ingesting nothing" failure. |
+| the inbox file is deleted | Treated as empty. Later mail still runs. |
+| mail arrives during a turn | Runs as the next turn, in order. Nothing is lost. |
+| the sender deregisters before the reply | The reply text goes to the log in full, the cursor still advances, the worker stays up. |
+| `--cwd` is a symlink | Resolved once, at construction. The sandbox is scoped to the real directory and both spellings get the same approval verdict. |
+| `--cwd` is deleted after start | Every turn is **refused** with a reply naming the reason, and the worker stays on the bus — the directory may come back. No turn runs without its boundary. |
+| `--cwd` is not writable, in `workspace`/`danger` | A startup warning naming it. Otherwise the only symptom is the model reporting failed edits as its own fault. |
+| `auth.json` missing, unreadable, malformed, or lacking either key | Declines (`-32601`) and says which file and which key. Never invents a token, and never logs one. |
+
+Anything the list above did not predict is caught at the top of the poll loop, logged with its
+traceback as an `UNEXPECTED FAILURE`, and the worker exits 1. This ships to a machine its author
+cannot debug on, where a traceback on an unwatched terminal is the same as no report at all.
+
+`thread/start`'s result is read in both shapes it has returned across versions (`threadId` and
+`thread.id`). The worker previously read only the flat one while `--doctor` read both, so a server
+answering the other shape would have produced a doctor that passed and a worker that died on the
+same call.
 
 ### The idle read
 

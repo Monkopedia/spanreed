@@ -45,6 +45,7 @@ from typing import Any, TextIO, cast
 
 from .codex_approvals import approval_policy, sandbox_policy, wire_decision
 from .codex_client import CodexClient
+from .store import default_state_root
 
 MARKER = "SPANREED_DOCTOR_OK"
 """What the model is asked to reply. Specific enough that it cannot appear by
@@ -169,6 +170,24 @@ def _config_summary(home: Path) -> dict[str, Any]:
     return out
 
 
+def probe_writable(directory: Path) -> tuple[bool, str]:
+    """Can a file actually be created in ``directory``? Try it and see.
+
+    Not ``os.access``, which answers about permission bits: it says yes on a
+    read-only mount and can say no where an ACL says otherwise. The whole point
+    of this file is that a probe must be able to report its own failure, and
+    the only check that does that here is the write itself.
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / ".spanreed-doctor-write-probe"
+        probe.write_text("probe")
+        probe.unlink()
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, "created and removed a probe file there"
+
+
 def _live_codex_processes() -> list[str]:
     """Other codex processes, for context only -- never used as a diagnosis.
 
@@ -261,6 +280,23 @@ def run_doctor(
 
     # ---- step 0 -------------------------------------------------------------
     rep.rule("Step 0 - environment")
+    # Checked before `codex` on PATH, which returns early: a worker refuses to
+    # start when it cannot write its approval log, and that refusal has nothing
+    # to do with Codex being installed. A doctor that passes on a machine where
+    # the worker cannot start is the exact defect this file exists to avoid.
+    log_dir = default_state_root() / "codex"
+    writable, why = probe_writable(log_dir)
+    if not writable:
+        rep.fact(f"worker log directory {log_dir}: NOT WRITABLE - {why}")
+        s0.no(
+            f"a worker refuses to start without its approval log, and {log_dir} cannot be "
+            f"written ({why}). Every approval a worker grants for an unauthenticated sender "
+            f"is recorded there. Fix the permissions, or point $SPANREED_STATE_ROOT somewhere "
+            f"this user can write."
+        )
+        return finish(rep, fh, log_path)
+    rep.fact(f"worker log directory {log_dir}: writable ({why})")
+
     codex = shutil.which("codex")
     rep.fact(f"codex on PATH: {codex or 'NOT FOUND'}")
     if not codex:
@@ -300,6 +336,18 @@ def run_doctor(
     if not cwd.is_dir():
         s0.no(f"--cwd {cwd} is not a directory")
         return finish(rep, fh, log_path)
+    if mode == "read-only":
+        rep.fact(f"--cwd {cwd}: write access not needed in read-only mode")
+    elif os.access(cwd, os.W_OK):
+        rep.fact(f"--cwd {cwd}: writable by this user")
+    else:
+        # Not a failure: the worker starts and warns. But in a write mode every
+        # file change then fails inside the sandbox, where the only symptom is
+        # the model apologising for an edit it could not make.
+        rep.fact(
+            f"--cwd {cwd}: NOT WRITABLE by uid {os.getuid()} - in mode {mode} every file "
+            f"change will fail inside the sandbox and look like the model's own failure"
+        )
     s0.ok(f"codex {codex}, CODEX_HOME {home}, mode {mode}")
     return _run_protocol_steps(
         rep,

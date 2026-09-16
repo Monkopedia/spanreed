@@ -47,6 +47,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -220,6 +221,28 @@ class WorkerConfig:
         return default_state_root() / "codex" / f"{self.name}.log"
 
 
+class WorkerLogUnwritable(RuntimeError):
+    """The worker's log file cannot be written, so the worker will not start.
+
+    ``docs/architecture.md`` makes the log non-negotiable: every approval
+    decision, both outcomes, is written to it. A worker that auto-approves
+    commands on behalf of unauthenticated senders and cannot record what it
+    approved is not a degraded worker, it is an unreviewable one — so this is a
+    refusal to start rather than a warning.
+    """
+
+
+class InboxUnreadable(RuntimeError):
+    """The worker's inbox could not be read, so the worker stops.
+
+    Raised for a truncated line, a byte sequence that is not UTF-8, or any
+    other failure of :meth:`StateStore.recv_messages`. Continuing would mean
+    polling an inbox that answers with an exception forever: alive, logging
+    nothing new, ingesting nothing — the exact shape of issue #55, which cost a
+    human three days. Stopping with the reason named is the lesser failure.
+    """
+
+
 class WorkerLog:
     """The worker's log: one file, plus an echo to a stream for the human.
 
@@ -227,17 +250,62 @@ class WorkerLog:
     Codex agent did on their behalf. Nothing that passes through here may be a
     credential — :meth:`CodexWorker.refresh_auth_tokens` is the only code with
     access to one and it logs names, never values.
+
+    Writability is proven at construction, by opening the file, rather than
+    assumed until the first write. The first write is inside
+    :meth:`CodexWorker.start`, and the handler that reports a failed start
+    writes to this same log — so a log that fails on first use turns a
+    diagnosable startup error into a bare traceback with nothing recorded.
     """
 
     def __init__(self, path: Path, stream: TextIO | None = sys.stderr) -> None:
         self.path = path
         self._stream = stream
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self.failures = 0
+        """How many lines the file refused to take. See :meth:`write`."""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a"):
+                pass
+        except OSError as exc:
+            raise WorkerLogUnwritable(
+                f"the worker's log file {path} cannot be written: {type(exc).__name__}: {exc}. "
+                f"The worker refuses to start without it: every approval decision it makes on "
+                f"behalf of an unauthenticated sender is recorded there, and an auto-approved "
+                f"command that appears nowhere is the one that cannot be reviewed. Check that "
+                f"{path.parent} exists and is writable by this user (the whole tree lives under "
+                f"$SPANREED_STATE_ROOT when that is set, and under ~/.claude/spanreed otherwise)."
+            ) from exc
 
     def write(self, line: str) -> None:
+        """Write one line. Never raises, and never loses the line.
+
+        A log that becomes unwritable *after* startup — a full disk, a
+        permission change, an unmounted state root — used to raise from here,
+        which is the worst possible place: every failure path in this module
+        reports itself by calling this method, so the report would die on the
+        way out and take its own cause with it. The line goes to the stream
+        instead, with a notice that the file no longer has it, and
+        :attr:`failures` counts how many times that has happened.
+        """
         stamped = f"{datetime.now(UTC).isoformat(timespec='seconds')} {line}"
-        with self.path.open("a") as handle:
-            handle.write(stamped + "\n")
+        try:
+            with self.path.open("a") as handle:
+                handle.write(stamped + "\n")
+        except OSError as exc:
+            self.failures += 1
+            fallback = self._stream if self._stream is not None else sys.stderr
+            print(stamped, file=fallback, flush=True)
+            print(
+                f"[codex-worker] THE LOG FILE {self.path} COULD NOT BE WRITTEN "
+                f"({type(exc).__name__}: {exc}); the line above exists only on this stream, "
+                f"and approvals are no longer being recorded anywhere durable. This is "
+                f"failure {self.failures} of this kind. Check the disk and the permissions "
+                f"on {self.path.parent}.",
+                file=fallback,
+                flush=True,
+            )
+            return
         if self._stream is not None:
             print(stamped, file=self._stream, flush=True)
 
@@ -286,6 +354,9 @@ class CodexWorker:
         self.log = WorkerLog(config.log_path, log_stream)
         self.poll_interval = poll_interval
         self.client = client_factory(self.handle_server_request, self.handle_notification)
+        # Not a factory argument: every caller's factory would have to grow a
+        # parameter to route faults that the client already captures anyway.
+        self.client.on_protocol_error = self.handle_protocol_fault
         self.thread_id: str | None = None
         self.rate_limits: dict[str, Any] | None = None
         """Latest ``account/rateLimits/updated`` payload, or None if none seen."""
@@ -314,6 +385,19 @@ class CodexWorker:
         )
         if config.mode == "danger":
             self.log.write(DANGER_BANNER)
+        if config.mode != "read-only" and not os.access(config.cwd, os.W_OK):
+            # Not a refusal: read-only work in a directory this user cannot
+            # write is legitimate, and the worker is still useful. But in
+            # workspace/danger mode every file change will fail *inside* the
+            # sandbox, where the only symptom is a model apologising for a
+            # failed edit — so the reason is named here, once, at the top.
+            self.log.write(
+                f"[codex-worker] WARNING: --cwd {config.cwd} is NOT WRITABLE by this process "
+                f"(uid {os.getuid()}), but mode={config.mode} tells Codex it may write there. "
+                f"Every file change will fail inside the sandbox and the model will report it "
+                f"as its own failure. Check the directory's permissions, or run with "
+                f"--mode read-only."
+            )
 
         self.client.connect()
         params: dict[str, Any] = {
@@ -369,8 +453,12 @@ class CodexWorker:
             # The spawned server's own output is usually the whole diagnosis
             # ("no such subcommand", a config error, a missing login), and it
             # dies with the process — so it goes in the log before it is gone.
+            # settle() first: the drain is a separate thread, and the line that
+            # names the reason is the last one written.
+            self.client.settle()
             self.log.write(
                 f"[codex-worker] FAILED TO START: {type(exc).__name__}: {exc}\n"
+                f"--- what became of the server ---\n{self.client.server_status()}\n"
                 f"--- last of the app-server output ---\n{self.client.server_log()[-2000:]}"
             )
             self.close()
@@ -384,7 +472,27 @@ class CodexWorker:
             # Supervision is out of scope here exactly as it is for `conjoin`:
             # this restarts nothing. Wrap it in systemd/launchd/tmux if you want
             # a service.
-            self.log.write(f"[codex-worker] app-server connection lost: {exc}; shutting down")
+            self.client.settle()
+            self.log.write(
+                f"[codex-worker] app-server connection lost: {exc}; shutting down. "
+                f"{self.client.server_status()}\n"
+                f"--- last of the app-server output ---\n{self.client.server_log()[-2000:]}"
+            )
+            code = 1
+        except InboxUnreadable as exc:
+            self.log.write(f"[codex-worker] {exc}")
+            code = 1
+        except Exception as exc:
+            # Nothing above predicted this one, which is exactly why it gets
+            # written down: this worker ships to a machine its author cannot
+            # debug on, and a traceback on a terminal nobody is watching is the
+            # same as no report at all.
+            self.log.write(
+                f"[codex-worker] UNEXPECTED FAILURE in the poll loop: "
+                f"{type(exc).__name__}: {exc}; the worker is shutting down rather than "
+                f"continuing in a state it cannot describe. Send this log with the traceback "
+                f"below.\n{traceback.format_exc()}"
+            )
             code = 1
         finally:
             self.close()
@@ -428,8 +536,26 @@ class CodexWorker:
         was down is picked up on restart. With no cursor at all the whole inbox
         is pending — :meth:`StateStore.recv_messages`'s own rule, "better to
         deliver too much than to silently drop messages".
+
+        An inbox that cannot be *read* — a line truncated by a crashed writer,
+        bytes that are not UTF-8 — raises :class:`InboxUnreadable` rather than
+        letting a ``ValidationError`` or a ``UnicodeDecodeError`` escape as a
+        traceback. The worker stops either way; the difference is whether the
+        log says which file to look at.
         """
-        return self.store.recv_messages(self.config.agent_id, since_msg_id=self._cursor)
+        try:
+            return self.store.recv_messages(self.config.agent_id, since_msg_id=self._cursor)
+        except Exception as exc:
+            inbox = self.store.root / "inboxes" / f"{self.config.agent_id}.jsonl"
+            raise InboxUnreadable(
+                f"THE INBOX COULD NOT BE READ and the worker is stopping: {inbox} raised "
+                f"{type(exc).__name__}: {exc}. Every message in that file is unreachable "
+                f"until it is repaired, and a worker that kept polling would look alive "
+                f"while ingesting nothing. The file is one JSON object per line: check the "
+                f"last line for a truncated write and check the whole file for bytes that "
+                f"are not UTF-8. Removing the bad line loses that message and unblocks the "
+                f"rest; the worker's cursor is at {self._cursor or '(none — the whole inbox)'}."
+            ) from exc
 
     def idle_read(self) -> None:
         """Consume whatever the server has sent since the last call.
@@ -457,12 +583,60 @@ class CodexWorker:
             # Every turn, not just at startup: a log the owner scrolls through
             # must say what mode the command they are reading ran under.
             self.log.write(DANGER_BANNER)
+        if not config.cwd.is_dir():
+            # The directory that bounds everything this worker may touch is
+            # gone. Running the turn anyway would mean approving paths against
+            # a tree that no longer exists and handing Codex a cwd it cannot
+            # enter — a decision made in a state nobody can describe. The
+            # worker stays up, because the directory may come back (a worktree
+            # swapped, a mount that dropped), and every message meanwhile gets
+            # told exactly why it was refused.
+            self.log.write(
+                f"[codex-worker] REFUSING THE TURN for {message.msg_id} from "
+                f"{message.from_agent}: --cwd {config.cwd} IS NO LONGER A DIRECTORY. That "
+                f"directory is this worker's entire security boundary — approvals are granted "
+                f"inside it and declined outside it — so with it gone no turn can be bounded. "
+                f"No turn was started and nothing was retried. Restore the directory or "
+                f"restart the worker with a --cwd that exists."
+            )
+            self._reply(
+                message,
+                f"[codex-worker {config.name}] this worker refused to run your message: its "
+                f"--cwd ({config.cwd}) is no longer a directory, and that directory is the "
+                f"only bound on what the worker may touch. Nothing was run. The worker is "
+                f"still on the bus and will answer again once the directory is restored.",
+            )
+            self.store.set_status(config.agent_id, "idle")
+            return
 
         self.store.set_status(config.agent_id, "working")
         started = time.monotonic()
         try:
             self.client.turn_start(self.thread_id, _turn_input(message), **self._turn_params())
             result = self.client.wait_for_turn()
+        except ConnectionError as exc:
+            # The app-server died or closed the socket mid-turn. There is no
+            # thread any more, so the queue behind this message cannot be run
+            # either: the worker answers this sender, then goes down loudly.
+            # Re-raised rather than swallowed — a worker with a dead transport
+            # that keeps polling is alive in the registry and useless in fact.
+            self.client.settle()
+            self.log.write(
+                f"[codex-worker] THE APP-SERVER CONNECTION DROPPED MID-TURN for "
+                f"{message.msg_id} from {message.from_agent}: {type(exc).__name__}: {exc}. "
+                f"{self.client.server_status()}. The turn had already been accepted, so "
+                f"whatever it had done to the filesystem stands; it is NOT retried. The "
+                f"worker is shutting down — restart it, and read the app-server output below "
+                f"for why the server went away."
+            )
+            self._reply(
+                message,
+                f"[codex-worker {config.name}] the app-server connection dropped in the "
+                f"middle of your turn, so there is no reply to give you. The turn was already "
+                f"accepted, so any files it changed stay changed, and it was not retried. The "
+                f"worker is shutting down; ask its owner to restart it.",
+            )
+            raise
         except (CodexError, TimeoutError) as exc:
             # A refused turn (`CodexError`) and one app-server never even
             # acknowledged (`TimeoutError` on turn/start itself) are the same
@@ -520,6 +694,20 @@ class CodexWorker:
             self.log.write(f"[codex-worker] quota: {_render(params)}")
             return
         self.log.write(f"[codex-worker] {method} {_render(params)}")
+
+    def handle_protocol_fault(self, detail: str) -> None:
+        """A frame app-server sent that the protocol does not allow.
+
+        The client has already skipped it and carried on — one malformed frame
+        does not desynchronise a WebSocket stream — so this is a report, not a
+        failure. It is here rather than only in the client's own capture
+        because that capture is printed on a failed start and by the doctor,
+        and a fault during an otherwise healthy turn would never be seen.
+        """
+        self.log.write(
+            f"[codex-worker] PROTOCOL FAULT from app-server (the frame was skipped and the "
+            f"worker carried on): {detail}"
+        )
 
     def refresh_auth_tokens(self, params: dict[str, Any]) -> dict[str, Any] | None:
         """Answer ``account/chatgptAuthTokens/refresh`` from ``auth.json``.
@@ -709,11 +897,27 @@ def _thread_id_of(thread: Any) -> str:
 
     A worker with no thread id cannot run a single turn, so this fails at
     startup rather than at the first message.
+
+    Both shapes are read — flat ``{"threadId": …}`` and nested
+    ``{"thread": {"id": …}}`` — because ``thread/start`` has returned each of
+    them across versions. This used to accept only the flat one, while
+    ``codex_doctor`` accepted both: on a server answering the nested shape the
+    doctor would have passed step 2 and reported the machine healthy, and the
+    worker would have died at startup on the same call. A diagnostic that
+    cannot fail where the real thing fails is the defect this project has paid
+    for more than any other.
     """
-    candidate = _string(_as_mapping(thread).get("threadId"))
-    if candidate is None:
-        raise RuntimeError(f"thread/start returned no threadId: {thread!r}")
-    return candidate
+    fields = _as_mapping(thread)
+    nested = _as_mapping(fields.get("thread"))
+    for source in (fields, nested):
+        for key in ("threadId", "id"):
+            candidate = _string(source.get(key))
+            if candidate is not None:
+                return candidate
+    raise RuntimeError(
+        f"thread/start returned no thread id in any shape this worker knows "
+        f"(threadId, id, thread.threadId, thread.id): {thread!r}"
+    )
 
 
 def _turn_input(message: Message) -> str:

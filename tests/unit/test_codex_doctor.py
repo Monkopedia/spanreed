@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from spanreed.codex_doctor import MARKER, Report, Step, redacted_auth, run_doctor
 from tests.unit.test_codex_client import StubServer
@@ -147,3 +150,73 @@ def _render(rep: Report) -> str:
 def test_stub_import_is_the_shared_one() -> None:
     """Guard against a second stub appearing. See the module docstring."""
     assert StubServer.__module__ == "tests.unit.test_codex_client"
+
+
+class TestStartupPreconditions:
+    """The doctor and the worker must agree about whether a worker can start.
+
+    A worker refuses to start when it cannot write its approval log. Before
+    this, `--doctor` never looked at that directory — so on the one machine
+    this ships to, the doctor could report everything healthy while `spanreed
+    codex` refused to run, and the only evidence coming back would be a pasted
+    log of a passing doctor.
+    """
+
+    def test_an_unwritable_log_directory_fails_step_zero(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("root ignores the permission bits this test sets")
+        root = tmp_path / "state"
+        root.mkdir()
+        root.chmod(0o500)
+        monkeypatch.setenv("SPANREED_STATE_ROOT", str(root))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        buf = io.StringIO()
+        try:
+            rc = run_doctor(cwd=tmp_path, log_path=tmp_path / "d.log", out=buf)
+        finally:
+            root.chmod(0o700)
+        text = buf.getvalue()
+        assert rc == 1
+        assert "NOT WRITABLE" in text
+        assert "a worker refuses to start without its approval log" in text
+
+    def test_a_writable_log_directory_is_proven_by_writing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """And the probe leaves nothing behind: a diagnostic that litters the
+        directory it is checking is one somebody will later mistake for state."""
+        root = tmp_path / "state"
+        monkeypatch.setenv("SPANREED_STATE_ROOT", str(root))
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        buf = io.StringIO()
+        run_doctor(cwd=tmp_path, log_path=tmp_path / "d.log", out=buf)
+        assert "writable (created and removed a probe file there)" in buf.getvalue()
+        assert list((root / "codex").iterdir()) == []
+
+    def test_a_cwd_that_cannot_be_written_is_reported_in_write_modes(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("root ignores the permission bits this test sets")
+        monkeypatch.setenv("SPANREED_STATE_ROOT", str(tmp_path / "state"))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        # A fake `codex` on PATH, so step 0 gets past the PATH check and reaches
+        # the cwd facts at its end.
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        fake = bindir / "codex"
+        fake.write_text("#!/bin/sh\necho stub-codex 0.0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bindir))
+        work = tmp_path / "repo"
+        work.mkdir()
+        work.chmod(0o500)
+        buf = io.StringIO()
+        try:
+            run_doctor(cwd=work, log_path=tmp_path / "d.log", out=buf, timeout=5.0)
+        finally:
+            work.chmod(0o700)
+        assert "NOT WRITABLE by uid" in buf.getvalue()

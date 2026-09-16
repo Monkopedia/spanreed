@@ -23,6 +23,19 @@ Things still to test, design, or decide.
   `baseInstructions` *replaces* Codex's built-in agent prompt — a one-line persona would silently
   strip the model's tool and sandbox guidance. If the owner wanted the replacing kind, this is the
   knob.
+- **A Codex worker's log failing mid-run** (decided one half, flagging the other): an unwritable log
+  at **startup** is a refusal to start — approvals must be recordable. A log that stops taking
+  writes **later** (a full disk, a permission change, an unmounted state root) currently falls back
+  to stderr, says loudly that approvals are no longer being recorded durably, counts the failures,
+  and the worker **keeps going**. The symmetrical choice would be to stop, as startup does. Left
+  running because a worker mid-queue has senders waiting on replies, and stderr on a supervised
+  process is usually captured — but if the owner wants the same refusal in both places, this is the
+  knob. Pinned by `test_a_log_that_becomes_unwritable_mid_run_keeps_the_line`.
+- **A Codex worker whose `--cwd` disappears**: it refuses every turn, replies to each sender with
+  the reason, and stays on the bus, on the theory that the directory may come back (a worktree
+  swapped, a mount that dropped). The alternative is to exit, which is what it does when the
+  transport dies. Nobody has hit this in practice yet, so the choice is recorded rather than
+  defended.
 - **State format**: JSONL append-only? SQLite? File-per-message?
 - **Agent identity**: what makes two sessions "the same agent" vs. distinct? Working directory? Manual name? PID?
 - **Conversation continuity**: can a message reference a thread, and Claude pick up context from prior messages in it?

@@ -146,10 +146,14 @@ class TurnResult:
 # --------------------------------------------------------------- WebSocket
 
 
-def _params_of(msg: dict[str, Any]) -> dict[str, Any]:
-    """A message's ``params`` as a dict. Notifications may omit the member."""
-    params: dict[str, Any] = msg.get("params") or {}
-    return params
+ProtocolFaultHandler = Callable[[str], None]
+"""``(detail)`` for a frame app-server sent that the protocol does not allow.
+
+A fault is never silent and never fatal on its own: the frame is skipped, the
+detail is appended to :meth:`CodexClient.server_log` and handed to this
+callback if one is set. Silence here is the failure the spike paid for six
+times over — a diagnostic that cannot report its own failure.
+"""
 
 
 def ws_handshake(sock: socket.socket, *, host: str = "localhost", path: str = "/") -> bytearray:
@@ -378,6 +382,7 @@ class CodexClient:
         spawn_timeout: float = 15.0,
         on_server_request: ServerRequestHandler | None = None,
         on_notification: NotificationHandler | None = None,
+        on_protocol_error: ProtocolFaultHandler | None = None,
         log_lines: int = 20000,
     ) -> None:
         self._given_socket = Path(socket_path) if socket_path is not None else None
@@ -389,6 +394,14 @@ class CodexClient:
         self.spawn_timeout = spawn_timeout
         self._on_server_request = on_server_request
         self._on_notification = on_notification
+        self.on_protocol_error: ProtocolFaultHandler | None = on_protocol_error
+        """Where protocol faults are reported, in addition to the captured log.
+
+        A public attribute rather than a constructor-only argument so a caller
+        that builds its client through a factory (the worker does) can still
+        route faults into its own log without every factory growing a
+        parameter.
+        """
 
         self._proc: subprocess.Popen[str] | None = None
         self._tmpdir: Path | None = None
@@ -486,6 +499,103 @@ class CodexClient:
         if self._tmpdir is not None:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
             self._tmpdir = None
+
+    def server_status(self) -> str:
+        """What became of the spawned server, in words. Never a bare code.
+
+        Called on every failure path that has to explain itself to a reader who
+        cannot attach a debugger: "the connection dropped" and "the process
+        exited 101" are the same symptom and different diagnoses, and only one
+        of them means restarting the worker will help.
+        """
+        if self._proc is None:
+            return "no app-server was spawned by this client (it connected to an existing socket)"
+        code = self._proc.poll()
+        if code is None:
+            return f"the app-server this client spawned is still running (pid {self._proc.pid})"
+        return (
+            f"the app-server this client spawned has EXITED with status {code} "
+            f"(pid {self._proc.pid})"
+        )
+
+    def settle(self, timeout: float = 1.0) -> None:
+        """Give a dying server the last word before its output is read.
+
+        The drain runs on its own thread, so the line explaining why the server
+        went away — which is the whole diagnosis — may not have been appended
+        yet when a failure path reaches for :meth:`server_log`. Every caller
+        here is already on the way to reporting a failure, so a bounded wait
+        costs nothing and is the difference between a log that names the cause
+        and one that stops just short of it.
+        """
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            _ = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return  # still running: nothing to flush, and not ours to kill here
+        if self._reader is not None:
+            self._reader.join(timeout=timeout)
+
+    def _protocol_fault(self, detail: str) -> None:
+        """Record one frame the protocol does not allow, and carry on.
+
+        Skipping a bad frame is the recoverable answer — WebSocket frames are
+        self-delimiting, so one unparseable frame does not desynchronise the
+        stream — but a skip nobody is told about is how a worker ends up
+        ingesting nothing while looking alive (issue #55). Both halves are
+        required: the frame goes, the report stays.
+        """
+        self._log.append(f"[codex-client] PROTOCOL FAULT: {detail}\n")
+        if self.on_protocol_error is not None:
+            self.on_protocol_error(detail)
+
+    def _params_of(self, msg: dict[str, Any], context: str) -> dict[str, Any]:
+        """A message's ``params`` as a dict. Notifications may omit the member.
+
+        A ``params`` that is present but is a string, a list or a number is a
+        protocol violation, and it used to be handed to the caller's handler
+        as-is: the worker then called ``.get()`` on a string and died with an
+        ``AttributeError`` in the middle of a turn. It is reported and replaced
+        with an empty object, which every handler here already treats as "the
+        request named nothing", i.e. a decline.
+        """
+        params: Any = msg.get("params")
+        if params is None:
+            return {}
+        if not isinstance(params, dict):
+            method = msg.get("method") or "(no method)"
+            self._protocol_fault(
+                f"{method} arrived during {context} with a `params` member that is a "
+                f"{type(params).__name__}, not a JSON object; it was replaced with an empty "
+                f"object, so any decision made from it is a decline"
+            )
+            return {}
+        return cast("dict[str, Any]", params)
+
+    def _report_stray_response(self, msg: dict[str, Any], context: str) -> None:
+        """A response we are not waiting for. Discarded — but never quietly.
+
+        Two different faults wear this shape. An id inside the range this
+        client has issued is a *late* answer, which means an earlier call
+        timed out and the server answered it afterwards; an id outside that
+        range was never ours at all, and points at id confusion on the wire.
+        A reader needs to be told which one arrived.
+        """
+        rid = msg.get("id")
+        if isinstance(rid, int) and 1 <= rid <= self._next_id:
+            self._protocol_fault(
+                f"a LATE response to request id {rid} arrived during {context} and was "
+                f"discarded; the call that sent id {rid} had already given up waiting, so "
+                f"the server is answering slower than this client's timeout"
+            )
+            return
+        self._protocol_fault(
+            f"a response for id {rid!r} arrived during {context} and was discarded: this "
+            f"client has never sent that id (it has issued ids 1..{self._next_id}). Either "
+            f"something else is writing to this socket or the server has confused two clients"
+        )
 
     def server_log(self) -> str:
         """Everything the spawned server wrote, as captured by the drain thread.
@@ -617,16 +727,17 @@ class CodexClient:
         result = TurnResult(completed=False)
         while True:
             try:
-                msg = self._read_message(deadline, "turn")
+                msg = self._read_message(deadline, "a turn")
             except TimeoutError:
                 return result
             method = msg.get("method")
             if method is None:
-                continue  # a response to an earlier request; not ours to keep
+                self._report_stray_response(msg, "a turn")
+                continue
             if msg.get("id") is not None:
                 self._answer_server_request(msg)
                 continue
-            params = _params_of(msg)
+            params = self._params_of(msg, "a turn")
             result.events.append((str(method), params))
             handler = on_notify or self._on_notification
             if handler is not None:
@@ -706,7 +817,19 @@ class CodexClient:
     def _send(self, msg: dict[str, Any]) -> None:
         if self._sock is None:
             raise RuntimeError("not connected")
-        self._sock.sendall(ws_encode(json.dumps(msg).encode()))
+        try:
+            self._sock.sendall(ws_encode(json.dumps(msg).encode()))
+        except OSError as exc:
+            # A server that has already gone away fails the *write*, and the
+            # bare `[Errno 32] Broken pipe` that comes out says nothing about
+            # what was being sent or to whom. Callers branch on ConnectionError
+            # (BrokenPipeError is one), so the type is preserved and only the
+            # sentence improves.
+            raise ConnectionError(
+                f"the app-server connection was gone before "
+                f"{msg.get('method') or 'a reply to a server request'} could be sent: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     def _read_message(self, deadline: float, context: str) -> dict[str, Any]:
         """Next JSON-RPC message off the wire. Ping/pong and control frames are
@@ -740,9 +863,26 @@ class CodexClient:
                 continue
             if opcode not in (_OP_TEXT, _OP_BINARY):
                 continue
-            decoded_msg: Any = json.loads(payload.decode(errors="replace"))
+            try:
+                decoded_msg: Any = json.loads(payload.decode(errors="replace"))
+            except ValueError as exc:
+                # One bad frame is not a broken stream: WebSocket frames carry
+                # their own length, so the next frame still starts where it
+                # should. Raising here instead killed the whole turn (and, for
+                # a caller that did not expect a ValueError out of a read, the
+                # whole worker) over a single unparseable notification.
+                self._protocol_fault(
+                    f"a frame that is not JSON arrived during {context} and was skipped: "
+                    f"{exc}. First 200 bytes: {payload[:200]!r}"
+                )
+                continue
             if not isinstance(decoded_msg, dict):
-                raise ValueError(f"app-server sent a non-object JSON-RPC frame: {payload!r}")
+                self._protocol_fault(
+                    f"a JSON-RPC frame that is not an object (it is a "
+                    f"{type(decoded_msg).__name__}) arrived during {context} and was skipped. "
+                    f"First 200 bytes: {payload[:200]!r}"
+                )
+                continue
             # isinstance() narrows to dict[Unknown, Unknown]; the wire format
             # is JSON, so the keys are strings by construction.
             return cast("dict[str, Any]", decoded_msg)
@@ -750,13 +890,14 @@ class CodexClient:
     def _dispatch(self, msg: dict[str, Any], on_notify: NotificationHandler | None) -> None:
         method = msg.get("method")
         if method is None:
-            return  # a response to some other id — not ours
+            self._report_stray_response(msg, "a request/response exchange")
+            return
         if msg.get("id") is not None:
             self._answer_server_request(msg)
             return
         handler = on_notify or self._on_notification
         if handler is not None:
-            handler(str(method), _params_of(msg))
+            handler(str(method), self._params_of(msg, "a request/response exchange"))
 
     def _answer_server_request(self, msg: dict[str, Any]) -> None:
         """Answer a server→client request. Always. Without exception.
@@ -771,7 +912,7 @@ class CodexClient:
         """
         rid = msg.get("id")
         method = str(msg.get("method") or "")
-        params = _params_of(msg)
+        params = self._params_of(msg, f"the server request {method}")
         reply: dict[str, Any] = {"id": rid}
         if self._on_server_request is None:
             reply["error"] = {

@@ -19,6 +19,7 @@ import contextlib
 import hashlib
 import json
 import os
+import signal
 import socket
 import struct
 import subprocess
@@ -66,8 +67,12 @@ def _server_handshake(conn: socket.socket) -> bytearray:
     return bytearray(rest)
 
 
-def _server_encode(payload: bytes, opcode: int = 0x1) -> bytes:
-    """A server→client frame: same framing as the client's, never masked."""
+def server_encode(payload: bytes, opcode: int = 0x1) -> bytes:
+    """A server→client frame: same framing as the client's, never masked.
+
+    Public because the fault tests put frames on the wire that JSON cannot
+    express — a close frame mid-turn, bytes that are not JSON at all.
+    """
     size = len(payload)
     if size < 126:
         header = struct.pack("!BB", 0x80 | opcode, size)
@@ -109,7 +114,7 @@ class StubServer:
 
     def send(self, obj: dict[str, Any]) -> None:
         assert self.conn is not None
-        self.conn.sendall(_server_encode(json.dumps(obj).encode()))
+        self.conn.sendall(server_encode(json.dumps(obj).encode()))
 
     def reply(self, mid: Any, result: Any = None, error: Any = None) -> None:
         msg: dict[str, Any] = {"id": mid}
@@ -612,6 +617,20 @@ class TestTurnStream:
 # --------------------------------------------------------- spawned server
 
 
+def _write_noise(total: int) -> None:
+    """Write ``total`` bytes to stdout, the way a Rust server at INFO does."""
+    written = 0
+    line = "x" * 99 + "\n"
+    while written < total:
+        sys.stdout.write(line)
+        written += len(line)
+    sys.stdout.flush()
+
+
+CHILD_THREAD_ID = "t-child-1"
+"""The thread id the spawned child hands out, so a worker test can name it."""
+
+
 def run_stub_child(argv: list[str]) -> None:
     """Entry point for the spawned-child tests. Runs in a subprocess.
 
@@ -619,22 +638,43 @@ def run_stub_child(argv: list[str]) -> None:
     how the pipe-drain regression test puts the child in the exact position a
     real app-server is in: producing log faster than a client that is not
     reading it can absorb.
+
+    The other environment knobs exist for the fault-injection tests, and each
+    one is a failure a real app-server can produce:
+
+    ``STUB_NEVER_BIND``
+        Seconds to stay alive without ever creating the socket. A server that
+        starts, logs, and never listens.
+    ``STUB_TURN_NOISE_BYTES``
+        Bytes written to stdout *after accepting ``turn/start`` and before the
+        terminal event* — the 64KB pipe filling in the middle of a turn rather
+        than before the socket exists.
+    ``STUB_DIE_AFTER``
+        ``handshake`` exits 0 once ``initialize`` is answered; ``turn`` SIGKILLs
+        itself once ``turn/start`` is accepted, with no terminal event and no
+        close frame.
     """
     listen = next(a for a in argv if a.startswith("unix://"))
     path = listen[len("unix://") :]
-    noise = int(os.environ.get("STUB_NOISE_BYTES", "0"))
-    written = 0
-    line = "x" * 99 + "\n"
-    while written < noise:
-        sys.stdout.write(line)
-        written += len(line)
-    sys.stdout.flush()
+    _write_noise(int(os.environ.get("STUB_NOISE_BYTES", "0")))
 
+    never_bind = os.environ.get("STUB_NEVER_BIND")
+    if never_bind:
+        sys.stdout.write("stub-child: alive, logging, and never binding a socket\n")
+        sys.stdout.flush()
+        time.sleep(float(never_bind))
+        return
+
+    die_after = os.environ.get("STUB_DIE_AFTER", "")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(path)
     listener.listen(1)
     conn, _ = listener.accept()
     buf = _server_handshake(conn)
+
+    def send(obj: dict[str, Any]) -> None:
+        conn.sendall(server_encode(json.dumps(obj).encode()))
+
     while True:
         decoded = ws_decode(buf)
         if decoded is None:
@@ -650,14 +690,27 @@ def run_stub_child(argv: list[str]) -> None:
         if opcode not in (0x1, 0x2):
             continue
         msg = json.loads(payload.decode())
-        if msg.get("method") == "initialize":
-            conn.sendall(
-                _server_encode(
-                    json.dumps(
-                        {"id": msg["id"], "result": {"serverInfo": {"name": "noisy"}}}
-                    ).encode()
-                )
-            )
+        method = msg.get("method")
+        if method == "initialize":
+            send({"id": msg["id"], "result": {"serverInfo": {"name": "noisy"}}})
+            if die_after == "handshake":
+                sys.stdout.write("stub-child: exiting 0 right after the handshake\n")
+                sys.stdout.flush()
+                return
+        elif method == "thread/start":
+            send({"id": msg["id"], "result": {"threadId": CHILD_THREAD_ID}})
+        elif method == "turn/start":
+            send({"id": msg["id"], "result": {"status": "inProgress"}})
+            _write_noise(int(os.environ.get("STUB_TURN_NOISE_BYTES", "0")))
+            if die_after == "turn":
+                # SIGKILL, not exit(): a server that is killed mid-turn gets no
+                # chance to close the socket politely, and the client has to
+                # cope with the abrupt half of that pair too.
+                os.kill(os.getpid(), signal.SIGKILL)
+            send({"method": "item/agentMessage/delta", "params": {"delta": "child replied"}})
+            send({"method": "turn/completed", "params": {"usage": {}}})
+        elif "id" in msg:
+            send({"id": msg["id"], "result": {"ok": method}})
 
 
 _CHILD_BOOTSTRAP = (
@@ -671,7 +724,8 @@ stayed under the buffer, passed against both the broken and the fixed client,
 and proved nothing (spike README, "Demonstrated, not argued")."""
 
 
-def _child_cmd() -> list[str]:
+def child_cmd() -> list[str]:
+    """The argv that runs :func:`run_stub_child` as a real child process."""
     root = str(Path(__file__).resolve().parents[2])
     return [sys.executable, "-c", _CHILD_BOOTSTRAP.format(root=root)]
 
@@ -686,7 +740,7 @@ class TestSpawn:
         that does not drain continuously never sees the socket appear at all.
         """
         client = CodexClient(
-            codex_cmd=_child_cmd(),
+            codex_cmd=child_cmd(),
             env={"STUB_NOISE_BYTES": str(NOISE_BYTES)},
             timeout=10.0,
             spawn_timeout=20.0,
@@ -715,7 +769,7 @@ class TestSpawn:
 
     def test_close_reaps_the_child(self) -> None:
         client = CodexClient(
-            codex_cmd=_child_cmd(), env={"STUB_NOISE_BYTES": "0"}, spawn_timeout=20.0
+            codex_cmd=child_cmd(), env={"STUB_NOISE_BYTES": "0"}, spawn_timeout=20.0
         )
         client.connect()
         pid = client.pid
@@ -727,7 +781,7 @@ class TestSpawn:
         """The worker gets its own socket rather than joining a shared one: a
         foreign client cannot drive threads another process holds anyway."""
         client = CodexClient(
-            codex_cmd=_child_cmd(), env={"STUB_NOISE_BYTES": "0"}, spawn_timeout=20.0
+            codex_cmd=child_cmd(), env={"STUB_NOISE_BYTES": "0"}, spawn_timeout=20.0
         )
         client.connect()
         path = client.socket_path
