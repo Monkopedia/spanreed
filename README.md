@@ -85,6 +85,40 @@ Prerequisites: `spanreed-bus` ≥ 0.0.4 on both hosts, and key-based non-interac
 
 Experimental and point-to-point only — no multi-hop routing or peer discovery yet.
 
+## Codex workers (experimental)
+
+A **Codex worker** is a bus agent with no human attached: a long-lived process
+that owns one `codex app-server` thread and turns inbound mail into Codex turns.
+It needs `codex` on `$PATH` and a signed-in Codex; it does **not** need the
+Claude Code plugin, since there is no Claude session involved.
+
+Run the doctor first. It exercises the whole path once and writes a single
+self-contained log — send that file rather than a screenful:
+
+```bash
+spanreed codex --doctor --cwd ~/some/project
+```
+
+Then start a worker:
+
+```bash
+spanreed codex --name reviewer --cwd ~/some/project
+```
+
+`--cwd` is **required and has no default**. It is the worker's entire blast
+radius: approvals are auto-approved inside it, any registered agent may wake the
+worker, and the bus does not authenticate senders. `--mode` picks the
+confinement — `read-only`, `workspace` (default, writes confined to `--cwd`), or
+`danger` (no sandbox at all, which warns on startup and on every turn).
+
+**Experimental, and specifically so.** The protocol work is verified against
+Codex's own schemas, and the failure paths are covered by fault-injection tests,
+but the end-to-end path has been exercised against a stub rather than against a
+live `codex app-server` on a machine where one is installed. Expect the doctor
+to find things. See [docs/architecture.md](docs/architecture.md) §"Codex
+workers" for the design and
+[docs/findings.md](docs/findings.md) for what was actually measured.
+
 ## Update
 
 The Python package and the plugin update independently:

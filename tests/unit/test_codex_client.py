@@ -803,3 +803,34 @@ def _pid_alive(pid: int) -> bool:
         ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
     )
     return bool(state.stdout.strip()) and not state.stdout.strip().startswith("Z")
+
+
+class TestServerStatusTellsTheTruth:
+    """`_proc is None` has three causes and they are different diagnoses.
+
+    Reporting the benign one unconditionally printed "it connected to an
+    existing socket" directly beneath "FileNotFoundError: 'codex'" -- a
+    confident wrong explanation sitting under the real error, which is the
+    defect this whole module was written to stop producing. Found by running
+    the README's own commands (repo rule 6).
+    """
+
+    def test_a_failed_spawn_says_the_spawn_failed(self) -> None:
+        client = CodexClient(codex_cmd=("definitely-not-a-real-binary-xyzzy",))
+        with pytest.raises(OSError):
+            client.connect()
+        status = client.server_status()
+        assert "SPAWNING ONE FAILED" in status
+        # The exact wrong sentence must not come back.
+        assert "connected to an existing socket" not in status
+        assert "no server output below" in status
+
+    def test_a_given_socket_says_it_was_given(self, tmp_path: Path) -> None:
+        client = CodexClient(socket_path=tmp_path / "app.sock")
+        assert "used a socket it was given" in client.server_status()
+
+    def test_an_untouched_client_claims_nothing(self) -> None:
+        client = CodexClient()
+        status = client.server_status()
+        assert "none was attempted" in status
+        assert "FAILED" not in status

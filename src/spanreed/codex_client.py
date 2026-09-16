@@ -404,6 +404,12 @@ class CodexClient:
         """
 
         self._proc: subprocess.Popen[str] | None = None
+        # Why there is no process, for server_status(). "never attempted",
+        # "attempted and failed", and "given a socket" are three different
+        # diagnoses, and reporting the benign one unconditionally put a
+        # confident wrong explanation under a real error.
+        self._spawn_error: BaseException | None = None
+        self._socket_path_given: bool = socket_path is not None
         self._tmpdir: Path | None = None
         self._sock: socket.socket | None = None
         self._buf = bytearray()
@@ -509,7 +515,21 @@ class CodexClient:
         of them means restarting the worker will help.
         """
         if self._proc is None:
-            return "no app-server was spawned by this client (it connected to an existing socket)"
+            # `_proc is None` has THREE causes and they are different diagnoses.
+            # Reporting the benign one unconditionally printed "it connected to
+            # an existing socket" directly beneath "FileNotFoundError: 'codex'",
+            # which is a confident wrong explanation sitting under the real
+            # error -- the exact defect this client was written to stop
+            # producing.
+            if self._spawn_error is not None:
+                return (
+                    f"no app-server is running: SPAWNING ONE FAILED with "
+                    f"{type(self._spawn_error).__name__}: {self._spawn_error}. "
+                    f"Nothing was started, so there is no server output below."
+                )
+            if self._socket_path_given:
+                return "no app-server was spawned by this client; it used a socket it was given"
+            return "no app-server was spawned by this client, and none was attempted"
         code = self._proc.poll()
         if code is None:
             return f"the app-server this client spawned is still running (pid {self._proc.pid})"
@@ -611,14 +631,20 @@ class CodexClient:
         self.socket_path = self._tmpdir / "app.sock"
         cmd = [*self._codex_cmd, "--listen", f"unix://{self.socket_path}"]
         env = {**os.environ, **(self._env or {})}
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env=env,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+        except OSError as exc:
+            # server_status() is read on the failure path and must not claim a
+            # server exists, nor that none was attempted.
+            self._spawn_error = exc
+            raise
         self._proc = proc
         _SPAWNED.append(proc)
         _install_reaper()
