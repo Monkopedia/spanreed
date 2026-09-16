@@ -42,7 +42,7 @@ class TestVerdictReporting:
         rep = Report(out=io.StringIO())
         rep.steps.append(Step(1, "ran", verdict="PASS", detail="d"))
         rep.steps.append(Step(2, "never ran"))
-        rendered = _render(rep)
+        _rc, rendered = _render(rep)
         assert "DID NOT RUN" in rendered
         assert "did not pass" in rendered
         assert "That is not a pass" in rendered
@@ -51,7 +51,7 @@ class TestVerdictReporting:
     def test_a_failure_says_later_steps_may_be_untested(self) -> None:
         rep = Report(out=io.StringIO())
         rep.steps.append(Step(1, "broke", verdict="FAIL", detail="d"))
-        rendered = _render(rep)
+        _rc, rendered = _render(rep)
         assert "step(s) FAILED" in rendered
         # A long specific phrase, not a substring that could match by luck --
         # and one that does not span the line break, since collapsing whitespace
@@ -139,15 +139,18 @@ class TestAgainstAStubServer:
         assert "_" in MARKER
 
 
-def _render(rep: Report) -> str:
+def _render(rep: Report) -> tuple[int, str]:
     """Run the report's own finish path and return what it printed."""
     from spanreed.codex_doctor import finish
 
     buf = io.StringIO()
     rep.out = buf
     fh = io.StringIO()
-    finish(rep, fh, Path("/tmp/x.log"))
-    return buf.getvalue()
+    # The rc comes back too. It used to be discarded, which is exactly why the
+    # exit-code half of the findings channel had no coverage: dropping
+    # `or rep.findings` from finish() left the whole suite green.
+    rc = finish(rep, fh, Path("/tmp/x.log"))
+    return rc, buf.getvalue()
 
 
 def test_stub_import_is_the_shared_one() -> None:
@@ -239,7 +242,7 @@ class TestSkipIsNotAPass:
         rep = Report(out=io.StringIO())
         rep.steps.append(Step(3, "ran", verdict="PASS", detail="d"))
         rep.steps.append(Step(4, "skipped", verdict="SKIP", detail="mode is danger"))
-        rendered = _render(rep)
+        _rc, rendered = _render(rep)
         assert "Everything passed" not in rendered
         assert "That is not a pass" in rendered
         assert "4 (SKIP)" in rendered
@@ -249,7 +252,7 @@ class TestSkipIsNotAPass:
         rep = Report(out=io.StringIO())
         rep.steps.append(Step(1, "a", verdict="PASS", detail="d"))
         rep.steps.append(Step(2, "b", verdict="PASS", detail="d"))
-        assert "Everything passed" in _render(rep)
+        assert "Everything passed" in _render(rep)[1]
 
 
 class TestEscapeVerdictReadsWhatWasSent:
@@ -436,7 +439,7 @@ class TestEverythingPassedIsDerived:
         rep = Report(out=io.StringIO())
         rep.steps.append(Step(3, "ran", verdict="PASS", detail="d"))
         rep.steps.append(Step(4, "warned", verdict="WARN", detail="never exercised"))
-        rendered = _render(rep)
+        _rc, rendered = _render(rep)
         assert "Everything passed" not in rendered
         assert "4 (WARN)" in rendered
 
@@ -446,11 +449,57 @@ class TestEverythingPassedIsDerived:
         rep = Report(out=io.StringIO())
         rep.steps.append(Step(1, "a", verdict="PASS", detail="d"))
         rep.steps.append(Step(2, "b", verdict="INCONCLUSIVE", detail="d"))
-        rendered = _render(rep)
+        _rc, rendered = _render(rep)
         assert "Everything passed" not in rendered
         assert "2 (INCONCLUSIVE)" in rendered
 
     def test_all_pass_is_still_a_pass(self) -> None:
         rep = Report(out=io.StringIO())
         rep.steps.append(Step(1, "a", verdict="PASS", detail="d"))
-        assert "Everything passed" in _render(rep)
+        assert "Everything passed" in _render(rep)[1]
+
+
+class TestAFindingReachesTheBannerAndTheExitCode:
+    """The CONSUMER half of the findings channel.
+
+    Round 5's defect was that the escape site got tests and `finish()` did not.
+    Round 6 found the identical split one channel over: the producer
+    (`rep.finding(...)` at the escape site) was pinned, while the two lines that
+    make a finding matter — the banner branch and the exit code — were not.
+    Deleting either left 547 tests green, and deleting the banner branch
+    reinstated round 5's exact defect: "Everything passed. A Codex worker can
+    run on this machine" printed directly under the finding.
+    """
+
+    @staticmethod
+    def _with_finding() -> Report:
+        rep = Report(out=io.StringIO())
+        rep.steps.append(Step(4, "escape", verdict="PASS", detail="answered the alarming way"))
+        rep.findings.append("a write landed outside every writable root")
+        return rep
+
+    def test_a_finding_is_not_everything_passing(self) -> None:
+        # Kills the mutation that deletes the banner branch.
+        _rc, text = _render(self._with_finding())
+        assert "Everything passed" not in text
+        assert "FINDING(S)" in text
+        assert "the findings above still stand" in text
+
+    def test_a_finding_sets_the_exit_code(self) -> None:
+        # Kills the mutation that drops `or rep.findings` from the return.
+        rc, _text = _render(self._with_finding())
+        assert rc == 1, "a confirmed finding must not exit 0"
+
+    def test_all_pass_and_no_finding_is_still_rc_zero(self) -> None:
+        # The other direction, so the guard cannot make a clean run look dirty.
+        rep = Report(out=io.StringIO())
+        rep.steps.append(Step(1, "a", verdict="PASS", detail="d"))
+        rc, text = _render(rep)
+        assert rc == 0
+        assert "Everything passed" in text
+
+    def test_a_failure_still_exits_one(self) -> None:
+        rep = Report(out=io.StringIO())
+        rep.steps.append(Step(1, "a", verdict="FAIL", detail="d"))
+        rc, _text = _render(rep)
+        assert rc == 1
