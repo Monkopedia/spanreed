@@ -50,6 +50,15 @@ APPLY_PATCH_APPROVAL = "applyPatchApproval"
 """Server request asking to write files. Params carry the paths to be written."""
 
 ELICITATION_REQUEST = "mcpServer/elicitation/request"
+
+# app-server speaks v2 to us (the server logs app_server.api_version="v2"), and
+# v2 renamed the approval requests. ServerRequest.json lists both spellings, so
+# both are handled: an unhandled approval is declined, and a worker that
+# declines every real request is useless in a way that looks like a policy
+# decision rather than a bug.
+EXEC_COMMAND_APPROVAL_V2 = "item/commandExecution/requestApproval"
+APPLY_PATCH_APPROVAL_V2 = "item/fileChange/requestApproval"
+PERMISSIONS_APPROVAL_V2 = "item/permissions/requestApproval"
 """Server request asking a *human* a question. A worker has none — see :func:`decide`."""
 
 
@@ -158,9 +167,9 @@ def decide(root: Path, method: str, params: object) -> Decision:
     """
     if not root.is_absolute():
         raise ValueError(f"root must be absolute; got {root!r}")
-    if method == EXEC_COMMAND_APPROVAL:
+    if method in (EXEC_COMMAND_APPROVAL, EXEC_COMMAND_APPROVAL_V2):
         return _decide_exec(root, params)
-    if method == APPLY_PATCH_APPROVAL:
+    if method in (APPLY_PATCH_APPROVAL, APPLY_PATCH_APPROVAL_V2):
         return _decide_patch(root, params)
     if method == ELICITATION_REQUEST:
         return Decision(
@@ -352,22 +361,59 @@ def _render_elicitation(params: object) -> str:
     return message if isinstance(message, str) and message.strip() else "(elicitation)"
 
 
-def sandbox_policy(root: Path) -> dict[str, object]:
-    """The ``sandboxPolicy`` a worker sends, scoping writes to ``--cwd``.
+MODES = ("read-only", "workspace", "danger")
 
-    This exists so the worker has one obvious place to get it, and so the module
-    that *cannot* contain a shell command points at the thing that can.
 
-    **The shape below is UNVERIFIED.** ``codex`` is not installed on the machine
-    this was written on, so it could not be checked against ``codex app-server
-    generate-json-schema`` — which is authoritative and on disk wherever codex
-    *is* installed. The one thing here that is not a guess is the value that
-    matters: the absolute, symlink-resolved ``--cwd``. Treat the key names and
-    the mode string as placeholders to confirm before a worker ships; a wrong
-    shape is likely to be rejected or ignored by app-server, and an *ignored*
-    sandbox policy is a worker running unsandboxed while this module's
-    best-effort exec check quietly implies otherwise.
+def sandbox_policy(root: Path, mode: str = "workspace") -> dict[str, object]:
+    """The ``sandboxPolicy`` a worker sends. Shapes verified against the schema.
+
+    Taken from ``SandboxPolicy`` in ``ClientRequest.json``, produced by ``codex
+    app-server generate-json-schema``. The four variants are discriminated by a
+    ``type`` field: ``workspaceWrite``, ``readOnly``, ``dangerFullAccess``,
+    ``externalSandbox``.
+
+    An earlier version of this function guessed ``{"mode": "workspace-write"}``
+    — wrong key *and* wrong value. That is worth remembering rather than just
+    deleting: a policy app-server does not recognise is one it may ignore, and
+    an ignored sandbox leaves the worker unconfined while this module's
+    best-effort exec check reports that the sandbox is the real boundary. The
+    guess would have failed silently, which is the failure mode this package
+    exists to stop shipping.
+
+    ``networkAccess`` is left at its schema default of ``False`` for the two
+    confined modes: a worker driven by unauthenticated bus mail should not get
+    the network thrown in unasked.
     """
     if not root.is_absolute():
         raise ValueError(f"root must be absolute; got {root!r}")
-    return {"mode": "workspace-write", "writableRoots": [str(root.resolve())]}
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}; got {mode!r}")
+    if mode == "read-only":
+        return {"type": "readOnly", "networkAccess": False}
+    if mode == "danger":
+        # No confinement at all. The worker is responsible for warning loudly;
+        # this function will not silently downgrade the caller's request.
+        return {"type": "dangerFullAccess"}
+    return {
+        "type": "workspaceWrite",
+        "writableRoots": [str(root.resolve())],
+        "networkAccess": False,
+    }
+
+
+def approval_policy(mode: str = "workspace") -> str:
+    """The ``approvalPolicy`` for a mode. Values from ``AskForApproval``.
+
+    The schema permits ``"untrusted"``, ``"on-request"``, ``"never"``, or a
+    ``granular`` object.
+
+    ``on-request`` is deliberate for the two confined modes even though the
+    worker auto-approves: it is what makes app-server *ask*, which is what makes
+    every decision loggable. ``never`` would be less code and would auto-approve
+    just the same, but nothing would be written down, and rule 7 wants the owner
+    to see what a Codex agent did on their behalf. Confinement comes from the
+    sandbox either way, so the choice costs nothing but a round trip.
+    """
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}; got {mode!r}")
+    return "never" if mode == "danger" else "on-request"

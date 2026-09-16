@@ -27,8 +27,12 @@ import pytest
 
 from spanreed.codex_approvals import (
     APPLY_PATCH_APPROVAL,
+    APPLY_PATCH_APPROVAL_V2,
     ELICITATION_REQUEST,
     EXEC_COMMAND_APPROVAL,
+    EXEC_COMMAND_APPROVAL_V2,
+    PERMISSIONS_APPROVAL_V2,
+    approval_policy,
     contains,
     decide,
     sandbox_policy,
@@ -309,3 +313,79 @@ class TestSandboxPolicy:
     def test_relative_root_raises(self) -> None:
         with pytest.raises(ValueError, match="absolute"):
             sandbox_policy(Path("work"))
+
+
+class TestModePolicies:
+    """The mode -> (approvalPolicy, sandboxPolicy) mapping.
+
+    These assert the exact strings from `SandboxPolicy` and `AskForApproval` in
+    ClientRequest.json, because the previous version of `sandbox_policy` was a
+    guess with the wrong key AND the wrong value. A test that only checked "the
+    root appears somewhere" passed against that guess, which is why it is not
+    enough here: app-server silently ignoring an unrecognised policy is the
+    failure being guarded, and only the discriminator catches it.
+    """
+
+    def test_workspace_uses_the_schema_discriminator_and_scopes_writes(
+        self, tmp_path: Path
+    ) -> None:
+        pol = sandbox_policy(tmp_path, "workspace")
+        assert pol["type"] == "workspaceWrite"
+        assert pol["writableRoots"] == [str(tmp_path.resolve())]
+        assert pol["networkAccess"] is False
+
+    def test_read_only_is_read_only(self, tmp_path: Path) -> None:
+        pol = sandbox_policy(tmp_path, "read-only")
+        assert pol["type"] == "readOnly"
+        assert "writableRoots" not in pol
+
+    def test_danger_is_full_access_and_is_not_downgraded(self, tmp_path: Path) -> None:
+        # If a caller asks for danger they get danger; quietly confining it
+        # would make the loud warning a lie.
+        assert sandbox_policy(tmp_path, "danger") == {"type": "dangerFullAccess"}
+
+    def test_confined_modes_ask_so_decisions_can_be_logged(self) -> None:
+        assert approval_policy("workspace") == "on-request"
+        assert approval_policy("read-only") == "on-request"
+
+    def test_danger_does_not_ask(self) -> None:
+        assert approval_policy("danger") == "never"
+
+    def test_unknown_mode_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            sandbox_policy(tmp_path, "yolo")
+        with pytest.raises(ValueError):
+            approval_policy("yolo")
+
+    def test_relative_root_still_raises(self) -> None:
+        with pytest.raises(ValueError):
+            sandbox_policy(Path("rel"), "workspace")
+
+
+class TestV2ApprovalNames:
+    """v2 renamed the approval requests; both spellings must decide alike.
+
+    The server reports app_server.api_version="v2", so these are the names a
+    real worker will actually receive. Handling only the v1 names would make a
+    worker decline every genuine request -- safe, but indistinguishable from a
+    deliberate policy, which is the worst kind of bug to debug.
+    """
+
+    def test_v2_exec_inside_root_is_approved(self, tmp_path: Path) -> None:
+        d = decide(tmp_path, EXEC_COMMAND_APPROVAL_V2, {"command": ["ls"], "cwd": str(tmp_path)})
+        assert d.approved
+
+    def test_v2_exec_outside_root_is_declined(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "elsewhere"
+        outside.mkdir(exist_ok=True)
+        d = decide(tmp_path, EXEC_COMMAND_APPROVAL_V2, {"command": ["ls"], "cwd": str(outside)})
+        assert not d.approved
+
+    def test_v2_patch_outside_root_is_declined(self, tmp_path: Path) -> None:
+        d = decide(tmp_path, APPLY_PATCH_APPROVAL_V2, {"changes": {"/etc/passwd": {}}})
+        assert not d.approved
+
+    def test_permissions_request_is_declined(self, tmp_path: Path) -> None:
+        # Not a path-scoped request, so containment cannot judge it. Default deny.
+        d = decide(tmp_path, PERMISSIONS_APPROVAL_V2, {})
+        assert not d.approved
