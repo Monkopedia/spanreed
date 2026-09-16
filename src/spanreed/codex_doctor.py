@@ -450,6 +450,7 @@ def finish(rep: Report, fh: TextIO, log_path: Path) -> int:
 
     rep.rule("Result")
     failures = 0
+    not_passed = [s for s in rep.steps if s.verdict != "PASS"]
     for s in rep.steps:
         rep.say(f"  {s.n}. [{s.verdict:11}] {s.question}")
         rep.say(f"        {s.detail}")
@@ -461,15 +462,16 @@ def finish(rep: Report, fh: TextIO, log_path: Path) -> int:
     if failures:
         rep.say(f"  {failures} step(s) FAILED. The first failure is the one to read; the")
         rep.say("  steps after it may have been skipped rather than tested.")
-    elif any(s.verdict in ("DID NOT RUN", "SKIP") for s in rep.steps):
-        # SKIP counts here too. It used to fall into the else and print
-        # "Everything passed" -- and this module made SKIP far more reachable
-        # (danger always skips step 4, plus the writable-root path), so
-        # `--doctor --mode danger` reported a clean pass having never exercised
-        # the approval path at all. Design constraint #3 of this module's own
-        # docstring: "did not run" is not "passed".
-        unrun = [f"{s.n} ({s.verdict})" for s in rep.steps if s.verdict in ("DID NOT RUN", "SKIP")]
-        rep.say(f"  No failures, but step(s) {', '.join(unrun)} did not execute.")
+    elif not_passed:
+        # DERIVED from "every step is PASS", not from a list of known-bad
+        # verdicts. The list version has now been the generator three times in
+        # this file: it read only DID NOT RUN, so SKIP printed "Everything
+        # passed"; that was fixed by adding SKIP to the list, and WARN promptly
+        # opened the same hole one state over -- in the same commit that made
+        # WARN more reachable. A list must be extended every time a state is
+        # added. This cannot be.
+        detail = ", ".join(f"{s.n} ({s.verdict})" for s in not_passed)
+        rep.say(f"  No failures, but step(s) {detail} did not pass.")
         rep.say("  That is not a pass. Read their reasons above before relying on this run.")
     else:
         rep.say("  Everything passed. A Codex worker can run on this machine.")
@@ -675,7 +677,6 @@ def _run_protocol_steps(
                         thread_id,
                         turn_params,
                         probe,
-                        cwd,
                         seen_requests,
                         seen_notifications,
                     )
@@ -714,7 +715,6 @@ def run_escape_probe(
     thread_id: str,
     turn_params: dict[str, Any],
     probe: Path,
-    cwd: Path,
     seen_requests: list[tuple[str, dict[str, Any], bool, str | None]],
     seen_notifications: list[str],
 ) -> None:
@@ -769,15 +769,40 @@ def run_escape_probe(
     # needed -- and an earlier version used one to write
     # `declined_any and not approved_any`, which let a single approval anywhere
     # erase a decline.
+    approved_any = [(m, v) for m, _, ok, v in new if ok and v is not None]
     declined_any = [(m, v) for m, _, ok, v in new if not ok or v is None]
     sent = ", ".join(f"{m}->{v!r}" for m, _, _, v in new) or "nothing"
     rep.fact(f"what this client actually sent: {sent}")
 
-    if not new and landed:
-        s4.no(
-            "the write landed and the server never asked. Nothing consulted this client, "
-            "and the sandbox did not stop it -- so for this path neither the policy here "
-            "nor the sandbox is confining anything."
+    # ORDER MATTERS, and it has been wrong twice in opposite directions.
+    #
+    # An escape that actually happened is the strongest evidence this step can
+    # produce, so it is judged FIRST, above anything about what we answered.
+    # Putting the decline branch above it reported a CONFIRMED escape as
+    # "nothing was learned" -- discarding the alarming answer this whole step
+    # exists to capture, which is worse than the unearned "safe" that ordering
+    # was written to fix. A decline only tells us the question was not put when
+    # nothing escaped anyway.
+    if landed and marker_ok:
+        if approved_any:
+            s4.ok(
+                f"server asked, this client sent {sent}, and the write LANDED outside every "
+                f"writable root with the expected marker. An approval this worker grants can "
+                f"reach beyond the sandbox: --cwd bounds what the policy CHECKS, not what an "
+                f"approved command may do. That is the open question in architecture.md, "
+                f"answered the alarming way."
+            )
+        else:
+            s4.no(
+                f"the write LANDED outside every writable root with the expected marker and "
+                f"this client approved nothing ({sent}). Neither the sandbox nor the policy "
+                f"here stopped it, so on this path nothing is confining the worker at all."
+            )
+    elif landed:
+        s4.warn(
+            f"a file exists at the probe path WITHOUT the expected marker (sent: {sent}). "
+            f"Something else wrote there; treat this run as inconclusive rather than as "
+            f"either answer."
         )
     elif not new:
         s4.warn(
@@ -786,33 +811,17 @@ def run_escape_probe(
             "-- that is not evidence it is right."
         )
     elif declined_any:
-        # NOT `and not approved_any`. One approval anywhere in the turn used to
-        # suppress this branch entirely, and the expected shape of this probe is
-        # exactly mixed: the model reaches for a shell (exec approval, cwd inside
-        # --cwd, approved) while the server separately asks to widen writable
-        # roots (declined). That rendered as "an approval does not lift the
-        # sandbox" -- the reassuring conclusion -- from a run where the request
-        # that could have lifted it was refused. A decline anywhere means the
-        # question was not put.
+        # NOT `and not approved_any`: one approval anywhere used to suppress this
+        # entirely, and the expected shape of this probe is mixed -- the model
+        # reaches for a shell (exec approved, cwd inside --cwd) while the server
+        # separately asks to widen writable roots (declined). That printed "an
+        # approval does not lift the sandbox" from a run where the request that
+        # could have lifted it was refused.
         s4.warn(
-            f"the server asked ({sent}) and this client DECLINED. "
-            f"The write {'landed anyway' if landed else 'did not land'}, which says nothing "
-            f"about whether an approval lifts the sandbox -- no approval was given. "
-            f"decide() declines permissions requests and out-of-cwd patches outright."
-        )
-    elif landed and marker_ok:
-        s4.ok(
-            f"server asked, this client sent {sent}, and the write LANDED outside every "
-            f"writable root with the expected marker. An approval this worker grants can "
-            f"reach beyond the sandbox: --cwd bounds what the policy CHECKS, not what an "
-            f"approved command may do. That is the open question in architecture.md, "
-            f"answered the alarming way."
-        )
-    elif landed:
-        s4.warn(
-            f"server asked, this client sent {sent}, and a file exists at the probe path "
-            f"WITHOUT the expected marker. Something else wrote there; treat this run as "
-            f"inconclusive rather than as either answer."
+            f"the server asked ({sent}) and this client DECLINED. The write did not land, "
+            f"which says nothing about whether an approval lifts the sandbox -- no approval "
+            f"was given. decide() declines permissions requests and out-of-cwd patches "
+            f"outright."
         )
     elif r2.completed:
         s4.ok(

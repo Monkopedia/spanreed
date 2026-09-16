@@ -44,7 +44,7 @@ class TestVerdictReporting:
         rep.steps.append(Step(2, "never ran"))
         rendered = _render(rep)
         assert "DID NOT RUN" in rendered
-        assert "did not execute" in rendered
+        assert "did not pass" in rendered
         assert "That is not a pass" in rendered
         assert "2 (DID NOT RUN)" in rendered, "the summary must name WHICH step"
 
@@ -306,7 +306,6 @@ class TestEscapeVerdictReadsWhatWasSent:
                 "t",
                 {},
                 probe,
-                Path(td),  # type: ignore[arg-type]
                 seen,
                 [],
             )
@@ -357,3 +356,38 @@ class TestEscapeVerdictReadsWhatWasSent:
         )
         assert s4.verdict == "WARN"
         assert "inconclusive" in s4.detail
+
+
+class TestEverythingPassedIsDerived:
+    """ "Everything passed" must mean every step passed.
+
+    The predicate was a list of known-bad verdicts three times over: it read
+    only DID NOT RUN, so SKIP printed "Everything passed"; SKIP was added to the
+    list, and WARN opened the identical hole one state over -- in the same
+    commit that made WARN more reachable. A list must be extended whenever a
+    state is added; this is the third time in one PR that a literal set was the
+    generator, after the writable roots and the verdict keying.
+    """
+
+    def test_a_warn_is_not_everything_passing(self) -> None:
+        rep = Report(out=io.StringIO())
+        rep.steps.append(Step(3, "ran", verdict="PASS", detail="d"))
+        rep.steps.append(Step(4, "warned", verdict="WARN", detail="never exercised"))
+        rendered = _render(rep)
+        assert "Everything passed" not in rendered
+        assert "4 (WARN)" in rendered
+
+    def test_an_invented_future_verdict_is_not_everything_passing(self) -> None:
+        # The point of deriving: a state nobody has thought of yet is covered on
+        # the day it is added, with no edit here.
+        rep = Report(out=io.StringIO())
+        rep.steps.append(Step(1, "a", verdict="PASS", detail="d"))
+        rep.steps.append(Step(2, "b", verdict="INCONCLUSIVE", detail="d"))
+        rendered = _render(rep)
+        assert "Everything passed" not in rendered
+        assert "2 (INCONCLUSIVE)" in rendered
+
+    def test_all_pass_is_still_a_pass(self) -> None:
+        rep = Report(out=io.StringIO())
+        rep.steps.append(Step(1, "a", verdict="PASS", detail="d"))
+        assert "Everything passed" in _render(rep)
