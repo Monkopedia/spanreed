@@ -26,7 +26,13 @@ from pathlib import Path
 from spanreed.codex_approvals import MODES
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.protocol import Agent
-from spanreed.store import StateStore, default_state_root
+from spanreed.store import (
+    StateStore,
+    default_state_root,
+    format_age,
+    is_stale,
+    peer_link_is_attached,
+)
 
 # ---------------------------------------------------------------- commands
 
@@ -150,22 +156,181 @@ def _cmd_deregister(args: argparse.Namespace) -> int:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
-    agents = StateStore().list_agents(include_stale=args.include_stale)
-    json.dump([a.model_dump(mode="json") for a in agents], sys.stdout, indent=2)
-    print()
+    """Report the whole bus: local agents, mirrored agents, and every bridge.
+
+    Human-readable by default, ``--json`` for the machine shape. That default
+    is the point of the command after issue #55: the reported failure was
+    diagnosable only from state that nothing printed, on a host the owner could
+    not attach a debugger to, and the fix has to be one pasted terminal buffer.
+    So this prints the peer records in full, says in words what each state
+    means, and names the remedy — rather than leaving a reader to infer any of
+    it from an absence.
+
+    ``--json`` emits the same array of agents this command has always emitted,
+    unchanged, so existing scripts keep working by adding one flag. Peer records
+    are deliberately not folded into that array: they are not agents, and
+    widening the shape would break every consumer that adding a flag spares.
+    """
+    store = StateStore()
+    agents = store.list_agents(include_stale=args.include_stale)
+    if args.json:
+        json.dump([a.model_dump(mode="json") for a in agents], sys.stdout, indent=2)
+        print()
+        return 0
+    _print_bus_report(store, agents, include_stale=args.include_stale)
     return 0
 
 
-def _cmd_send(args: argparse.Namespace) -> int:
-    from_agent = args.from_agent or _self_identity()[0]
-    msg = StateStore().send_message(
-        from_agent=from_agent,
-        to_agent=args.to,
-        body=args.body,
-        in_reply_to=args.in_reply_to,
-    )
-    json.dump(msg.model_dump(mode="json"), sys.stdout, indent=2)
+def _print_bus_report(store: StateStore, agents: list[Agent], *, include_stale: bool) -> None:
+    """Write the human bus report to stdout."""
+    hidden = len(store.list_agents(include_stale=True)) - len(agents)
+    print(f"spanreed bus — state root {store.root}")
     print()
+    heading = f"AGENTS ({len(agents)} shown"
+    if include_stale:
+        heading += ", stale included"
+    elif hidden:
+        heading += f", {hidden} stale hidden — pass --include-stale to see them"
+    print(heading + ")")
+    if not agents:
+        print("  (none)")
+    for agent in agents:
+        live = "LIVE " if not is_stale(agent) else "STALE"
+        via = ""
+        if "@" in agent.agent_id:
+            via = f"  [mirrored from host {agent.agent_id.rpartition('@')[2]} by the bridge]"
+        print(f"  {live}  {agent.agent_id}  ({agent.name})  pid {agent.pid}{via}")
+        print(f"         working_dir: {agent.working_dir}")
+        if agent.focus:
+            print(f"         focus:       {agent.focus}")
+        if agent.status:
+            print(f"         status:      {agent.status}")
+        print(
+            f"         last_seen:   {agent.last_seen.isoformat()} ({format_age(agent.last_seen)})"
+        )
+    print()
+    print(
+        "  last_seen is INFORMATIONAL ONLY — it is the time the agent last registered, "
+        "not a\n  heartbeat. Agents do not renew it on a timer, so an old last_seen on a "
+        "LIVE agent is\n  normal and proves nothing; liveness above is the pid check and "
+        "only the pid check.\n  Do not infer that an agent is gone from its last_seen "
+        "(issue #55, secondary finding 3)."
+    )
+    print()
+    _print_peer_section(store)
+
+
+def _print_peer_section(store: StateStore) -> None:
+    """Write the cross-host bridge section of the bus report."""
+    links = store.list_peer_links()
+    print(f"PEERS — cross-host bridges ({len(links)} recorded)")
+    if not links:
+        print(
+            "  (none) — no `spanreed conjoin` has ever attached a peer host to this bus,\n"
+            "  so no <agent_id>@<host> address can resolve here. That is a configuration\n"
+            "  state, not a fault."
+        )
+        return
+    for link in links:
+        attached = peer_link_is_attached(link)
+        state = "ATTACHED" if attached else "DETACHED"
+        print(f"  {state}  {link.host}  (this end is the '{link.role}' side)")
+        print(
+            f"         bridge pid:    {link.bridge_pid}"
+            + ("" if attached else " — no longer running, so its mirrored agents are gone")
+        )
+        print(
+            f"         attached at:   {link.attached_at.isoformat()} "
+            f"({format_age(link.attached_at)})"
+        )
+        if link.detached_at is not None:
+            print(
+                f"         detached at:   {link.detached_at.isoformat()} "
+                f"({format_age(link.detached_at)})"
+            )
+        print(f"         last frame:    {format_age(link.last_frame_at)}")
+        if link.last_registry_at is None:
+            print(
+                f"         registry sync: NEVER — this host has received no registry "
+                f"snapshot from\n                        '{link.host}', so NONE of its "
+                f"agents are addressable from here.\n                        Messages "
+                f"still cross the bridge in both directions; only sync is\n"
+                f"                        starved, which is why nothing else looks wrong. "
+                f"We have asked\n                        {link.registry_requests_sent} "
+                f"time(s). Check `spanreed list` ON '{link.host}'."
+            )
+        else:
+            print(
+                f"         registry sync: {link.last_registry_at.isoformat()} "
+                f"({format_age(link.last_registry_at)}), "
+                f"{link.last_registry_agents} agent(s), "
+                f"{link.registry_syncs} sync(s) total"
+            )
+            if link.peer_registry_rows is not None:
+                print(
+                    f"                        '{link.host}' held {link.peer_registry_rows} "
+                    f"local row(s) then, {link.peer_stale_rows} judged stale there"
+                )
+            if not link.last_registry_agents:
+                print(
+                    f"                        ZERO AGENTS ADVERTISED: the bridge works and "
+                    f"'{link.host}' has\n                        nothing live to offer. "
+                    f"Fix it on '{link.host}', not here."
+                )
+        if link.note:
+            print(f"         note:          {link.note}")
+
+
+SEND_UNRESOLVED_EXIT = 2
+"""Exit code for a recipient that could not be resolved. Nothing was written.
+
+Shares argparse's usage-error code deliberately: an unaddressable recipient is
+a usage error, and the two are never distinguished by a caller that is checking
+whether its send happened.
+"""
+
+SEND_UNDELIVERED_EXIT = 3
+"""Exit code for a message that was written but has no live reader.
+
+Distinct from 0 (a running session is tailing that inbox) and from the ``1``/
+``2`` argparse and usage failures. A send that only *queues* must not exit 0:
+issue #55 calls a silently-successful delivery worse than the bug it was
+reported for, and a shell caller's only channel for that distinction is the
+status code.
+"""
+
+
+def _cmd_send(args: argparse.Namespace) -> int:
+    """Post a message, and say plainly whether anyone is there to read it.
+
+    An unresolvable recipient is reported as a message on stderr, not as a
+    traceback. The resolver's text is the whole product of issue #55's first
+    secondary finding — six situation-specific diagnoses naming six different
+    remedies — and a Python traceback wrapped around it buries the sentence a
+    human is supposed to act on under a stack they are not. The MCP tool still
+    raises: there the exception text *is* what the caller sees.
+    """
+    from_agent = args.from_agent or _self_identity()[0]
+    store = StateStore()
+    try:
+        msg = store.send_message(
+            from_agent=from_agent,
+            to_agent=args.to,
+            body=args.body,
+            in_reply_to=args.in_reply_to,
+        )
+    except ValueError as exc:
+        print(f"spanreed send: {exc}", file=sys.stderr)
+        return SEND_UNRESOLVED_EXIT
+    live, detail = store.delivery_verdict(msg.to_agent)
+    payload = msg.model_dump(mode="json")
+    payload["delivered_to_live_session"] = live
+    payload["delivery"] = detail
+    json.dump(payload, sys.stdout, indent=2)
+    print()
+    if not live:
+        print(detail, file=sys.stderr)
+        return SEND_UNDELIVERED_EXIT
     return 0
 
 
@@ -246,6 +411,7 @@ Incoming messages arrive as notifications on the spanreed-inbox monitor \
 
 Use the spanreed MCP tools to interact with the bus:
   - list_agents(include_stale?)                              — discover peers (includes their focus)
+  - list_peers()                                             — cross-host bridges + when each last synced
   - send_message(from_agent, to_agent, body, in_reply_to?)   — post to a peer's inbox
   - recv_messages(agent_id, since_msg_id?)                   — read new messages
   - wait_for_reply(agent_id, in_reply_to, timeout_s)         — block until a reply lands
@@ -257,6 +423,11 @@ set_focus is optional and pull-only — peers see it in list_agents, nobody is \
 notified. Set a one-line focus when you pick up a major task, then leave it (it's \
 preserved across restarts); don't update it for every small step. A peer who \
 needs a fresh read can request_focus_update you.
+
+Cross-host agents appear as `<agent_id>@<host>` and are mirrored by a `spanreed \
+conjoin` bridge. If one you expect is missing, call list_peers BEFORE concluding it \
+is gone: a bridge that is attached but has never synced makes every agent on that \
+host invisible here, and list_agents cannot tell you that.
 
 Your default name is the basename of your cwd. If that's not descriptive (e.g. "git" \
 because cwd is ``~/git``), call set_name with something better — also preserved across \
@@ -593,11 +764,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_dereg = sub.add_parser("deregister", help="Remove an agent from the registry by id")
     p_dereg.add_argument("agent_id")
 
-    p_list = sub.add_parser("list", help="List registered agents")
+    p_list = sub.add_parser(
+        "list", help="Report this bus: agents, and the state of every cross-host bridge"
+    )
     p_list.add_argument(
         "--include-stale",
         action="store_true",
         help="Include agents whose PID is dead or whose start-time no longer matches",
+    )
+    p_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the agent array as JSON (the pre-0.0.9 output) instead of the report",
     )
 
     p_send = sub.add_parser("send", help="Send a message to another agent")

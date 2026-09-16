@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,7 +17,8 @@ import pytest
 
 from spanreed import cli
 from spanreed.identity import derive_agent_identity
-from spanreed.store import StateStore
+from spanreed.protocol import Agent, PeerLink
+from spanreed.store import StateStore, pid_start_time
 
 
 @pytest.fixture
@@ -43,6 +45,13 @@ def _register_peer(agent_id: str) -> None:
     StateStore().register_agent(
         name=agent_id, working_dir="/tmp", pid=os.getpid(), agent_id=agent_id
     )
+
+
+def _dead_pid() -> int:
+    """Spawn-and-reap a subprocess to get a PID guaranteed not in use."""
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
 
 
 def _run(capsys: pytest.CaptureFixture[str], argv: list[str]) -> tuple[int, str]:
@@ -112,7 +121,7 @@ class TestRegistry:
 
     def test_register_then_list(self, cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
         _run(capsys, ["register"])
-        rc, out = _run(capsys, ["list"])
+        rc, out = _run(capsys, ["list", "--json"])
         assert rc == 0
         agents = json.loads(out)
         assert len(agents) == 1
@@ -125,7 +134,7 @@ class TestRegistry:
         agent_id = json.loads(reg_out)["agent_id"]
         rc, _ = _run(capsys, ["deregister", agent_id])
         assert rc == 0
-        _, list_out = _run(capsys, ["list"])
+        _, list_out = _run(capsys, ["list", "--json"])
         assert json.loads(list_out) == []
 
     def test_register_uses_ppid_by_default(
@@ -254,7 +263,7 @@ class TestSessionStart:
         context = hook["additionalContext"]
         assert "Spanreed inter-agent message bus" in context
         # The agent should also now appear in the registry.
-        _, list_out = _run(capsys, ["list"])
+        _, list_out = _run(capsys, ["list", "--json"])
         agents = json.loads(list_out)
         assert any(a["working_dir"] == str(cli_env) for a in agents)
 
@@ -342,7 +351,7 @@ class TestFocus:
     ) -> None:
         _run(capsys, ["register"])
         _run(capsys, ["focus", "the focus"])
-        _, out = _run(capsys, ["list"])
+        _, out = _run(capsys, ["list", "--json"])
         agents = json.loads(out)
         assert agents[0]["focus"] == "the focus"
 
@@ -352,7 +361,7 @@ class TestFocus:
         """Calling `focus` before `register` shouldn't fail — it auto-registers."""
         rc, _ = _run(capsys, ["focus", "initial focus"])
         assert rc == 0
-        _, out = _run(capsys, ["list"])
+        _, out = _run(capsys, ["list", "--json"])
         agents = json.loads(out)
         assert len(agents) == 1
         assert agents[0]["focus"] == "initial focus"
@@ -385,7 +394,7 @@ class TestStatus:
     ) -> None:
         _run(capsys, ["register"])
         _run(capsys, ["status", "blocked"])
-        _, out = _run(capsys, ["list"])
+        _, out = _run(capsys, ["list", "--json"])
         assert json.loads(out)[0]["status"] == "blocked"
 
     def test_status_auto_registers_if_missing(
@@ -393,7 +402,7 @@ class TestStatus:
     ) -> None:
         rc, _ = _run(capsys, ["status", "needs_input"])
         assert rc == 0
-        _, out = _run(capsys, ["list"])
+        _, out = _run(capsys, ["list", "--json"])
         assert json.loads(out)[0]["status"] == "needs_input"
 
     def test_status_rejects_invalid_level(self, cli_env: Path) -> None:
@@ -462,7 +471,7 @@ class TestName:
     ) -> None:
         _run(capsys, ["register"])
         _run(capsys, ["name", "main-coordinator"])
-        _, out = _run(capsys, ["list"])
+        _, out = _run(capsys, ["list", "--json"])
         agents = json.loads(out)
         assert agents[0]["name"] == "main-coordinator"
 
@@ -481,7 +490,7 @@ class TestName:
     ) -> None:
         rc, _ = _run(capsys, ["name", "fresh-name"])
         assert rc == 0
-        _, out = _run(capsys, ["list"])
+        _, out = _run(capsys, ["list", "--json"])
         agents = json.loads(out)
         assert len(agents) == 1
         assert agents[0]["name"] == "fresh-name"
@@ -943,3 +952,189 @@ class TestRegisteringSomeoneElse:
 
         assert rc == 0
         assert json.loads(out)["pid"] == 880505
+
+
+# ---------------------------------------------------------------- #55: visibility
+
+
+def _write_peer(host: str, **overrides: object) -> None:
+    """Drop a peer record into the CLI's state root (env-bound)."""
+    fields: dict[str, object] = {
+        "host": host,
+        "role": "connect",
+        "bridge_pid": os.getpid(),
+        "bridge_pid_start": pid_start_time(os.getpid()),
+        "attached_at": datetime.now(UTC),
+        "last_frame_at": datetime.now(UTC),
+    }
+    fields.update(overrides)
+    StateStore().write_peer_link(PeerLink.model_validate(fields))
+
+
+class TestListReportsSyncState:
+    """#55 secondary finding 2: sync state was invisible from the initiating side.
+
+    The owner's constraint is that the whole diagnosis has to survive being
+    pasted out of one terminal, so these assert on what `spanreed list` PRINTS.
+    """
+
+    def test_json_still_emits_the_bare_agent_array(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--json is the pre-existing machine shape, unchanged."""
+        _run(capsys, ["register"])
+        _, out = _run(capsys, ["list", "--json"])
+        agents = json.loads(out)
+        assert isinstance(agents, list)
+        assert agents[0]["working_dir"] == str(cli_env)
+
+    def test_no_peers_says_so_in_words(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["register"])
+        _, out = _run(capsys, ["list"])
+        assert "PEERS — cross-host bridges (0 recorded)" in out
+        assert "no `spanreed conjoin` has ever attached a peer host to this bus" in out
+
+    def test_an_attached_peer_that_has_never_synced_is_called_out(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The reported fault, made visible. This is the line that was missing."""
+        _run(capsys, ["register"])
+        _write_peer("macbook", registry_requests_sent=42)
+        _, out = _run(capsys, ["list"])
+        assert "ATTACHED  macbook" in out
+        assert "registry sync: NEVER" in out
+        assert "NONE of its agents are addressable from here" in out
+        assert "only sync is" in out and "starved" in out
+        assert "We have asked" in out and "42" in out
+
+    def test_a_healthy_peer_shows_its_last_sync(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["register"])
+        _write_peer(
+            "adolin",
+            last_registry_at=datetime.now(UTC),
+            last_registry_agents=3,
+            peer_registry_rows=4,
+            peer_stale_rows=1,
+            registry_syncs=99,
+        )
+        _, out = _run(capsys, ["list"])
+        assert "ATTACHED  adolin" in out
+        assert "3 agent(s), 99 sync(s) total" in out
+        assert "'adolin' held 4 local row(s) then, 1 judged stale there" in out
+        assert "registry sync: NEVER" not in out
+
+    def test_a_peer_advertising_zero_agents_points_at_the_peer(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["register"])
+        _write_peer(
+            "adolin",
+            last_registry_at=datetime.now(UTC),
+            last_registry_agents=0,
+            peer_registry_rows=4,
+            peer_stale_rows=4,
+        )
+        _, out = _run(capsys, ["list"])
+        assert "ZERO AGENTS ADVERTISED" in out
+        assert "Fix it on 'adolin', not here." in out
+
+    def test_a_dead_bridge_is_shown_as_detached(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _write_peer("adolin", bridge_pid=_dead_pid(), bridge_pid_start=None)
+        _, out = _run(capsys, ["list"])
+        assert "DETACHED  adolin" in out
+        assert "no longer running, so its mirrored agents are gone" in out
+
+    def test_the_report_warns_that_last_seen_is_not_liveness(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#55 secondary finding 3 — a stale-looking last_seen on a live agent."""
+        _run(capsys, ["register"])
+        _, out = _run(capsys, ["list"])
+        assert "last_seen is INFORMATIONAL ONLY" in out
+        assert "liveness above is the pid check and only the pid check" in out
+
+    def test_a_mirrored_agent_is_labelled_as_coming_from_the_bridge(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run(capsys, ["register"])
+        _write_peer("adolin")
+        StateStore().sync_remote_agents(
+            "adolin",
+            [
+                Agent(
+                    agent_id="agent-r",
+                    name="remote",
+                    working_dir="/tmp",
+                    pid=os.getpid(),
+                    last_seen=datetime.now(UTC),
+                )
+            ],
+            os.getpid(),
+            pid_start_time(os.getpid()),
+        )
+        _, out = _run(capsys, ["list"])
+        assert "agent-r@adolin" in out
+        assert "[mirrored from host adolin by the bridge]" in out
+
+
+class TestSendReportsDelivery:
+    """#55 secondary finding 4: a queued message must not exit 0."""
+
+    def test_a_live_recipient_exits_zero_and_says_delivered(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _register_peer("agent-live")
+        rc, out = _run(capsys, ["send", "--from", "agent-x", "--to", "agent-live", "--body", "hi"])
+        assert rc == 0
+        payload = json.loads(out)
+        assert payload["delivered_to_live_session"] is True
+        assert "whose session is running" in payload["delivery"]
+
+    def test_a_stopped_recipient_does_not_exit_zero(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        StateStore().register_agent(
+            name="gone", working_dir="/tmp", pid=_dead_pid(), agent_id="agent-gone"
+        )
+        rc = cli.main(["send", "--from", "agent-x", "--to", "agent-gone", "--body", "hi"])
+        captured = capsys.readouterr()
+        assert rc == cli.SEND_UNDELIVERED_EXIT
+        payload = json.loads(captured.out)
+        assert payload["delivered_to_live_session"] is False
+        assert payload["delivery"].startswith("NOT DELIVERED TO A LIVE SESSION")
+        assert "NOT DELIVERED TO A LIVE SESSION" in captured.err
+        # The message is still queued — refusing to write it would lose mail a
+        # restarting session is entitled to.
+        assert [m.body for m in StateStore().recv_messages("agent-gone")] == ["hi"]
+
+    def test_a_name_matching_only_stopped_sessions_is_refused_by_the_cli(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        store = StateStore()
+        store.register_agent(
+            name="ksrpc", working_dir="/tmp", pid=_dead_pid(), agent_id="agent-gone"
+        )
+        rc = cli.main(["send", "--from", "agent-x", "--to", "ksrpc", "--body", "hi"])
+        captured = capsys.readouterr()
+        assert rc == cli.SEND_UNRESOLVED_EXIT
+        assert "every agent carrying it on this bus has STOPPED" in captured.err
+        assert store.recv_messages("agent-gone") == []
+
+    def test_an_unresolvable_recipient_is_a_message_not_a_traceback(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The diagnosis has to survive being pasted; a stack trace buries it."""
+        _write_peer("macbook")
+        rc = cli.main(["send", "--from", "agent-x", "--to", "agent-r@macbook", "--body", "hi"])
+        captured = capsys.readouterr()
+        assert rc == cli.SEND_UNRESOLVED_EXIT
+        assert captured.err.startswith("spanreed send: ")
+        assert "has NEVER RECEIVED A REGISTRY SNAPSHOT from 'macbook'" in captured.err
+        assert "Traceback" not in captured.err
+        assert captured.out == ""

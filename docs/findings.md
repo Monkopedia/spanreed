@@ -203,3 +203,22 @@ Confirmed by inspecting on-disk state: **11 stranded messages** across 5 name-ad
 The actual cause was the spike. It spawned app-server with `stdout=PIPE`, set `RUST_LOG=info` **itself**, and read that pipe only at the end of the run — so nothing drained it while the server ran. A Rust server logging at INFO on every span poll fills the 64KB pipe in milliseconds; `write()` then blocks *inside whichever handler is logging*, and the server never returns, never errors, and never logs again, because logging is what is blocked. Calls that log little worked. Calls that log heavily hung. Draining on a thread from the moment of spawn fixed all of it, and was proven by A/B against one stub writing 510KB mid-handler.
 
 **Lesson, and it is not the obvious one.** This repo has already recorded the failure mode of *a diagnostic that cannot report its own failure* — a TCP connect printing "OK" where TLS is the thing that breaks. This was its sibling and it is harder to see: **a diagnostic that reports a constant.** The spike printed `[0 warn/error, 123 lines total]` at the end of every run — 121, 123, 123, 121, 123 — for twenty-five runs. An identical number across runs with different timeouts, different targets and different outcomes is not a status line; it is a measurement of a fixed-size buffer, and it was the answer in plain sight the whole time. Treat a value that never changes as data, not decoration.
+
+## Incident: #55's one-directional registry sync did not reproduce locally (2026-09-16)
+
+Recorded because it bounds what the fix for issue #55 can honestly claim.
+
+**The report.** Bridge up over an hour, messages crossing in both directions, `last_seen` on the peer's mirrored rows current — and *zero* `@<peer>` rows in the initiator's registry, so `_resolve_recipient` refused every address on the peer.
+
+**What was tried.** Two real `spanreed conjoin` processes (`connect` + `--serve`, separate state roots, real pipes, real subprocess launch) mirrored agents **both ways**, every time. Two false starts are worth naming, because each produced a convincing-looking reproduction of the reported symptom and neither was the bug:
+
+- Inspecting `registry.json` **after** the run. Teardown clears mirrored entries by design, so the initiator's registry is legitimately empty afterwards. The registry has to be read while the bridge is alive.
+- Too short a run. The first `--exec` launch went through `uv run`, whose startup delay put the peer's `hello` about 9s in; a 12s window looked like a bridge that never synced.
+
+**So the deployed root cause is not established**, and no fix was written against a guessed one. What the code *did* have was three paths that produce exactly the reported state and leave no trace, all now closed or made visible:
+
+1. A `registry` frame arriving before the peer's `hello` was dropped by `if peer_host is not None:` with no `else`.
+2. `Agent.model_validate` on a frame from a version-skewed peer raised inside the reader thread, killing it. The main thread kept forwarding mail, so the bridge looked healthy while ingesting nothing — the reported symptom exactly.
+3. A peer whose own agents all failed *its* liveness check advertised an empty list, and `sync_remote_agents` replaced the mirror with nothing. On the receiving end that is indistinguishable from never having synced.
+
+**The lesson, and it is the one the fix is built on.** Every one of those is a *silent* path, and the reporter spent three days inside the ambiguity they create. Making sync bidirectional-by-construction (push *and* pull) closes (1); catching per-frame errors closes (2); sending the counts behind the agent list closes (3) — but the load-bearing change is that all three now write a peer record a human can read from `spanreed list` on either host. A fault that can be named in one pasted terminal buffer costs minutes; the same fault with nothing printed cost three days.

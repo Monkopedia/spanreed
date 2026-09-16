@@ -6,14 +6,18 @@ import os
 import subprocess
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from spanreed import store as store_module
-from spanreed.protocol import Agent, Message
-from spanreed.store import StateStore
+from spanreed.protocol import Agent, Message, PeerLink
+from spanreed.store import (
+    StateStore,
+    format_age,
+    peer_link_is_attached,
+)
 
 
 def _dead_pid() -> int:
@@ -602,7 +606,7 @@ class TestRecipientValidation:
     def test_ambiguous_display_name_raises(self, store: StateStore) -> None:
         store.register_agent(name="dup", working_dir="/tmp", pid=os.getpid(), agent_id="agent-1")
         store.register_agent(name="dup", working_dir="/tmp", pid=os.getpid(), agent_id="agent-2")
-        with pytest.raises(ValueError, match="multiple agents"):
+        with pytest.raises(ValueError, match="display name shared by multiple live agents"):
             store.send_message(from_agent="A", to_agent="dup", body="x")
 
     def test_stale_recipient_still_delivers(self, store: StateStore) -> None:
@@ -680,3 +684,314 @@ class TestActivityLog:
         assert len(store.read_activity(agent="agent-a")) == 1
         assert len(store.read_activity(agent="kodemirror")) == 1  # name also matches
         assert store.read_activity(agent="nobody") == []
+
+
+# ------------------------------------------------- peer links + #55 resolution
+
+
+def _peer_link(host: str, **overrides: object) -> PeerLink:
+    """An attached peer record owned by this (live) process, plus overrides."""
+    fields: dict[str, object] = {
+        "host": host,
+        "role": "connect",
+        "bridge_pid": os.getpid(),
+        "bridge_pid_start": store_module.pid_start_time(os.getpid()),
+        "attached_at": datetime.now(UTC),
+        "last_frame_at": datetime.now(UTC),
+    }
+    fields.update(overrides)
+    return PeerLink.model_validate(fields)
+
+
+class TestPeerLinks:
+    """The peer record: the state whose absence made #55 undiagnosable."""
+
+    def test_write_read_list_round_trip(self, store: StateStore) -> None:
+        store.write_peer_link(_peer_link("adolin"))
+        store.write_peer_link(_peer_link("kaladin"))
+        assert [link.host for link in store.list_peer_links()] == ["adolin", "kaladin"]
+        found = store.read_peer_link("adolin")
+        assert found is not None
+        assert found.role == "connect"
+
+    def test_unknown_host_reads_as_none(self, store: StateStore) -> None:
+        assert store.read_peer_link("never-bridged") is None
+
+    def test_attached_while_the_bridge_process_lives(self, store: StateStore) -> None:
+        assert peer_link_is_attached(_peer_link("adolin"))
+
+    def test_detached_once_the_bridge_pid_is_gone(self, store: StateStore) -> None:
+        link = _peer_link("adolin", bridge_pid=_dead_pid(), bridge_pid_start=None)
+        assert not peer_link_is_attached(link)
+
+    def test_detached_when_the_start_time_no_longer_matches(self, store: StateStore) -> None:
+        """PID reuse: the pid is alive but belongs to something else now."""
+        link = _peer_link("adolin", bridge_pid_start=-1)
+        assert not peer_link_is_attached(link)
+
+    def test_a_clean_teardown_is_detached_even_with_a_live_pid(self, store: StateStore) -> None:
+        """``detached_at`` is authoritative — the same process may reconnect later."""
+        link = _peer_link("adolin", detached_at=datetime.now(UTC))
+        assert not peer_link_is_attached(link)
+
+    def test_a_host_label_that_is_a_path_is_refused(self, store: StateStore) -> None:
+        with pytest.raises(ValueError, match="not a usable peer host label"):
+            store.write_peer_link(_peer_link("../../etc/passwd"))
+
+    def test_a_corrupt_record_does_not_break_the_listing(self, store: StateStore) -> None:
+        """``list`` and message resolution must survive one bad file."""
+        store.write_peer_link(_peer_link("adolin"))
+        (store.root / "peers" / "garbage.json").write_text("{not json")
+        assert [link.host for link in store.list_peer_links()] == ["adolin"]
+
+
+class TestStaleRowsCannotShadowLiveAgents:
+    """#55 secondary finding 4 — the one that lost messages silently."""
+
+    def test_the_live_agent_wins_a_shared_display_name(self, store: StateStore) -> None:
+        dead = _dead_pid()
+        store.register_agent(name="ksrpc", working_dir="/tmp", pid=dead, agent_id="agent-dead-1")
+        store.register_agent(name="ksrpc", working_dir="/tmp", pid=dead, agent_id="agent-dead-2")
+        store.register_agent(
+            name="ksrpc", working_dir="/tmp", pid=os.getpid(), agent_id="agent-live"
+        )
+        msg = store.send_message(from_agent="agent-x", to_agent="ksrpc", body="hi")
+        assert msg.to_agent == "agent-live"
+        # And nothing was written to either dead inbox.
+        for dead_id in ("agent-dead-1", "agent-dead-2"):
+            assert store.recv_messages(dead_id) == []
+
+    def test_a_name_matching_only_stopped_sessions_is_refused(self, store: StateStore) -> None:
+        dead = _dead_pid()
+        store.register_agent(name="ksrpc", working_dir="/tmp", pid=dead, agent_id="agent-dead-1")
+        store.register_agent(name="ksrpc", working_dir="/tmp", pid=dead, agent_id="agent-dead-2")
+        with pytest.raises(ValueError) as excinfo:
+            store.send_message(from_agent="agent-x", to_agent="ksrpc", body="hi")
+        text = str(excinfo.value)
+        assert "every agent carrying it on this bus has STOPPED" in text
+        assert "address it by its exact agent_id" in text
+        assert store.recv_messages("agent-dead-1") == []
+        assert store.recv_messages("agent-dead-2") == []
+
+    def test_one_stopped_session_is_refused_too(self, store: StateStore) -> None:
+        """A single dead row is the same fault as two — it resolved before #55."""
+        store.register_agent(
+            name="ksrpc", working_dir="/tmp", pid=_dead_pid(), agent_id="agent-dead"
+        )
+        with pytest.raises(ValueError, match="every agent carrying it on this bus has STOPPED"):
+            store.send_message(from_agent="agent-x", to_agent="ksrpc", body="hi")
+
+    def test_the_exact_id_of_a_stopped_session_still_resolves(self, store: StateStore) -> None:
+        """Deliberate: mail waits for a session that is merely restarting."""
+        store.register_agent(
+            name="ksrpc", working_dir="/tmp", pid=_dead_pid(), agent_id="agent-dead"
+        )
+        msg = store.send_message(from_agent="agent-x", to_agent="agent-dead", body="hi")
+        assert msg.to_agent == "agent-dead"
+
+    def test_ambiguity_is_only_counted_among_live_agents(self, store: StateStore) -> None:
+        store.register_agent(name="dup", working_dir="/tmp", pid=_dead_pid(), agent_id="agent-dead")
+        store.register_agent(name="dup", working_dir="/tmp", pid=os.getpid(), agent_id="agent-a")
+        store.register_agent(name="dup", working_dir="/tmp", pid=os.getpid(), agent_id="agent-b")
+        with pytest.raises(ValueError) as excinfo:
+            store.send_message(from_agent="agent-x", to_agent="dup", body="hi")
+        text = str(excinfo.value)
+        assert "display name shared by multiple live agents" in text
+        assert "agent-dead" not in text
+
+
+class TestDeliveryVerdict:
+    """Appending is not delivering, and the caller has to be told which happened."""
+
+    def test_a_live_local_session_is_a_delivery(self, store: StateStore) -> None:
+        store.register_agent(name="a", working_dir="/tmp", pid=os.getpid(), agent_id="agent-a")
+        live, detail = store.delivery_verdict("agent-a")
+        assert live
+        assert "whose session is running" in detail
+
+    def test_a_stopped_session_is_not_a_delivery(self, store: StateStore) -> None:
+        store.register_agent(name="a", working_dir="/tmp", pid=_dead_pid(), agent_id="agent-a")
+        live, detail = store.delivery_verdict("agent-a")
+        assert not live
+        assert detail.startswith("NOT DELIVERED TO A LIVE SESSION")
+        assert "treat this as QUEUED, not delivered" in detail
+
+    def test_an_unregistered_inbox_is_not_a_delivery(self, store: StateStore) -> None:
+        live, detail = store.delivery_verdict("agent-nobody")
+        assert not live
+        assert detail.startswith("NOT DELIVERED TO A LIVE SESSION")
+
+    def test_a_mirrored_agent_behind_an_attached_bridge_is_a_delivery(
+        self, store: StateStore
+    ) -> None:
+        store.write_peer_link(_peer_link("adolin", last_registry_at=datetime.now(UTC)))
+        store.sync_remote_agents(
+            "adolin",
+            [
+                Agent(
+                    agent_id="agent-r",
+                    name="remote",
+                    working_dir="/tmp",
+                    pid=1,
+                    last_seen=datetime.now(UTC),
+                )
+            ],
+            os.getpid(),
+            store_module.pid_start_time(os.getpid()),
+        )
+        live, detail = store.delivery_verdict("agent-r@adolin")
+        assert live
+        assert "Queued for the bridge to 'adolin'" in detail
+
+    def test_a_mirrored_agent_with_no_bridge_is_not_a_delivery(self, store: StateStore) -> None:
+        store.sync_remote_agents(
+            "adolin",
+            [
+                Agent(
+                    agent_id="agent-r",
+                    name="remote",
+                    working_dir="/tmp",
+                    pid=1,
+                    last_seen=datetime.now(UTC),
+                )
+            ],
+            os.getpid(),
+            store_module.pid_start_time(os.getpid()),
+        )
+        live, detail = store.delivery_verdict("agent-r@adolin")
+        assert not live
+        assert detail.startswith("NOT DELIVERED TO A LIVE SESSION")
+        assert "will be forwarded when `spanreed conjoin adolin` next attaches" in detail
+
+
+class TestResolverNamesTheRightRemedy:
+    """#55 secondary finding 1.
+
+    Every assertion here is on a LONG phrase. The reported failure was a human
+    reading a short, true, useless sentence and acting on it for three days, so
+    the text is the artifact under test; a substring like "list_agents" would
+    match all six of these messages and distinguish none of them.
+    """
+
+    UNQUALIFIED_REMEDY = "Call list_agents to find the recipient's agent_id"
+
+    def _error(self, store: StateStore, to_agent: str) -> str:
+        with pytest.raises(ValueError) as excinfo:
+            store.send_message(from_agent="agent-x", to_agent=to_agent, body="hi")
+        return str(excinfo.value)
+
+    def test_an_unknown_bare_id_still_points_at_list_agents(self, store: StateStore) -> None:
+        text = self._error(store, "agent-typo")
+        assert "is not a registered agent_id or display name on this host" in text
+        assert self.UNQUALIFIED_REMEDY in text
+        assert "address it as <agent_id>@<host>" in text
+
+    def test_a_host_with_no_bridge_says_there_is_no_bridge(self, store: StateStore) -> None:
+        text = self._error(store, "agent-r@adolin")
+        assert "This bus has NO BRIDGE to 'adolin'" in text
+        assert "no `spanreed conjoin` has ever attached that host here" in text
+        assert "This is NOT evidence that 'agent-r' has stopped" in text
+
+    def test_an_attached_but_never_synced_bridge_says_so(self, store: StateStore) -> None:
+        """The exact fault of #55: everything healthy, nothing addressable."""
+        store.write_peer_link(_peer_link("adolin", registry_requests_sent=7))
+        text = self._error(store, "agent-r@adolin")
+        assert "has NEVER RECEIVED A REGISTRY SNAPSHOT from 'adolin'" in text
+        assert "Registry sync and message transport are independent paths" in text
+        assert "This is NOT evidence that 'agent-r' has stopped" in text
+        assert "We have asked 'adolin' to advertise 7 time(s)" in text
+
+    def test_the_never_synced_error_does_not_send_you_to_list_agents(
+        self, store: StateStore
+    ) -> None:
+        """The specific wrong remedy. list_agents returns nothing for that host,
+        which *confirms* the false belief that the agent is gone."""
+        store.write_peer_link(_peer_link("adolin"))
+        text = self._error(store, "agent-r@adolin")
+        assert self.UNQUALIFIED_REMEDY not in text
+
+    def test_a_dead_bridge_says_the_bridge_is_detached(self, store: StateStore) -> None:
+        store.write_peer_link(_peer_link("adolin", bridge_pid=_dead_pid(), bridge_pid_start=None))
+        text = self._error(store, "agent-r@adolin")
+        assert "The bridge to 'adolin' is DETACHED" in text
+        assert "until the bridge is restarted (`spanreed conjoin adolin`)" in text
+        assert self.UNQUALIFIED_REMEDY not in text
+
+    def test_a_peer_advertising_nothing_points_at_the_peer(self, store: StateStore) -> None:
+        store.write_peer_link(
+            _peer_link(
+                "adolin",
+                last_registry_at=datetime.now(UTC),
+                last_registry_agents=0,
+                peer_registry_rows=4,
+                peer_stale_rows=4,
+                registry_syncs=12,
+            )
+        )
+        text = self._error(store, "agent-r@adolin")
+        assert "that snapshot advertised ZERO AGENTS" in text
+        assert "the registry on adolin held 4 local row(s), 4 of which" in text
+        assert "the fix belongs on 'adolin'" in text
+
+    def test_a_healthy_bridge_calls_it_a_genuinely_unknown_agent(self, store: StateStore) -> None:
+        store.write_peer_link(
+            _peer_link(
+                "adolin",
+                last_registry_at=datetime.now(UTC),
+                last_registry_agents=1,
+                registry_syncs=12,
+            )
+        )
+        store.sync_remote_agents(
+            "adolin",
+            [
+                Agent(
+                    agent_id="agent-real",
+                    name="real",
+                    working_dir="/tmp",
+                    pid=1,
+                    last_seen=datetime.now(UTC),
+                )
+            ],
+            os.getpid(),
+            store_module.pid_start_time(os.getpid()),
+        )
+        text = self._error(store, "agent-ghost@adolin")
+        assert "is a genuinely unknown agent rather than a sync failure" in text
+        assert "'adolin' is currently advertising: agent-real@adolin" in text
+
+    def test_the_six_messages_are_actually_distinct(self, store: StateStore) -> None:
+        """A guard on the guards: six branches that all said the same thing would
+        pass every assertion above that looks for a shared phrase."""
+        messages: list[str] = []
+        messages.append(self._error(store, "agent-typo"))
+        messages.append(self._error(store, "agent-r@adolin"))  # no bridge
+        store.write_peer_link(_peer_link("adolin"))
+        messages.append(self._error(store, "agent-r@adolin"))  # never synced
+        store.write_peer_link(
+            _peer_link("adolin", last_registry_at=datetime.now(UTC), last_registry_agents=0)
+        )
+        messages.append(self._error(store, "agent-r@adolin"))  # zero agents
+        store.write_peer_link(
+            _peer_link("adolin", last_registry_at=datetime.now(UTC), last_registry_agents=3)
+        )
+        messages.append(self._error(store, "agent-r@adolin"))  # healthy, unknown id
+        store.write_peer_link(_peer_link("adolin", bridge_pid=_dead_pid(), bridge_pid_start=None))
+        messages.append(self._error(store, "agent-r@adolin"))  # detached
+        assert len(set(messages)) == 6
+
+
+class TestFormatAge:
+    def test_none_reads_as_never(self) -> None:
+        assert format_age(None) == "never"
+
+    def test_seconds_minutes_hours_days(self) -> None:
+        now = datetime(2026, 1, 2, tzinfo=UTC)
+        assert format_age(now - timedelta(seconds=4), now=now) == "4s ago"
+        assert format_age(now - timedelta(minutes=2, seconds=3), now=now) == "2m 3s ago"
+        assert format_age(now - timedelta(hours=1, minutes=3), now=now) == "1h 3m ago"
+        assert format_age(now - timedelta(days=2, hours=5), now=now) == "2d 5h ago"
+
+    def test_a_future_timestamp_says_check_the_clocks(self) -> None:
+        now = datetime(2026, 1, 2, tzinfo=UTC)
+        assert "check the clocks on both hosts" in format_age(now + timedelta(hours=1), now=now)

@@ -310,8 +310,9 @@ further from the cause. The token value is never logged, in any form.
 ### Deliberately not decided yet
 
 - **Cross-host workers.** `conjoin` plus auto-approve means a write on host A executes on host B.
-  Not blocked here, but it has not been thought about, and #55 shows the bridge's registry sync is
-  not yet trustworthy in both directions.
+  Not blocked here, but it has not been thought about. (#55's registry sync is fixed — sync is now
+  push *and* pull, and its state is on disk — so the remaining question is the security one, not a
+  correctness one.)
 - **Sender-visible quota.** The worker logs `account/rateLimits/updated` but does not tell anyone on
   the bus. What the threshold would be, and who gets mailed, is undecided.
 
@@ -340,6 +341,28 @@ hostA:  spanreed conjoin hostB
 
 Both ends run identical bridge logic. `connect` owns the SSH process and the reconnect loop; `serve` speaks the pipe over its own stdin/stdout. This is the `git`-over-SSH / `rsync --server` pattern. The bridge is dedicated infrastructure — it is *not* a Claude session and never wakes one on a timer.
 
+### Registry sync: push *and* pull
+
+The bridge advertises its own host's live agents on a timer, and separately **asks** the peer to advertise (`registry-request`) until a snapshot actually arrives. Two halves, deliberately, because the push half alone cannot detect its own failure.
+
+Issue #55 is the failure it could not detect. In the reported topology the initiator's agents propagated to the peer and the peer's never came back; since `_resolve_recipient` validates against the *local* registry, the initiator could address nobody on the peer. Message transport was unaffected in both directions, so the only symptom was `'<id>@<host>' is not a registered agent_id` — which reads as "that agent doesn't exist".
+
+The design response is not a patch to whichever push went missing; it is that **no side should depend on the other side's timer for state it needs.** Three properties follow, and each closes a way the old design could go quiet:
+
+- **A side that has not been told asks.** The pull re-fires on every sync tick while `last_registry_at` is null, so a snapshot lost to a race, a dropped frame, or a peer that simply never pushed is recovered on the next tick rather than never.
+- **Every silent drop became a recorded one.** A registry frame arriving before the handshake used to vanish into an `if peer_host is not None` with no else. A frame this version could not model used to raise out of the reader thread, killing it — after which the bridge kept forwarding mail from its main thread while ingesting nothing, which is precisely "healthy bridge, no sync". Both now write a `note` on the peer record and carry on.
+- **An empty answer is distinguishable from no answer.** The `registry` frame carries the counts behind its list (`local_rows`, `stale_local_rows`), so a peer advertising zero agents says so *and* says whether it has rows that failed its own liveness check. "The peer has nothing live" and "the peer never spoke" are different faults on different machines.
+
+**Why not have the initiator pull once at handshake and be done?** Because a one-shot pull has the same blind spot as a one-shot push: it cannot tell a peer that answered with nothing from a peer that did not answer, and it has no second chance if the answer is lost. The cost of re-asking is one line on a pipe that is already sending a keepalive at the same cadence.
+
+### Bridge state is on disk, because the failure was invisible
+
+Each bridge writes `peers/<host>.json` — attached-at, last frame, last registry sync and its size, counts of syncs and requests, detach time, and a free-form note. Schema and semantics in [`protocol.md`](protocol.md#peershostjson--peer-records).
+
+This exists for a stated reason: the reported bug was diagnosable only from state that nothing printed, on a machine the owner could not attach a debugger to. `spanreed list` and the `list_peers` MCP tool now render these records in full, in words, with the remedy named — so the whole diagnosis fits in one pasted terminal buffer. That is the visibility-over-hiding principle applied to the bridge, and it resolves the "`@host` UX in `list_agents`" open question.
+
+Link liveness reuses the agent liveness model exactly (bridge PID alive + start-time match), so a link's state can never disagree with the state of the mirrored entries that bridge owns. Records are **kept** after teardown with `detached_at` set: "a bridge was here and died" is a diagnosis, and deleting the file would make it read as "no bridge was ever configured".
+
 ### The core trick: reuse inboxes as the outbound queue
 
 The bridge **mirrors the peer's live agents into the local registry**, qualified by host (`agent-X@hostB`) and owned by the bridge's own PID. Both self-set presence fields cross the bridge: a mirrored entry carries the remote agent's `focus` *and* its `status`, so the "who needs a human" scan over `list_agents` (`status ∈ {needs_input, blocked}`) sees remote agents exactly as it sees local ones. Everything else falls out of the existing primitives with no MCP changes:
@@ -356,7 +379,7 @@ Global identity is `agent-X@homehost`; on its home host the agent is the bare `a
 
 ### Properties that fall out for free
 
-- **No cross-host heartbeat.** Remote-agent liveness is just "present in the peer's latest registry snapshot," which the peer computes with the local PID + start-time check. The bridge's own PID backs the mirrored entries, so if the pipe dies the remote agents correctly vanish from `list_agents`.
+- **No cross-host heartbeat.** Remote-agent liveness is just "present in the peer's latest registry snapshot," which the peer computes with the local PID + start-time check. The snapshot's *age* is recorded on the peer record, so a caller can see how old that evidence is rather than assuming it is current. The bridge's own PID backs the mirrored entries, so if the pipe dies the remote agents correctly vanish from `list_agents`.
 - **Store-and-forward across disconnects.** If the pipe is down, outbound messages accumulate durably in the `*@peer` inbox files; on reconnect the bridge resumes from its saved cursor (the existing `cursors/` mechanism) and drains the backlog.
 
 ### Launch and prerequisites (empirically settled)
