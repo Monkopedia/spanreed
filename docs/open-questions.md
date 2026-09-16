@@ -3,6 +3,31 @@
 Things still to test, design, or decide.
 
 ## Behavioral / empirical
+- **A structural close for boundary prose** (recommended by the review of #56, not taken there): the
+  guard in `tests/unit/test_codex_worker.py` is total on the *generator* axis — it walks every
+  emitted string in every module of the package — and a **six-phrase substring blacklist** on the
+  *predicate* axis, so a newly-worded sentence making the same claim passes. Five review rounds
+  produced five instances, and the last one shipped on a one-word difference (`the` worker vs
+  `this` worker). The proposed close: *every emitted string containing `cwd` must be one of an
+  approved set of module-level constants, checked by identity of the constant rather than by
+  phrase.* That is total in the direction that matters — a new sentence about `--cwd` at a new site
+  fails by construction, in any wording — and it reuses the AST walk already written. It was not
+  taken during the #56 landing because it relocates prose written for five different audiences
+  (model preamble, operator log, bus peer, CLI stderr, CLI `--help`) into one approved set, which is
+  a refactor rather than a fix. Worth doing before the next feature adds a sixth audience.
+- **An identifier can assert a property, and nothing reads a name as a sentence.** `read-only` was
+  cut from `--mode` because it auto-approved inside `--cwd` exactly like every other mode; the
+  guarantee was never in the code, it was in the identifier. Four rounds of auditing *prose* never
+  reached it. The class to watch: `safe_*`, `validated_*`, `*_only`, and `CONFINED_MODES` itself.
+  No guard is proposed — the observation is recorded because the defect is invisible to every
+  mechanism this repo has.
+- **A once-observed flake in `test_a_child_that_exits_zero_after_the_handshake_is_not_a_success`**
+  (2026-09-16). Failed once inside a full `make check`, then passed 12 consecutive runs of its own
+  module, 3 full-suite runs, and 18 runs under deliberate CPU contention. The test already documents
+  a race with the child's exit and accepts two outcomes; a third path is the obvious hypothesis and
+  is **not** evidenced. Recorded rather than fixed, because writing a fix against an unreproduced
+  cause is exactly what #55 taught this repo not to do.
+
 
 - **`/reload-plugins` doesn't restart already-running MCP servers.** Reloading the plugin picks up changes to the manifest, hooks, monitors, and `.mcp.json` config, but the MCP server process spawned at session start keeps running on the *old* code. Adding a new MCP tool, renaming a tool, or changing tool signatures all require a full Claude session restart to take effect. Existing tools continue to work because the MCP server reads StateStore state fresh on each call — so behavioral changes to *implementations* of existing tools land on next call, but new tool *registrations* don't surface until restart. Development-workflow gotcha; possibly worth `/feedback` asking for `/reload-plugins` to restart MCP server processes too.
 - **Monitor exit-warning UX**: a plugin Monitor shows up as "1 monitor still running" in the status line and triggers a "background work in progress" warning on session exit. There's no documented way to mark a monitor as essential infrastructure that should be quietly ignored on exit (no `essential` / `silent` / `quiet` field; no settings override). For an always-on bus, this gets annoying. Options: file `/feedback` asking Anthropic for the flag, or investigate whether MCP server-initiated notifications can replace Monitor as the wake mechanism (avoids the warning entirely, but unclear if Claude Code wakes on them).

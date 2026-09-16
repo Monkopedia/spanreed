@@ -765,7 +765,13 @@ class TestBoundaryInstructionMatchesTheMode:
         # loop iterated a hand-written list and never saw it.
         for mode in CONFINED_MODES:
             text = BOUNDARY_BY_MODE[mode].format(cwd="/w")
+            # Presence: it must describe what is sent.
             assert "asks Codex for" in text, mode
+            # Absence: and must not ALSO assert enforcement. The review injected
+            # a template containing both and this test passed on the first half
+            # alone -- the same defect it is named for, inside the guard suite.
+            for claim in ("turned away by the worker", "before Codex ever sees", "sealed off"):
+                assert claim not in text, f"{mode}: enforcement claim {claim!r}"
 
     def test_every_mode_has_a_boundary_sentence(self) -> None:
         # A mode added without one would fall back to a KeyError at start(),
@@ -810,22 +816,39 @@ class TestNoBoundaryClaimInAnyEmittedString:
 
     Four review rounds, four instances, each somewhere the previous round's
     guard did not reach: the danger template, a since-removed read-only
-    template, the
-    workspace template, and then the --cwd-is-gone refusal 400 lines away --
-    emitted both to the operator's log AND onto the bus, where a peer agent
-    reads it exactly as the model reads the preamble.
+    template, the workspace template, and then the --cwd-is-gone refusal 400
+    lines away -- emitted both to the operator's log AND onto the bus, where a
+    peer agent reads it exactly as the model reads the preamble.
 
     So this walks the AST and checks every string the module can emit, skipping
     docstrings: a docstring SAYING a phrase was retracted is this codebase
     documenting its own history, while the same phrase in an emitted string is
     the defect. A raw text scan cannot tell those apart and flagged the
     explanation as the crime.
+
+    **THIS IS A REGRESSION RATCHET OVER PHRASINGS ALREADY SHIPPED, NOT A
+    DECISION PROCEDURE FOR THE CLAIM.** The generator is total -- every emitted
+    string in every listed module is walked -- and the *predicate* is a
+    six-phrase substring blacklist, so a newly-worded sentence making the same
+    claim passes. The review of #56 demonstrated exactly that: a fresh sentence
+    in the DEFAULT mode's preamble, green across the whole suite. It also
+    demonstrated the one-word hole: "the only bound on what THE worker may
+    touch" is blacklisted and "...what THIS worker may touch" was not, and
+    shipped in cli.py.
+
+    The docstring above argues completeness at length and all of it is about
+    which *sites* are scanned. That is the half that was fixed. The predicate is
+    the open half, and a structural close for it is recorded in
+    docs/open-questions.md rather than half-built here.
     """
 
     FORBIDDEN = (
         "declined outside it",
         "granted inside it",
+        # Both articles: "the" was blacklisted, "this" shipped in cli.py.
         "only bound on what the worker may touch",
+        "only bound on what this worker may touch",
+        "whole blast radius",
         "declines approvals for paths outside",
         "declines every approval",
         "buys you nothing",
@@ -860,13 +883,16 @@ class TestNoBoundaryClaimInAnyEmittedString:
                 out.append(node.value)
         return out
 
-    def test_no_emitted_string_makes_a_retracted_claim(self) -> None:
-        import spanreed.cli as cli_mod
-        import spanreed.codex_approvals as approvals_mod
-        import spanreed.codex_worker as worker_mod
+    def test_no_emitted_string_makes_a_KNOWN_retracted_claim(self) -> None:
+        # Derived, not a literal -- the same critique CONFINED_MODES' docstring
+        # makes. codex_doctor.py was missing from the hand-written list, and at
+        # one point emitted a false claim through that hole.
+        import spanreed
 
-        for mod in (worker_mod, approvals_mod, cli_mod):
-            path = Path(mod.__file__ or "")
+        package_dir = Path(spanreed.__file__ or "").parent
+        paths = sorted(package_dir.glob("*.py"))
+        assert len(paths) >= 8, f"the package walk found only {len(paths)} modules"
+        for path in paths:
             for text in self._emitted_strings(path):
                 for phrase in self.FORBIDDEN:
                     assert phrase not in text, f"{path.name}: {phrase!r} in {text[:70]!r}"

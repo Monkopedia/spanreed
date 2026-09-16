@@ -105,9 +105,11 @@ Then start a worker:
 spanreed codex --name reviewer --cwd ~/some/project
 ```
 
-`--cwd` is **required and has no default**. It is the worker's entire blast
-radius: approvals are auto-approved inside it, any registered agent may wake the
-worker, and the bus does not authenticate senders. `--mode` picks the
+`--cwd` is **required and has no default**. It is what the worker checks
+approvals against and what it asks Codex to sandbox: approvals are
+auto-approved inside it, any registered agent may wake the worker, and the bus
+does not authenticate senders. What the sandbox then enforces depends on
+`--mode` — under `danger` there is no sandbox at all. `--mode` picks the
 confinement — `workspace` (default, writes confined to `--cwd`) or `danger` (no
 sandbox at all, which warns on startup and on every turn).
 

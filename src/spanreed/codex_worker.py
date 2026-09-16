@@ -171,7 +171,7 @@ mode-specific prose written against mode-blind code -- and fixing one instance
 per round produced the next one:
 
 - ``decide()`` takes ``(root, method, params)`` and **no mode**. It approves
-  anything inside ``--cwd`` in every mode, ``read-only`` included.
+  anything inside ``--cwd`` in every mode.
 - ``_decide_exec`` reads ``params["cwd"]`` and never the command's arguments,
   so ``rm -rf /elsewhere`` launched from ``--cwd`` is approved. Saying the
   worker "declines approvals for paths outside it" was false in the DEFAULT
@@ -627,8 +627,9 @@ class CodexWorker:
             # must say what mode the command they are reading ran under.
             self.log.write(DANGER_BANNER)
         if not config.cwd.is_dir():
-            # The directory that bounds everything this worker may touch is
-            # gone. Running the turn anyway would mean approving paths against
+            # The directory this worker checks approvals against, and asks Codex
+            # to sandbox, is gone. Running the turn anyway would mean approving
+            # paths against
             # a tree that no longer exists and handing Codex a cwd it cannot
             # enter — a decision made in a state nobody can describe. The
             # worker stays up, because the directory may come back (a worktree

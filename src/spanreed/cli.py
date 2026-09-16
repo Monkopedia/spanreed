@@ -684,11 +684,12 @@ def _cmd_codex(args: argparse.Namespace) -> int:
         return 2
     if not args.cwd:
         print(
-            "spanreed codex: --cwd is required and has no default. It is the only bound on "
-            "what this worker may touch: approvals are auto-approved inside it, any registered "
-            "agent may wake the worker, and the bus does not authenticate senders. Inheriting a "
-            "default (the process cwd, $HOME, or whatever config.toml marks trusted) would scope "
-            "the worker to a whole home directory. Pass --cwd <the one repo this worker owns>.",
+            "spanreed codex: --cwd is required and has no default. It is what the worker "
+            "checks approvals against and what it asks Codex to sandbox: approvals are "
+            "auto-approved inside it, any registered agent may wake the worker, and the bus "
+            "does not authenticate senders. Inheriting a default (the process cwd, $HOME, or "
+            "whatever config.toml marks trusted) would scope the worker to a whole home "
+            "directory. Pass --cwd <the one repo this worker owns>.",
             file=sys.stderr,
         )
         return 2
@@ -862,7 +863,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_codex.add_argument(
         "--cwd",
-        help="REQUIRED. The one directory this worker may work in — its whole blast radius",
+        help="REQUIRED. The directory this worker checks approvals against and asks Codex "
+        "to sandbox. What that sandbox then permits depends on --mode.",
     )
     p_codex.add_argument(
         "--model", help="Model id (from models_cache.json); server default if omitted"
