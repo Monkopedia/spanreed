@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.1
+
+Fixes to `spanreed codex --doctor`. **If you ran 0.2.0's doctor, re-run this one** —
+0.2.0 could report a *false* PASS on the question the tool exists to answer.
+
+- **Step 4 reported an approval it had not sent.** The verdict hardcoded
+  "approved" while the handler may have declined, so *we declined and nothing
+  escaped* printed as *we approved and confinement held* — the one reading that
+  would suggest auto-approve is safe. It now reports the decision actually
+  transmitted, and a decline is its own outcome that settles nothing.
+- **The escape probe did not test an escape.** It asked for a write in the
+  temp directory, which `workspaceWrite` leaves writable (`excludeSlashTmp`
+  and `excludeTmpdirEnvVar` both default false) — so the write was expected to
+  land with nothing asked, and the doctor called that a catastrophe and exited
+  1. The probe now writes outside every writable root the run actually sends,
+  computed from the policy rather than from `--cwd`.
+- **A confirmed escape no longer reports the machine as healthy.** It is a PASS
+  for step 4 — the round trip worked — and a *finding*, printed above the
+  verdicts and reflected in the exit code, so `Everything passed` is
+  unreachable while one stands. The exit code no longer depends on whether the
+  worker happened to approve.
+- **Step 3 could not fail.** It scanned the whole event stream for its marker,
+  and the stream replays the user message, which contains the marker because
+  the prompt asks for it. It now reads only the assistant's own output.
+- `--doctor` captures app-server's log (0.2.0 captured nothing, because the
+  client deliberately does not set `RUST_LOG` and the doctor did not either),
+  skips step 4 under `--mode danger` rather than reporting the documented
+  behaviour as a failure, cleans up its probe on every path including the
+  timeout, and prints the effective `RUST_LOG` rather than claiming one.
+- A `SKIP`ped or `WARN`ed step no longer prints `Everything passed`; that
+  summary is derived from every step passing rather than from a list of
+  known-bad verdicts.
+
+### Upgrading
+
+Same as 0.2.0 — see below. Nothing in the bus protocol or the worker changed;
+these are diagnostics only.
+
 ## 0.2.0
 
 ### Codex workers (experimental)
