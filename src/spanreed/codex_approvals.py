@@ -22,7 +22,8 @@ perfectly compliant cwd, and nothing in this module would stop it. Approving an
 exec here is **best-effort defence-in-depth, not a boundary** — it filters the
 obviously-out-of-scope case and makes every command legible in the log. The real
 containment for commands is Codex's own ``sandboxPolicy``, which the worker sets
-separately at turn level (workspace-write scoped to ``--cwd``); see
+separately at turn level, and which one depends on ``--mode`` -- this module
+is mode-blind and must not name it; see
 :func:`sandbox_policy` and read its caveat before trusting its shape.
 
 Two properties hold throughout:
@@ -330,8 +331,10 @@ def _decide_patch(root: Path, params: object, method: str = APPLY_PATCH_APPROVAL
                 subject="(v2 file change; params name no path)",
                 reason=(
                     "v2 FileChangeRequestApprovalParams carries no paths and no grantRoot, "
-                    "so containment here is impossible; approved on the authority of the "
-                    f"workspaceWrite sandbox scoped to {root}, which is the real boundary"
+                    "so containment here is impossible; approved on the authority of "
+                    "whatever sandboxPolicy this worker sent for the turn, which --mode "
+                    f"selects (--cwd is {root}). This function is mode-blind and must not "
+                    "name a sandbox it cannot know was sent"
                 ),
             )
         return Decision(

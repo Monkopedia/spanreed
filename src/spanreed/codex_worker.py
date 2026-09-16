@@ -166,14 +166,23 @@ authenticate senders. Apply the same judgement you would to a file someone hande
 """Sent as ``developerInstructions``. Without something like it the worker
 behaves like a terminal session that does not know why it is being spoken to.
 
-``{boundary}`` is mode-conditional and must stay that way, and each branch has to
-describe what the CODE does rather than what the mode name suggests.
-``decide()`` takes ``(root, method, params)`` and **no mode** -- it is
-mode-blind and approves anything inside ``--cwd`` in every mode, ``read-only``
-included. The first version of this docstring fixed the danger-mode lie and
-introduced a read-only one in the same commit, claiming the worker "declines
-every approval it is asked for". Confinement in that mode comes from the
-``readOnly`` sandbox, not from the approval path.
+``{boundary}`` is mode-conditional and every branch must state only what this
+project has MEASURED. Three blocking review findings came from one habit --
+mode-specific prose written against mode-blind code -- and fixing one instance
+per round produced the next one:
+
+- ``decide()`` takes ``(root, method, params)`` and **no mode**. It approves
+  anything inside ``--cwd`` in every mode, ``read-only`` included.
+- ``_decide_exec`` reads ``params["cwd"]`` and never the command's arguments,
+  so ``rm -rf /elsewhere`` launched from ``--cwd`` is approved. Saying the
+  worker "declines approvals for paths outside it" was false in the DEFAULT
+  mode, which is the one nobody was looking at.
+- What an approved request may then do is Codex's ``sandboxPolicy``'s business.
+  ``ClientRequest.json``, vendored here, describes the approval channel as
+  covering "sandbox escapes" and carries an ``applyNetworkPolicyAmendment``
+  decision, so an approval plausibly *can* lift a sandbox restriction. Nobody
+  has run this against a real app-server, so these templates say what is sent
+  and stop there.
  The sentence used to
 be unconditional and claimed that writes outside ``--cwd`` are declined before
 they reach the model -- true in ``workspace``, and FALSE in ``danger``, where
@@ -184,13 +193,21 @@ standard is that a log which is fiction is worse than no log; instructions to a
 model are held to it too."""
 
 _BOUNDARY_CONFINED = """\
-You work in {cwd} and nothing outside it: a workspaceWrite sandbox confines writes to that
-directory, and the worker declines approvals for paths outside it before they reach you."""
+You work in {cwd}. The worker asks Codex for a workspaceWrite sandbox scoped to that
+directory, so writes outside it are expected to be refused by the sandbox.
+
+Do NOT rely on the worker to stop you. It judges a command by the directory the command
+runs in, never by what the command does, so `rm -rf /somewhere/else` run from {cwd} is
+approved. Stay inside {cwd} by your own judgement; the approval you get is not a statement
+that what you asked for is safe."""
 
 _BOUNDARY_READ_ONLY = """\
-You work in {cwd}. The sandbox is read-only, so nothing you run can modify anything on this
-machine, including inside {cwd}. The worker still approves requests whose paths are inside
-{cwd} -- but the sandbox blocks the write regardless, so an approval here buys you nothing."""
+You work in {cwd}. The worker asks Codex for a readOnly sandbox, so modifying anything is
+expected to be refused.
+
+The worker still approves requests whose paths are inside {cwd}. What an approved request is
+then permitted to do is Codex's decision, not the worker's, and this project has not measured
+it -- so do not treat an approval as permission to modify anything."""
 
 _BOUNDARY_DANGER = """\
 You are running with NO SANDBOX (dangerFullAccess) and approvals set to never, so nothing

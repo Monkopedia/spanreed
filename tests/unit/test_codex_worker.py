@@ -720,8 +720,47 @@ class TestBoundaryInstructionMatchesTheMode:
         assert "workspaceWrite" in text
         assert "/w" in text
 
-    def test_read_only_says_read_only(self) -> None:
-        assert "read-only" in BOUNDARY_BY_MODE["read-only"].format(cwd="/w")
+    def test_read_only_names_the_sandbox_it_asks_for(self) -> None:
+        text = BOUNDARY_BY_MODE["read-only"].format(cwd="/w")
+        assert "readOnly sandbox" in text
+
+    # ---------------------------------------------------------------- claims
+    # Three review rounds found three false sentences here, each in a branch the
+    # previous round had not looked at, because nothing executed the prose. One
+    # test per retracted claim: the code is mode-blind and the templates are
+    # mode-specific, so the only thing keeping them honest is a list of things
+    # they are not allowed to say.
+
+    def test_no_branch_claims_the_worker_declines_by_path(self) -> None:
+        # FALSE in every mode. _decide_exec reads params["cwd"] and never the
+        # command's arguments, so `rm -rf /elsewhere` launched from --cwd is
+        # approved. Said in the DEFAULT mode for two rounds.
+        for mode, template in BOUNDARY_BY_MODE.items():
+            text = template.format(cwd="/w")
+            assert "declines approvals for paths outside" not in text, mode
+            assert "declined by the worker" not in text, mode
+
+    def test_no_branch_claims_the_worker_declines_everything(self) -> None:
+        # FALSE in read-only: decide() takes no mode and approves in-cwd
+        # requests in every one.
+        for mode, template in BOUNDARY_BY_MODE.items():
+            assert "declines every approval" not in template.format(cwd="/w"), mode
+
+    def test_no_branch_asserts_what_an_approval_is_worth(self) -> None:
+        # UNMEASURED. The vendored schema describes approvals as the channel for
+        # "sandbox escapes" and carries applyNetworkPolicyAmendment, so an
+        # approval plausibly CAN lift a sandbox restriction. Nothing here has
+        # been run against a real app-server, so no branch may claim either way.
+        for mode, template in BOUNDARY_BY_MODE.items():
+            assert "buys you nothing" not in template.format(cwd="/w"), mode
+
+    def test_every_branch_describes_what_is_SENT_not_what_is_enforced(self) -> None:
+        # The durable form of all three: these templates may say what the worker
+        # asks Codex for, because that is observable here. They may not assert
+        # what Codex then does.
+        for mode in ("workspace", "read-only"):
+            text = BOUNDARY_BY_MODE[mode].format(cwd="/w")
+            assert "asks Codex for" in text, mode
 
     def test_every_mode_has_a_boundary_sentence(self) -> None:
         # A mode added without one would fall back to a KeyError at start(),

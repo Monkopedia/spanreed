@@ -221,9 +221,23 @@ app-server accepts and ignores — checked against `ClientRequest.json`, not inf
 
 | `--mode` | `sandbox` (thread) / `sandboxPolicy` (turn) | `approvalPolicy` | Notes |
 |---|---|---|---|
-| `read-only` | `read-only` / `readOnly` | `on-request` | No writes, no network. |
+| `read-only` | `read-only` / `readOnly` | `on-request` | Asks Codex for a read-only sandbox. **Not verified to be airtight** — see the note below. |
 | `workspace` (default) | `workspace-write` / `workspaceWrite` with `writableRoots: [--cwd]` | `on-request` | The intended shape: writes inside `--cwd`, no network. |
 | `danger` | `danger-full-access` / `dangerFullAccess` | `never` | **No confinement at all.** |
+
+**A caution on `read-only`, recorded rather than resolved.** The worker still
+auto-approves any request whose paths are inside `--cwd`, in every mode —
+`decide()` takes no `mode` argument. What an approved request is then permitted
+to do is Codex's decision, and the schema vendored under
+`experiments/codex-app-server-spike/schema/` suggests approvals are precisely
+the channel for going beyond a sandbox: `ApprovalsReviewer` is documented as
+covering "sandbox escapes", `AskForApproval.granular` carries a
+`sandbox_approval` field, and `CommandExecutionApprovalDecision` includes
+`applyNetworkPolicyAmendment`.
+
+So `read-only` may be weaker than its name. Nobody has run this against a live
+`app-server` — `spanreed codex --doctor` is what would settle it, and until it
+does this row states what the worker *sends*, not what Codex enforces.
 
 `on-request` is deliberate for the two confined modes even though the worker auto-approves: it is
 what makes app-server *ask*, which is what makes every decision loggable. `never` would auto-approve
