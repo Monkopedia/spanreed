@@ -79,10 +79,49 @@ def list_agents(include_stale: bool = False) -> list[dict[str, object]]:
     Stale entries (PID dead, or the PID's start-time no longer matches what was
     recorded — i.e. the agent's process is gone) are filtered out by default;
     pass ``include_stale=True`` to see them.
+
+    **This shows only what THIS host knows.** Agents on a conjoined peer host
+    appear as ``<agent_id>@<host>`` and only once that host's bridge has synced
+    its registry here. If an agent you expect on another host is missing, call
+    ``list_peers`` before concluding it is gone — a bridge that is attached but
+    has never synced makes every agent on that host invisible to this tool,
+    which looks identical to the agent having stopped (issue #55).
+
+    ``last_seen`` on a record is informational only. Agents do not heartbeat, so
+    an old ``last_seen`` on a listed (therefore live) agent is normal and is not
+    evidence of anything.
     """
     return [
         a.model_dump(mode="json") for a in StateStore().list_agents(include_stale=include_stale)
     ]
+
+
+@mcp_app.tool()
+def list_peers() -> list[dict[str, object]]:
+    """List the cross-host bridges this bus has, and how each one is doing.
+
+    One record per peer host a ``spanreed conjoin`` has ever attached here,
+    including bridges that have since died (``detached_at`` set, or a
+    ``bridge_pid`` that is no longer running).
+
+    The field that matters most is ``last_registry_at``: ``null`` means this
+    host has **never** received a registry snapshot from that peer, so none of
+    the peer's agents can be addressed from here — while messages still cross
+    the bridge normally in both directions. That combination is why the fault
+    reads as "the agent does not exist" rather than as a sync failure.
+
+    Read it as:
+
+    - no record for a host → no bridge was ever started for it here.
+    - record present, ``detached_at`` set or ``bridge_pid`` dead → the bridge
+      died; restart ``spanreed conjoin <host>``.
+    - attached, ``last_registry_at`` null → the peer is not advertising; check
+      ``spanreed list`` on the peer itself.
+    - attached, ``last_registry_agents`` 0 → the peer answered and has nothing
+      live to advertise; ``peer_registry_rows``/``peer_stale_rows`` say whether
+      its agents exist but are failing its own liveness check.
+    """
+    return [link.model_dump(mode="json") for link in StateStore().list_peer_links()]
 
 
 @mcp_app.tool()
@@ -101,17 +140,26 @@ def send_message(
 
     The ``in_reply_to`` field, if set, threads this message as a response to a
     prior one. ``wait_for_reply`` uses this to match replies to their requests.
+
+    **Check ``delivered_to_live_session`` in the result.** Returning without an
+    error means the message was written to the recipient's inbox, which is not
+    the same as it being read: an exact ``agent_id`` still resolves for a
+    session that has exited, and the message then waits in a file nothing is
+    tailing. When that flag is ``false``, ``delivery`` explains why in full —
+    treat the message as QUEUED, tell the user so, and do not block on a reply.
+    A display *name* that matches only stopped sessions is refused outright
+    rather than queued, so a live agent can never be shadowed by a dead one
+    carrying the same name (issue #55).
     """
-    return (
-        StateStore()
-        .send_message(
-            from_agent=from_agent,
-            to_agent=to_agent,
-            body=body,
-            in_reply_to=in_reply_to,
-        )
-        .model_dump(mode="json")
+    store = StateStore()
+    msg = store.send_message(
+        from_agent=from_agent,
+        to_agent=to_agent,
+        body=body,
+        in_reply_to=in_reply_to,
     )
+    live, detail = store.delivery_verdict(msg.to_agent)
+    return {**msg.model_dump(mode="json"), "delivered_to_live_session": live, "delivery": detail}
 
 
 @mcp_app.tool()

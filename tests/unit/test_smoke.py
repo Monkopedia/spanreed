@@ -52,6 +52,7 @@ async def test_mcp_server_registers_its_tool_surface() -> None:
         "register_agent",
         "deregister_agent",
         "list_agents",
+        "list_peers",
         "send_message",
         "recv_messages",
         "wait_for_reply",

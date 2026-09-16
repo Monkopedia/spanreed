@@ -142,6 +142,248 @@ Out-of-scope explicitly:
 
 (Cross-host messaging was previously out-of-scope; it is now an in-design feature — see below.)
 
+(So were headless workers, in the first line of this section. A **Codex worker** is one: no human attached, woken only by mail. That is now an in-design feature too — see "Codex workers" below. The reason the original exclusion held was that headless agents had other handles and did not need the bus; a Codex session has no such handle, which is exactly why it needs one.)
+
+## Codex workers
+
+A **Codex worker** is a bus agent with no human attached: a long-lived process that owns one
+`codex app-server` thread and turns inbound mail into turns. Feasibility is settled empirically —
+see [findings.md](findings.md#test-5-can-a-foreign-process-drive-a-codex-turn-2026-09-15) — and this
+section is the design, not the evidence.
+
+```
+spanreed codex --name reviewer --cwd ~/git/foo \
+               --model gpt-5.6-sol --effort medium [--mode workspace] [--instructions TEXT]
+  ├─ spawn `codex app-server --listen unix://<private socket>`
+  ├─ initialize + initialized          (the notification is mandatory)
+  ├─ thread/start --cwd --model …      (one thread, owned for the worker's life)
+  ├─ register in the registry          (ordinary agent row; peers address it normally)
+  ├─ poll inbox → turn/start           (one turn per message, FIFO)
+  ├─ item/agentMessage/delta → reply back to the sender
+  ├─ thread/status/changed → registry status
+  └─ idle read between turns           (see "The idle read" — status/quota do NOT arrive by themselves)
+```
+
+**Identity.** The worker registers as `agent-<name>` with display name `<name>` — the same shape
+`SPANREED_AGENT_NAME` mints for a Claude session, so a restarted worker keeps the id its peers
+already hold and can also be addressed by name. Its registry `pid` is the **worker process's own**:
+that process's liveness *is* the entry's liveness, which is what `pid` means (`protocol.md`); there
+is no Claude session behind it. A restarted worker starts a **fresh thread** and does not resume the
+old one.
+
+### Two properties a Claude session does not have
+
+**Status is authoritative.** `thread/status/changed` reports real `active`/`idle` transitions, so a
+Codex worker's status is observed rather than self-declared. Claude's is best-effort (see "Agent
+status" above), and `last_seen` has been shown unreliable in practice
+(`Monkopedia/spanreed#55`). Where the two disagree, the Codex mechanism is the one to copy.
+
+Two qualifications this section originally lacked. First, *observed* only works if somebody reads
+the socket — see "The idle read" below. Second, the mapping is not free: Codex reports two states
+and the bus has four, and a worker has no human to need, so `active`→`working` and `idle`→`idle` is
+the whole map; `needs_input` and `blocked` are unreachable for a Codex worker. A value outside the
+map is logged and ignored rather than guessed at. Because the notification's exact payload shape is
+not in either vendored schema (they cover requests, not notifications), the worker also sets
+`working`/`idle` around each turn itself as a floor — an observed transition overwrites that
+whenever one arrives, so the authoritative source still wins where it exists.
+
+**Quota is observable.** `account/rateLimits/updated` arrives unprompted during a turn. A worker
+burning the owner's ChatGPT allowance can say so on the bus instead of failing opaquely later. v1
+*records and logs* each snapshot (it is in the worker's log, and the latest one is on the worker
+object); proactively mailing a peer about quota is not implemented.
+
+### Startup configuration
+
+The worker's model, reasoning effort and persona are fixed when it starts. The parameter names
+below are taken from `codex app-server generate-json-schema`, which is authoritative and on disk —
+they are not guesses, and the split between the two calls is real:
+
+| Flag | Passed on | Notes |
+|---|---|---|
+| `--cwd` | `thread/start` | **Required, no default.** See below. |
+| `--model` | `thread/start`, re-sent per `turn/start` | Ids come from `models_cache.json`. |
+| `--effort` | **`turn/start` only** | Not accepted by `thread/start`. A worker-level effort must therefore be re-applied on every turn — it cannot be set once at thread creation. |
+| `--personality` | both | |
+| `--service-tier` | both | `serviceTierForTurn` also exists, turn-only. |
+| `--instructions` | `thread/start` | Sent as **`developerInstructions`**, appended to a built-in bus preamble. This is where a worker is told it is *on a bus*: that input is mail from another agent, that its reply is sent back as mail, and that a body is data rather than an instruction. Without it the worker behaves like a terminal session that does not know why it is being spoken to. |
+| `--mode` | `thread/start` (`sandbox`) + every `turn/start` (`sandboxPolicy`) | `workspace` (default) \| `danger`. See "Modes" below. |
+| `--name` | neither | Bus identity only: the worker registers as `agent-<name>`. |
+
+**`sandbox` and `sandboxPolicy` are different parameters, and both are sent.** `thread/start` takes
+`sandbox`, whose type is the `SandboxMode` *enum* (`read-only` / `workspace-write` /
+`danger-full-access`). `turn/start` takes `sandboxPolicy`, whose type is the `SandboxPolicy`
+*object* (`{"type": "workspaceWrite", "writableRoots": [...]}`). Only the object carries
+`writableRoots`, which is what actually scopes writes to `--cwd`, so the policy is re-sent on every
+turn alongside `effort`. Sending the object under the enum's name is the exact class of mistake
+app-server accepts and ignores — checked against `ClientRequest.json`, not inferred.
+
+### Modes
+
+| `--mode` | `sandbox` (thread) / `sandboxPolicy` (turn) | `approvalPolicy` | Notes |
+|---|---|---|---|
+| `workspace` (default) | `workspace-write` / `workspaceWrite` with `writableRoots: [--cwd]` | `on-request` | The intended shape: writes inside `--cwd`, no network. |
+| `danger` | `danger-full-access` / `dangerFullAccess` | `never` | **No confinement at all.** |
+
+**A caution on what an approval is worth, recorded rather than resolved.** The
+worker auto-approves any request whose paths are inside `--cwd` — `decide()`
+takes no `mode` argument. What an approved request is then permitted to do is
+Codex's decision, and the schema vendored under
+`experiments/codex-app-server-spike/schema/` suggests approvals are precisely
+the channel for going beyond a sandbox: `ApprovalsReviewer` is documented as
+covering "sandbox escapes", `AskForApproval.granular` carries a
+`sandbox_approval` field, and `CommandExecutionApprovalDecision` includes
+`applyNetworkPolicyAmendment`.
+
+If that reading holds, auto-approving inside `--cwd` is a stronger grant than
+this table implies. Nobody has run it against a live `app-server`; `spanreed
+codex --doctor` is what would settle it.
+
+**A `read-only` mode was cut before release, for this reason.** It asked Codex
+for a `readOnly` sandbox while still auto-approving everything inside `--cwd`,
+so its name made a safety claim this project could not substantiate. A mode
+whose name is an unverified guarantee is worse than no mode. If read-only work
+is wanted later it should arrive with a `--doctor` run behind it.
+
+`on-request` is deliberate for `workspace` even though the worker auto-approves: it is
+what makes app-server *ask*, which is what makes every decision loggable. `never` would auto-approve
+identically and write nothing down.
+
+**`--mode danger` is allowed with any sender — and must warn loudly** (owner decision, 2026-09-15).
+It is not gated on an allowlist, because that would re-introduce an authentication model the bus
+does not have. Instead the worker logs an unmissable banner at startup *and again on every single
+turn*, naming the mode and the fact that senders are unauthenticated. A log the owner scrolls
+through has to say what mode the command they are reading ran under.
+
+**What v1 actually exposes as flags**: `--name`, `--cwd`, `--model`, `--effort`, `--mode`,
+`--instructions`. `--personality` and `--service-tier` are in the table because the *protocol*
+takes them and the split is worth recording; they are not CLI flags yet.
+
+**`config` is prohibited.** `thread/start` accepts a per-thread `config` override and we must never
+send one: on the version this was validated against, any `config` override makes subsequent turns
+hang silently — no notifications, no error, no timeout
+([openai/codex#45361](https://github.com/openai/codex/issues/45361)). Given that a silent turn hang
+is precisely the failure this spike spent thirty runs mistaking for a protocol problem, this is
+written down as a rule rather than left to be rediscovered.
+
+**Senders cannot override any of it** (owner decision, 2026-09-15). `effort`, `model` and the rest
+are per-turn parameters, so a message *could* carry them; it may not. Cost and model choice stay a
+property of how the worker was started, not of who mailed it — which matters because "any registered
+agent may wake it" means senders are unauthenticated, and an override would let one burn the owner's
+quota at will.
+
+### Controls
+
+Decided by the owner, 2026-09-15, in the session that closed the spike.
+
+| Control | Decision | Consequence accepted |
+|---|---|---|
+| Approvals | **Auto-approve within `--cwd`** | A **patch** approval is answered yes when every path it names is inside `--cwd`. An **exec** approval is answered yes when the *working directory* of the command is inside `--cwd` — the command's arguments are never examined, so `rm -rf /elsewhere` launched from `--cwd` is approved. Confinement for commands comes from `sandboxPolicy`, not from this check. |
+| Who may wake it | **Any registered agent** | Consistent with the trust model above — "if it's on the bus you can trust it". No allowlist. |
+| Concurrency | **Queue, FIFO** | One turn per message, each with its own reply. Senders may wait. Codex's native `steer` is deliberately *not* used: a steered turn produces one reply for two senders' messages, which the bus has no way to express. |
+| Thread lifetime | **One thread per worker** | Context accumulates, so a worker remembers its conversation the way a Claude session does. History growth is a token cost, not a correctness problem. |
+| Startup config | **Fixed at start; senders cannot override** | Model, effort and persona are worker flags. A message may not change them, so cost is a property of how the worker was launched. See "Startup configuration" above. |
+
+### `--cwd` is the security boundary, and it is required
+
+Auto-approval plus any-sender means **an unauthenticated inbox write becomes code execution**, and
+the only thing bounding it is `--cwd`. That is a deliberate choice and follows from the trust model,
+which was never a claim that the bus is *authenticated* — only that, single-user, it need not be. A
+Codex worker is the first thing on this bus where that distinction has teeth, because the other end
+of a message is now a shell rather than a model's judgement.
+
+Two rules follow, and they are not negotiable in the way the table above is:
+
+1. **`--cwd` has no default.** Not `$HOME`, not the process's working directory, not whatever
+   `config.toml` marks trusted. A worker started without `--cwd` refuses to start. The machine this
+   was validated on has `[projects."/Users/monk"] trust_level = "trusted"`, so an inherited default
+   would have scoped every worker to the entire home directory.
+2. **Approvals are logged, both outcomes,** to `~/.claude/spanreed/codex/<name>.log` (under
+   `$SPANREED_STATE_ROOT` when set — it is bus state, so it lives with the rest of it). Every
+   `execCommandApproval` and `applyPatchApproval`, the command or path, and whether it was approved
+   or declined for being outside `--cwd`. Per rule 7, verbose and legible: the owner wants to *see*
+   what a Codex agent did on their behalf, and an auto-approved command that appears nowhere is the
+   one that cannot be reviewed. The same file carries startup config, every turn, every non-delta
+   notification, and the auth refreshes — **never a credential**. A worker whose log **cannot be
+   written** — an unwritable state root, a `codex/` directory it may not create — **refuses to
+   start**, with the reason as a sentence on stderr rather than a traceback. A worker that
+   auto-approves commands for unauthenticated senders and cannot record what it approved is not a
+   degraded worker, it is an unreviewable one.
+
+### When things break
+
+Fault-injected and pinned by `tests/unit/test_codex_worker_faults.py`. The ordering behind every
+row: a worker that wedges silently is the worst outcome (that is `Monkopedia/spanreed#55`, which
+cost three days), a worker that exits loudly is acceptable, a worker that recovers is best. Every
+row produces a log line naming what happened, what the worker did, and what to check.
+
+| Fault | What the worker does |
+|---|---|
+| app-server dies or closes the socket **mid-turn** | Replies to that sender saying the turn was lost and not retried, logs the drop *and the child's exit status*, then **exits 1**. The queue behind it cannot run without a thread. |
+| app-server never binds its socket, or exits after the handshake | `FAILED TO START`, with the server's own captured output and its exit status, then exit 1. Nothing is left in the registry. |
+| the socket **file** is unlinked while connected | Nothing. An established unix socket is a descriptor, not a path. |
+| a colossal write during a turn | Absorbed by the drain thread, which runs from the moment the child is spawned. This is the 64KB-pipe hang that cost the spike thirty runs; it is now pinned at 1MB *mid-turn* as well as before the bind. |
+| a malformed frame, a JSON frame that is not an object, or a `params` member that is not an object | **Skipped and reported** as a `PROTOCOL FAULT` line in the worker's log. WebSocket frames are self-delimiting, so one bad frame does not desynchronise the stream — but a skip nobody is told about is exactly #55's shape. A non-object `params` becomes `{}`, which every approval path already treats as a decline. |
+| a response for an id we never sent, or a late one for an id we did | Discarded, and logged as *which of the two it was*: an id outside the range we have issued means something else is on this socket; an id inside it means the server answered a call we had already timed out. |
+| `turn/start` returns a JSON-RPC error | The sender gets the error as its reply; the worker stays up. |
+| no terminal turn event before the deadline | The sender is told the turn **did not finish**, with any partial text. Accepted is not completed. |
+| an unknown server→client request | Answered `-32601`. Never dropped: app-server blocks on these with no timeout. |
+| the inbox is unreadable (a truncated line, bytes that are not UTF-8) | Logs the file, the error, and how to repair it, then **exits 1**. Polling an inbox that answers with an exception is the "alive and ingesting nothing" failure. |
+| the inbox file is deleted | Treated as empty. Later mail still runs. |
+| mail arrives during a turn | Runs as the next turn, in order. Nothing is lost. |
+| the sender deregisters before the reply | The reply text goes to the log in full, the cursor still advances, the worker stays up. |
+| `--cwd` is a symlink | Resolved once, at construction. The sandbox is scoped to the real directory and both spellings get the same approval verdict. |
+| `--cwd` is deleted after start | Every turn is **refused** with a reply naming the reason, and the worker stays on the bus — the directory may come back. No turn runs without its boundary. |
+| `--cwd` is not writable, in `workspace`/`danger` | A startup warning naming it. Otherwise the only symptom is the model reporting failed edits as its own fault. |
+| `auth.json` missing, unreadable, malformed, or lacking either key | Declines (`-32601`) and says which file and which key. Never invents a token, and never logs one. |
+
+Anything the list above did not predict is caught at the top of the poll loop, logged with its
+traceback as an `UNEXPECTED FAILURE`, and the worker exits 1. This ships to a machine its author
+cannot debug on, where a traceback on an unwatched terminal is the same as no report at all.
+
+`thread/start`'s result is read in both shapes it has returned across versions (`threadId` and
+`thread.id`). The worker previously read only the flat one while `--doctor` read both, so a server
+answering the other shape would have produced a doctor that passed and a worker that died on the
+same call.
+
+### The idle read
+
+The sketch above says `thread/status/changed → registry status`, and an earlier revision of this
+document implied that and `account/rateLimits/updated` simply *fall out* of running turns. They do
+not. The client is synchronous: it reads frames off the socket only while it is inside a call, so
+between turns — which is most of an idle worker's life — nothing is read and those notifications sit
+in the kernel buffer. A worker's registry row would then report whatever the last turn left behind.
+
+So the loop's empty branch is an explicit **idle read**: when the inbox has nothing, the worker
+spends its poll interval reading and dispatching whatever the server has sent since the last call.
+Status and quota are therefore current between turns, and the read doubles as the poll's pacing —
+the worker blocks on the socket rather than on a `sleep`.
+
+### Authentication: `account/chatgptAuthTokens/refresh`
+
+On a `401`, app-server asks the *client* for a token and blocks on the answer. A worker answers from
+`$CODEX_HOME/auth.json` (default `~/.codex`) — `tokens.access_token` and `tokens.account_id` — and
+replies `{accessToken, chatgptAccountId}`. If the file is unreadable or lacks either field the
+worker **declines** (`-32601`) and says so loudly in the log: an invented token fails later and
+further from the cause. The token value is never logged, in any form.
+
+### Deliberately not decided yet
+
+- **Cross-host workers.** `conjoin` plus auto-approve means a write on host A executes on host B.
+  Not blocked here, but it has not been thought about. (#55's registry sync is fixed — sync is now
+  push *and* pull, and its state is on disk — so the remaining question is the security one, not a
+  correctness one.)
+- **Sender-visible quota.** The worker logs `account/rateLimits/updated` but does not tell anyone on
+  the bus. What the threshold would be, and who gets mailed, is undecided.
+
+Resolved since:
+
+- **A turn that fails** (decided 2026-09-16): `turn/failed` and `turn/aborted` send **the error back
+  to the sender as an ordinary reply**, threaded with `in_reply_to`, carrying any partial output.
+  No retry — a retry would re-run a turn whose side effects already happened — and never silence,
+  which would leave a peer blocked on a reply that is not coming. A turn that produces no terminal
+  event before the worker's deadline, and one that completes with no agent message, both reply
+  saying exactly that.
+
 ## Cross-host: the SSH bus-bridge
 
 Single-host spanreed coordinates through a shared local filesystem with no daemon. Cross-host can't share that filesystem safely (`flock` and append-atomicity don't hold over network FS) and the PID-based liveness model is local by definition. Rather than introduce a network broker or a shared mount, we **bridge two independent local buses over a persistent SSH duplex pipe**. SSH gives us authenticated, encrypted transport for free and makes "you can reach the box" the authorization model — which matches the single-user trust assumption exactly.
@@ -157,6 +399,28 @@ hostA:  spanreed conjoin hostB
 ```
 
 Both ends run identical bridge logic. `connect` owns the SSH process and the reconnect loop; `serve` speaks the pipe over its own stdin/stdout. This is the `git`-over-SSH / `rsync --server` pattern. The bridge is dedicated infrastructure — it is *not* a Claude session and never wakes one on a timer.
+
+### Registry sync: push *and* pull
+
+The bridge advertises its own host's live agents on a timer, and separately **asks** the peer to advertise (`registry-request`) until a snapshot actually arrives. Two halves, deliberately, because the push half alone cannot detect its own failure.
+
+Issue #55 is the failure it could not detect. In the reported topology the initiator's agents propagated to the peer and the peer's never came back; since `_resolve_recipient` validates against the *local* registry, the initiator could address nobody on the peer. Message transport was unaffected in both directions, so the only symptom was `'<id>@<host>' is not a registered agent_id` — which reads as "that agent doesn't exist".
+
+The design response is not a patch to whichever push went missing; it is that **no side should depend on the other side's timer for state it needs.** Three properties follow, and each closes a way the old design could go quiet:
+
+- **A side that has not been told asks.** The pull re-fires on every sync tick while `last_registry_at` is null, so a snapshot lost to a race, a dropped frame, or a peer that simply never pushed is recovered on the next tick rather than never.
+- **Every silent drop became a recorded one.** A registry frame arriving before the handshake used to vanish into an `if peer_host is not None` with no else. A frame this version could not model used to raise out of the reader thread, killing it — after which the bridge kept forwarding mail from its main thread while ingesting nothing, which is precisely "healthy bridge, no sync". Both now write a `note` on the peer record and carry on.
+- **An empty answer is distinguishable from no answer.** The `registry` frame carries the counts behind its list (`local_rows`, `stale_local_rows`), so a peer advertising zero agents says so *and* says whether it has rows that failed its own liveness check. "The peer has nothing live" and "the peer never spoke" are different faults on different machines.
+
+**Why not have the initiator pull once at handshake and be done?** Because a one-shot pull has the same blind spot as a one-shot push: it cannot tell a peer that answered with nothing from a peer that did not answer, and it has no second chance if the answer is lost. The cost of re-asking is one line on a pipe that is already sending a keepalive at the same cadence.
+
+### Bridge state is on disk, because the failure was invisible
+
+Each bridge writes `peers/<host>.json` — attached-at, last frame, last registry sync and its size, counts of syncs and requests, detach time, and a free-form note. Schema and semantics in [`protocol.md`](protocol.md#peershostjson--peer-records).
+
+This exists for a stated reason: the reported bug was diagnosable only from state that nothing printed, on a machine the owner could not attach a debugger to. `spanreed list` and the `list_peers` MCP tool now render these records in full, in words, with the remedy named — so the whole diagnosis fits in one pasted terminal buffer. That is the visibility-over-hiding principle applied to the bridge, and it resolves the "`@host` UX in `list_agents`" open question.
+
+Link liveness reuses the agent liveness model exactly (bridge PID alive + start-time match), so a link's state can never disagree with the state of the mirrored entries that bridge owns. Records are **kept** after teardown with `detached_at` set: "a bridge was here and died" is a diagnosis, and deleting the file would make it read as "no bridge was ever configured".
 
 ### The core trick: reuse inboxes as the outbound queue
 
@@ -174,7 +438,7 @@ Global identity is `agent-X@homehost`; on its home host the agent is the bare `a
 
 ### Properties that fall out for free
 
-- **No cross-host heartbeat.** Remote-agent liveness is just "present in the peer's latest registry snapshot," which the peer computes with the local PID + start-time check. The bridge's own PID backs the mirrored entries, so if the pipe dies the remote agents correctly vanish from `list_agents`.
+- **No cross-host heartbeat.** Remote-agent liveness is just "present in the peer's latest registry snapshot," which the peer computes with the local PID + start-time check. The snapshot's *age* is recorded on the peer record, so a caller can see how old that evidence is rather than assuming it is current. The bridge's own PID backs the mirrored entries, so if the pipe dies the remote agents correctly vanish from `list_agents`.
 - **Store-and-forward across disconnects.** If the pipe is down, outbound messages accumulate durably in the `*@peer` inbox files; on reconnect the bridge resumes from its saved cursor (the existing `cursors/` mechanism) and drains the backlog.
 
 ### Launch and prerequisites (empirically settled)

@@ -123,3 +123,79 @@ class Message(BaseModel):
 
     in_reply_to: str | None = None
     """If set, the msg_id this message is responding to."""
+
+
+class PeerLink(BaseModel):
+    """One cross-host bridge, as seen from *this* host.
+
+    Written by the bridge process to ``peers/<host>.json`` so that the state of
+    a `spanreed conjoin` is visible to every other process on the bus — the
+    CLI, the MCP server, and the recipient resolver. Without this record the
+    only observable effect of a bridge is the mirrored ``@host`` registry
+    entries it creates, which makes "the peer has no agents", "the peer never
+    sent a registry", and "there is no bridge at all" indistinguishable. Those
+    are three different faults with three different remedies (issue #55).
+
+    The record is **kept after teardown**, with ``detached_at`` set, because "a
+    bridge was here and died" is a diagnosis and deleting the file erases it.
+    """
+
+    host: str
+    """The peer's self-declared host label — the ``@host`` suffix of every id it owns."""
+
+    role: Literal["connect", "serve"]
+    """Which end of the pipe this process is: ``connect`` dialled out
+    (``spanreed conjoin <host>``), ``serve`` was dialled (``conjoin --serve``)."""
+
+    bridge_pid: int
+    """PID of the bridge process that owns this link. Its liveness *is* the
+    link's liveness, exactly as for the mirrored registry entries."""
+
+    bridge_pid_start: int | None = None
+    """Start-time of ``bridge_pid``, same PID-reuse guard as ``Agent.pid_start``."""
+
+    attached_at: datetime
+    """When the peer's ``hello`` was accepted and routing began."""
+
+    last_frame_at: datetime | None = None
+    """When any frame (including the peer's keepalive pings) last arrived.
+    Proves the pipe is carrying traffic even when no registry ever syncs."""
+
+    last_registry_at: datetime | None = None
+    """When a ``registry`` frame from the peer was last applied. ``None`` means
+    **never** — the single most important field on this record, because that is
+    the state in which the peer's agents are unaddressable while everything
+    else looks healthy."""
+
+    last_registry_agents: int | None = None
+    """How many agents the peer advertised in its last ``registry`` frame.
+    ``0`` is a real and distinct diagnosis from ``None``: the peer answered and
+    said it has nothing live."""
+
+    peer_registry_rows: int | None = None
+    """How many bare local rows the peer's own registry held when it built that
+    frame. ``None`` from a peer too old to report it."""
+
+    peer_stale_rows: int | None = None
+    """How many of ``peer_registry_rows`` the peer judged stale (and so withheld).
+    ``peer_registry_rows > 0`` with ``last_registry_agents == 0`` says the peer's
+    agents exist but are failing *its* liveness check — a fault on the peer, not
+    in the bridge."""
+
+    registry_syncs: int = 0
+    """Count of ``registry`` frames applied over this link's lifetime."""
+
+    registry_requests_sent: int = 0
+    """Count of ``registry-request`` frames we have sent asking the peer to
+    advertise. A large number with ``last_registry_at is None`` means the peer
+    is hearing us and not answering (or is too old to know the frame)."""
+
+    detached_at: datetime | None = None
+    """When the bridge tore this link down cleanly. ``None`` on a link that is
+    still up — *or* on one whose bridge was killed without running teardown, so
+    do not read ``None`` as "attached": check ``bridge_pid`` liveness."""
+
+    note: str | None = None
+    """Free-form diagnosis attached by the bridge: a frame that could not be
+    parsed, a registry frame that arrived before the handshake, the reason for
+    a teardown. Verbose on purpose — this is the line a human pastes."""

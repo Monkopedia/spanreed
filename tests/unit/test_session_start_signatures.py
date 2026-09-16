@@ -46,6 +46,7 @@ _SIGNATURE = re.compile(r"^\s*-\s+(\w+)\(([^)]*)\)", re.MULTILINE)
 _DOCUMENTED_TOOLS = frozenset(
     {
         "list_agents",
+        "list_peers",
         "send_message",
         "recv_messages",
         "wait_for_reply",

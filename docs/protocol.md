@@ -12,9 +12,17 @@ Under `~/.claude/spanreed/` (overridable via `SPANREED_STATE_ROOT`):
 registry.json           current agents
 inboxes/<agent_id>.jsonl    per-agent append-only message log
 cursors/<session_id>    per-session "last-seen msg_id" marker
+peers/<host>.json       one record per cross-host bridge (see "Peer records")
 config.json             bus-wide flags (status_tracking, activity_log)
 activity-log.jsonl      append-only focus/status transition log (opt-in)
+codex/<name>.log        per-Codex-worker log: startup config, every turn, every
+                        approval decision (both outcomes). Never a credential.
 ```
+
+`codex/<name>.log` is written only by `spanreed codex` (see
+[`architecture.md`](architecture.md#codex-workers)). It is append-only, plain text, one timestamped
+line per event, and is for a human to read — nothing parses it. A Codex worker is otherwise an
+ordinary registry row: `agent-<name>`, its own pid, no new fields.
 
 ### `registry.json`
 
@@ -41,6 +49,13 @@ Rewritten atomically on every change. `focus` and `status` are omitted/`null` wh
 
 There is **no `last_seen` TTL**: agents do not heartbeat on a timer (wasteful wakeups), so a live-but-quiet agent is never flagged stale. `last_seen` is retained as informational metadata (when the agent last registered/renewed), not as a liveness signal.
 
+**`last_seen` is not evidence of anything, and reading it as though it were has already cost a debugging session.** Issue #55 reported a row whose `last_seen` was from the previous day while the process had 22h50m of uptime and was actively working. That is the design behaving correctly — the field is written at registration and never renewed — but it *reads* like a dead agent, which is how it became supporting evidence for a wrong conclusion. Two rules follow, and both are enforced rather than merely stated:
+
+- No code infers liveness, staleness, or reachability from `last_seen`. Nothing in `store.py` does today; `is_stale` is PID-only by construction.
+- Every surface that *prints* `last_seen` prints the caveat next to it. `spanreed list` says so in words under the agent list.
+
+One exception worth naming because it looks like a violation: a **mirrored `@peer` entry's** `last_seen` is set to the moment of the sync that produced it, so for those rows it does track recency — of the sync, not of the agent. The peer record (below) is the honest place to read sync recency from.
+
 ### `inboxes/<agent_id>.jsonl`
 
 One JSON message per line, append-only. Schema matches the `Message` Pydantic model in `src/spanreed/protocol.py`:
@@ -55,20 +70,84 @@ JSON keys match Python field names exactly (no aliasing) — `from` is reserved 
 
 Plain text file containing the last-delivered `msg_id` for this session. Used on session restart to replay any messages that arrived while the session was down.
 
+### `peers/<host>.json` — peer records
+
+One record per peer host a `spanreed conjoin` bridge has ever attached here. Written by the bridge process, read by everything else (`spanreed list`, the `list_peers` MCP tool, and the recipient resolver). Schema = the `PeerLink` model in `src/spanreed/protocol.py`:
+
+```json
+{
+  "host": "adolin",
+  "role": "connect",
+  "bridge_pid": 4242,
+  "bridge_pid_start": 8675309,
+  "attached_at": "2026-09-16T12:00:00Z",
+  "last_frame_at": "2026-09-16T13:03:01Z",
+  "last_registry_at": "2026-09-16T13:03:00Z",
+  "last_registry_agents": 4,
+  "peer_registry_rows": 5,
+  "peer_stale_rows": 1,
+  "registry_syncs": 1208,
+  "registry_requests_sent": 1,
+  "detached_at": null,
+  "note": null
+}
+```
+
+**Liveness of a link is the bridge PID**, computed exactly as `is_stale` computes an agent's — PID alive *and* start-time matching. This is not a second liveness model: a mirrored `@host` registry entry records the bridge's PID for the same reason, so link state and mirrored-agent state can never disagree. `detached_at` is authoritative when set (a clean teardown) but **is not sufficient**: a bridge killed with `SIGKILL` never writes it, so `detached_at == null` must never be read as "attached".
+
+**Records are kept after teardown, never deleted.** "A bridge to this host was up and is now gone" is a diagnosis; deleting the file makes it indistinguishable from "no bridge was ever configured", and those have different remedies.
+
+The field that matters is `last_registry_at`. `null` means this host has **never** received a registry snapshot from that peer — the exact state issue #55 was reported for, in which none of the peer's agents are addressable while messages still cross the bridge normally in both directions. The four states a reader must be able to tell apart:
+
+| state | reads as | remedy |
+|---|---|---|
+| no record for the host | no bridge was ever started for it here | `spanreed conjoin <host>` |
+| record present, `detached_at` set or `bridge_pid` dead | the bridge died | restart `conjoin` |
+| attached, `last_registry_at` null | the peer is not advertising | check `spanreed list` **on the peer** |
+| attached, `last_registry_agents` 0 | the peer answered and has nothing live | fix the peer's own agents; `peer_registry_rows`/`peer_stale_rows` say whether they exist but fail its liveness check |
+
+`peer_registry_rows` / `peer_stale_rows` are `null` from a peer running a `spanreed` older than this scheme — `null` means "that peer cannot tell us", which is distinct from `0`.
+
 ## MCP tool surface
 
 Implemented in `src/spanreed/mcp_server.py` via the `mcp` SDK's `MCPServer` (`mcp.server.mcpserver`; this was `FastMCP` in `mcp` 1.x, removed in 2.0):
 
 - `register_agent(name, working_dir, pid, agent_id?) -> Agent` — upsert by id if supplied; preserves existing `focus` on upsert.
 - `deregister_agent(agent_id) -> {ok: true}`
-- `list_agents(include_stale=false) -> [Agent, ...]` — Agent records include `focus` and `status` fields.
-- `send_message(from_agent, to_agent, body, in_reply_to?) -> Message` — `to_agent` is **validated against the registry**: a known `agent_id` is used as-is, a unique display *name* resolves to its id, an ambiguous name or an unknown recipient **raises**. This stops a misaddressed message (e.g. sent to a display name) from being silently written to an inbox no monitor tails. Resolution uses the include-stale registry view, so a crashed-but-not-pruned agent stays addressable (mail waits for its restart).
+- `list_agents(include_stale=false) -> [Agent, ...]` — Agent records include `focus` and `status` fields. Shows only what **this** host knows: a peer's agents appear as `<id>@<host>` and only after that peer's bridge has synced. An agent missing from this list is not evidence it has stopped — see `list_peers`.
+- `list_peers() -> [PeerLink, ...]` — every cross-host bridge this bus has, attached or not, with when each last synced its registry. Read alongside `list_agents`: the two together distinguish "that agent is gone" from "this host has never been told about that host's agents", which `list_agents` alone cannot.
+- `send_message(from_agent, to_agent, body, in_reply_to?) -> Message + {delivered_to_live_session, delivery}` — `to_agent` is **validated against the registry** (see "Recipient resolution" below). The result carries two extra keys beyond the `Message`: `delivered_to_live_session` (bool) and `delivery` (a full sentence explaining it). Returning without an error means *appended*, not *read*.
 - `recv_messages(agent_id, since_msg_id?) -> [Message, ...]`
 - `wait_for_reply(agent_id, in_reply_to, timeout_s) -> Message | null` — blocks up to `timeout_s`. Considers **all** messages in the inbox, not only ones arriving after the call: a matching reply already present is returned immediately. Deliberate — skipping pre-existing matches lost any reply that landed between the caller's `send_message` and this call. Callers therefore need no `recv_messages` first.
 - `set_focus(focus) -> Agent | null` — set/clear the calling session's focus (uses derived identity); `null` if not registered. Empty string clears.
 - `set_status(status) -> Agent | null` — set the calling session's status (one of `idle | working | needs_input | blocked`); `null` if not registered. Pull-only (does not notify). Always functional regardless of the `status_tracking` flag.
 - `set_name(name) -> Agent | null` — rename the calling session's display name. `agent_id` does NOT change; only the human-readable name does. Persists across re-registration.
 - `request_focus_update(agent_id, timeout_s=30) -> str | null` — send a `[FOCUS_UPDATE_REQUEST]` message to a peer, wait for their reply, return the reply body. Convention: the recipient's policy says to call `set_focus` with their current focus and reply with that text.
+
+### Recipient resolution
+
+`send_message`'s `to_agent` is resolved against the registry before anything is written. A bare `open(path, "a")` creates an inbox for any string, so an unvalidated recipient means a message lost into a file nothing tails, with success reported to the sender.
+
+Resolution, in order:
+
+1. **An exact `agent_id`** — used as-is, **stale included**. An id is canonical, and a session that is merely restarting must keep accepting mail that waits for it. (The sender is still told it was not delivered to a running session; see below.)
+2. **A display name matching exactly one LIVE agent** — resolves to that agent's id.
+3. **A display name matching several live agents** — ambiguous, raises.
+4. **A display name matching only agents whose session has exited** — **raises**. This is issue #55's silent-loss case: two dead rows shared a display name with a live agent, a send to that name resolved to a dead local inbox, and the sender was told it succeeded. A stopped session is never a name-resolution target; addressing one requires its exact id.
+5. **Anything else** — raises, with a message that distinguishes *no such agent* from *this host has no synced registry for that host*.
+
+**Step 5's message is part of the spec, not an implementation detail.** Before #55 there was one message — "…is not a registered agent_id or display name. Call list_agents to find the recipient's agent_id." — and for an `<id>@<host>` address whose peer had never synced, that remedy is actively misleading: `list_agents` returns nothing for that host and so *confirms* the false conclusion that the agent is gone. Three days were lost to it. An address naming a host is therefore diagnosed against that host's peer record, producing six distinct messages: unknown bare id, no bridge to that host, bridge detached, bridge attached but never synced, bridge synced but advertising zero agents, and bridge healthy with the id genuinely unknown. Only the first still says "Call list_agents".
+
+### Delivery is not resolution
+
+`send_message` returning normally means the message was appended. Whether anyone will read it is a separate question, answered by `delivered_to_live_session`:
+
+- `true` — a live local session is tailing that inbox, or (for a mirrored `<id>@<host>` inbox) an attached bridge will forward it.
+- `false` — the message is **queued**. The recipient's session has exited, or the bridge for its host is not attached. `delivery` explains which.
+
+Queuing rather than refusing is deliberate: a restarting session picks its mail up. Reporting that as plain success is not — the CLI exits **3** for it (`spanreed send`), and the MCP tool's docstring directs the agent to check the flag and say "queued" rather than "sent".
+
+A recipient that cannot be resolved at all is different again: nothing is written and the CLI exits **2**, printing the resolver's diagnosis to stderr as a plain message. The MCP tool still **raises** there — the exception text is what its caller sees — but a traceback on a terminal buries the sentence the human is meant to act on.
 
 ## Focus
 
@@ -242,8 +321,8 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed inbox-path AGENT` | Print the inbox file path for an id |
 | `spanreed register [...]` | Upsert this session into the registry |
 | `spanreed deregister AGENT` | Remove an agent |
-| `spanreed list` | List registered agents (JSON) |
-| `spanreed send --to AGENT --body BODY [--from F] [--in-reply-to ID]` | Post a message |
+| `spanreed list [--include-stale] [--json]` | Report the bus: agents **and** every cross-host bridge with its sync state. Human-readable by default; `--json` emits the bare agent array (the pre-peer-record output) for scripts |
+| `spanreed send --to AGENT --body BODY [--from F] [--in-reply-to ID]` | Post a message. Exit **0** = a live session (or an attached bridge) is watching that inbox; **2** = the recipient could not be resolved and nothing was written (the resolver's diagnosis goes to stderr as a message, not a traceback); **3** = written but only queued, reason on stderr |
 | `spanreed recv AGENT [--since ID]` | Dump an agent's inbox |
 | `spanreed inbox-watch` | `tail -F` this session's inbox (plugin Monitor) |
 | `spanreed session-start` | Register + emit SessionStart hook JSON (plugin hook) |
@@ -251,6 +330,7 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed status-tracking [on\|off]` | Enable/disable bus-wide status tracking, or show the setting |
 | `spanreed activity-log [on\|off]` | Enable/disable bus-wide activity logging, or show the setting |
 | `spanreed log [--since AGE] [--agent ID\|NAME]` | Dump the activity log as JSON lines |
+| `spanreed codex --name N --cwd DIR [--model M] [--effort E] [--mode MODE] [--instructions TEXT]` | Run a Codex worker: a headless bus agent that turns inbound mail into `codex` turns. `--cwd` is required and has no default. |
 | `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
 
 ## Cross-host bridge wire-format
@@ -287,17 +367,47 @@ A message addressed to `agent-X@hostB` is delivered by the normal `send_message`
 
 ### Pipe frames
 
+**Frames carry no version, and compatibility is structural.** `hello` announces
+`{"kind", "host"}` and nothing more, so two hosts running different `spanreed`
+versions agree only by the shape of what they send. That is a decision, not an
+oversight, and it puts two obligations on every receiver:
+
+- A receiver **MUST ignore an unrecognised `kind`.** A frame from a newer peer
+  is not a fault and must not be recorded as one, or every mixed-version bridge
+  accumulates notes about working correctly. Pinned by
+  `test_an_unknown_frame_kind_is_ignored_and_leaves_no_note`.
+- A receiver **MUST NOT let a frame it cannot model terminate the reader.**
+  Drop it, note it, keep reading. This is the direct lesson of #55: a
+  version-skewed `registry` frame raised inside the reader thread and killed
+  it, after which mail kept flowing in both directions while nothing was
+  ingested — a bridge that looks healthy from every angle except the one that
+  matters. Pinned by
+  `test_a_malformed_registry_does_not_stop_later_delivery`.
+
+Optional fields follow the same rule from the other side: a field a peer is too
+old to send reads as `null`, never as a zero value. `local_rows` absent means
+"that peer cannot tell us", which is a different claim from "that peer has no
+rows", and conflating them is what made "advertised zero agents" and "never
+answered" indistinguishable before.
+
 The pipe carries newline-delimited JSON frames, each with a `kind`:
 
 ```json
 {"kind": "hello", "host": "<the sender's own host label>"}
 {"kind": "msg", "message": { <Message, addresses in RECEIVER's namespace> }}
-{"kind": "registry", "agents": [ <Agent, ...> ]}
+{"kind": "registry", "agents": [ <Agent, ...> ], "local_rows": 5, "stale_local_rows": 1}
+{"kind": "registry-request"}
 {"kind": "ping"}
 ```
 
 - `msg` — a forwarded bus message. The receiving bridge appends `message` verbatim to `inboxes/<message.to_agent>.jsonl`.
-- `registry` — the sender's current set of live local agents (bare ids, home = sender). The receiver mirrors them per "Mirrored registry entries" above. Sent on connect and whenever the local set changes.
+- `registry` — the sender's current set of live local agents (bare ids, home = sender). The receiver mirrors them per "Mirrored registry entries" above. Sent immediately after the handshake, on every sync tick, and on demand in answer to a `registry-request`.
+
+  `local_rows` and `stale_local_rows` are the counts **behind** the list: how many bare local rows the sender's registry held, and how many of those it judged stale and therefore withheld. Without them an empty `agents` list is indistinguishable on the receiving end from a peer that never answered, and those two faults have different remedies (fix the peer's agents vs. fix the bridge). Both are **optional** — a peer predating them omits them, and the receiver records `null`, which means "cannot tell" rather than zero.
+
+- `registry-request` — "advertise your agents now." Sent by both ends immediately after the handshake, and re-sent on every sync tick by a side that has not yet received a `registry` frame. Answered by the receiving side's **main thread** on its next turn (never by its reader thread, so the single-writer property the framing relies on is preserved).
+
+  This is the pull half of sync, and it exists because the push half alone cannot detect its own failure. Issue #55: sync ran one way in practice, and the starved side had no way to tell "the peer has no agents" from "the peer never spoke" from "I dropped what it said" — all three present as an empty `list_agents`. A peer too old to know this frame ignores it and keeps pushing on its own timer, so the pull is safe against version skew in both directions; a peer that hears it and never answers leaves `registry_requests_sent` climbing against a `null` `last_registry_at`, which is a countable statement of the exact fault.
 - `hello` — the sender's own host label, which becomes the `@host` suffix for every id it owns. Sent once, first, by both ends. **Validated on receipt**: alphanumeric at both ends, `.`/`-`/`_` inside, at most 253 characters. The receiver interpolates this value into a filesystem glob when selecting outbound inboxes, so a metacharacter would be a wildcard rather than a name.
 
   On a label that fails validation the receiver **sends nothing further and closes**. Specifically, it does **not** send a `registry` frame — that frame carries agent ids, display names, absolute working directories, pids and focus text, and a peer whose identity was just rejected must not receive it. `hello` is the only frame a refused peer ever sees, and it was already in flight. The refusal is reported on stderr, naming the rule and the `--label` override; stdout is the pipe and carries nothing but frames.

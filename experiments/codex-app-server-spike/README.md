@@ -1,0 +1,942 @@
+# Codex app-server spike
+
+**One question:** can a second process start a turn in a Codex session someone
+else has open?
+
+If yes, spanreed can treat a Codex session as a real peer — mail arrives, the
+monitor calls `turn/start`, the agent wakes with the human watching. If no, a
+Codex agent is a mailbox read at hook boundaries, and the integration is worth
+much less. Everything else about the design follows from this answer.
+
+## Run it
+
+On a machine with Codex signed in:
+
+```sh
+python3 spike.py                     # steps 1-3, read-only
+python3 spike.py --turn <thread-id>  # all four; starts ONE short turn
+```
+
+Stdlib only, installs nothing, touches no repo. The sole side effect is one turn
+in a thread you nominate, with a prompt that asks for a fixed string and forbids
+tools and file access.
+
+**Steps 1-3 passing does not answer the question.** They show you can connect and
+look. `--turn` is the test.
+
+## Why it is written this way
+
+It was written on a machine with no Codex, against documentation that could not
+be executed — and against an interface OpenAI's own docs call *"experimental and
+not supported for production workloads"*. So every step is an assumption, and the
+script's real job is to tell you **which** assumption broke:
+
+```
+A1  `codex app-server --listen unix://PATH` is the right invocation      CONFIRMED
+A2  the unix transport frames messages as newline-delimited JSON        WRONG — see below
+A3  `initialize` is required first, per connection                      CONFIRMED (via stdio)
+A4  method names are thread/list, thread/loaded/list, turn/start
+A5  turn/start takes a threadId and an input message
+```
+
+## What the real runs found
+
+**The assumption that broke was not on the list.** Three runs against
+codex-cli 0.154.0:
+
+| run | result |
+|---|---|
+| 1 | step 1 PASS; `initialize` closed the connection, no server output |
+| 2 | 8 framing x params combinations, all closed; still no output |
+| 3 | `RUST_LOG=info` made it speak, and a stdio control answered |
+
+Run 3's log:
+
+```
+WARN codex_app_server_transport::transport::unix_socket:
+     failed to upgrade control socket websocket connection:
+     WebSocket protocol error: httparse error: invalid token
+```
+
+**The unix socket is a WebSocket control socket.** Raw JSON was being parsed as
+an HTTP request line. A2 was wrong in a way none of its alternatives covered —
+the matrix tried JSONL and LSP framing and the answer was neither.
+
+The stdio control settled the rest: `initialize` with `clientInfo` is correct,
+and the server echoed the client name back. So the params were right from run 1;
+only the transport was wrong.
+
+A failure naming A1–A5 means **this script guessed wrong**. A clean protocol
+error from the server means **Codex declines to do it**. Those are different
+answers and the output keeps them apart.
+
+Every step prints PASS / FAIL / SKIP / DID NOT RUN with a reason. A step that
+could not run says so rather than printing nothing — "no threads found" when you
+never connected is worse than a crash.
+
+## What was verified before shipping it
+
+The Codex side could not be. The script's own logic was, against a stub
+app-server:
+
+| case | result |
+|---|---|
+| no `codex` on PATH | step 1 FAIL, steps 2-4 `DID NOT RUN`, exit 1 |
+| full run, steps 1-3 | PASS, step 4 SKIP with the caveat, exit 1 |
+| `turn/start` accepted | step 4 PASS, exit 0 |
+| `turn/start` refused by server | step 4 FAIL naming the server's error, exit 1 |
+
+The stub interleaves a notification and a response to a different id before each
+real reply, so the client's id-filtering is exercised rather than assumed.
+
+## Reporting back
+
+The verdict table is the output. Worth capturing separately if it happens:
+**a turn that runs but the human never sees** — that would mean turns are
+possible but invisible, which is a different answer from either yes or no.
+
+
+---
+
+# SUPERSEDED — see "The cause, found on run 13" at the end. The conclusion below was drawn while the client was still mis-calling the server.
+
+# ~~ANSWER: no, not today.~~ Eight runs, codex-cli 0.154.0, macOS.
+
+**A Codex TUI session cannot be reached by another process.** Not via IPC —
+nothing is listening. Not via a second app-server — it is locked out of the
+thread store while the TUI holds it.
+
+## The evidence
+
+| finding | how it was established |
+|---|---|
+| the TUI exposes no socket | `~/.codex/ipc/ipc.sock` exists but is **stale** — ECONNREFUSED on probe |
+| nothing advertises a server | `app-server-control/` holds one empty `app-server-startup.lock` |
+| no app-server is running | the two codex processes are `codex` (the TUI) and a ChatGPT.app computer-use helper |
+| ~~a second server is locked out~~ | **RETRACTED — this was wrong.** Run 9 had `codex processes running: 0` and `thread/list` still timed out. The lock-contention story was inferred from a `thread-writer-locks/` directory and a coincidence of timing, asserted here as measured, and then falsified. The real candidate is startup: the log shows `list_models{refresh_strategy=online}` and `fetching remote plugin catalog` still running when the call lands ~230ms later. Untested as of writing. |
+| a human's thread never appears | talking to `codex` in another terminal added nothing to `thread/list` |
+
+**Row 4 was the one I was most confident about and it is the one that was
+wrong.** The "contrast" — fast without a TUI, hung with one — came from
+comparing runs that differed in more than the TUI, and I read a correlation
+across two runs as a demonstrated mechanism. Run 9 held the TUI at zero and the
+timeout persisted.
+
+The finding survives without it: rows 1-3 and 5 still say the TUI exposes
+nothing and a human's thread never appears. What does not survive is the
+explanation of *why* the second server is useless, which is now open.
+
+## What was established, and is reusable
+
+The protocol work is sound and none of it is wasted if this changes:
+
+- `codex app-server --listen unix://PATH` runs under **ChatGPT subscription
+  sign-in** — no API key
+- the unix transport is a **WebSocket control socket**, not newline JSON. There
+  is a working stdlib RFC 6455 client here, tested against `aiohttp`
+- `initialize` from a foreign process **works** — the server echoes the client
+  name back and logs the call under `rpc.transport="unix_socket"`
+- `thread/loaded/list` works; the full protocol schema is emitted by
+  `codex app-server generate-json-schema --out DIR` (305 files)
+
+So the client is finished. What is missing is a server that owns a human's
+session and will talk to anyone else.
+
+## What would change the answer
+
+1. **OpenAI ships the wake primitive.** Four open issues ask for exactly it —
+   [#20312](https://github.com/openai/codex/issues/20312),
+   [#35542](https://github.com/openai/codex/issues/35542),
+   [#8375](https://github.com/openai/codex/issues/8375),
+   [#29922](https://github.com/openai/codex/issues/29922). #35542 describes this
+   situation precisely: *"nothing can reach an idle TUI"*.
+2. **Use the App or VS Code extension instead of the TUI.** Both reportedly
+   register as thread owners on the IPC router, which is why that socket exists
+   at all. Untested here, and it means not working in a terminal.
+
+## Why it stopped here
+
+Eight runs, and most of the cost was self-inflicted: five spawned a private
+server that could never have seen another process's threads, and one connected
+to a dead socket on the strength of a sentence in this script that claimed
+sockets were live without probing them.
+
+What the script got right is that every one of those was reported as **the
+script being wrong**, never as Codex refusing. That distinction is why the
+conclusion above can be trusted: the failures that were mine were labelled mine,
+and the one that is Codex's is the only one left.
+
+
+---
+
+# Run 29: all four steps pass. The pipe was the whole thing.
+
+```
+3. [PASS] Can it see threads — including ones a human has open?
+      3 distinct thread id(s) visible to a non-owning client
+4. [PASS] Can it create its OWN thread and drive a turn in it?
+      turn/start accepted
+```
+
+`thread/list` answered in **0.0s** — the same call that had just timed out at
+20s, 90s and 240s across fifteen runs. `thread/start` created a thread.
+`turn/start` was accepted. And the captured server log went from a constant
+~123 lines to **4038**.
+
+Nothing about Codex changed. The spike stopped holding its breath.
+
+## What is actually established now
+
+- A separate process **can** spawn app-server, connect over a unix socket,
+  initialize, list threads, create its own thread, and start a turn in it.
+- `thread/resume` on a brand-new thread returns a clean error — `no rollout
+  found for thread id …` — rather than hanging. Errors were always available;
+  we were preventing the server from producing them.
+- MCP servers start per-thread and announce themselves:
+  `mcpServer/startupStatus/updated` for `node_repl`, `cua_repl`, `codex_apps`.
+- Threads a human has open stay flock-held by live processes, so driving
+  *those* remains impossible. Owning our own thread is the supported path, and
+  it works.
+
+**For spanreed this is the answer, and it is yes:** spawn the server, own the
+thread, `turn/start` on inbound mail. A Codex session can be a bus peer.
+
+## Two things this run claimed that it had not shown
+
+**The turn never ran.** `turn/start` returned `status: "inProgress"`, the spike
+called that a pass, and `report()` terminated the server immediately — the
+shutdown is in its own log two lines below the success:
+
+```
+received shutdown signal; entering graceful restart drain
+(connections=1, runningAssistantTurns=0, requests still a…)
+```
+
+*Accepted* and *completed* are different claims and only one was observed.
+`wait_for_turn()` now reads until a terminal turn event: the marker in a reply
+is a PASS, a terminal event without it is a PASS with the caveat stated, and an
+accept with no terminal event is **PARTIAL** — which is what run 29 actually
+earned. Verified both ways against a stub.
+
+**The writer-lock warning fired on our own thread.** `target thread … HAS a
+writer-lock file — expect a refusal/hang`, printed about a thread this script
+had created four lines earlier, and then contradicted by the same run driving a
+turn in it. A lock we hold on a thread we just made is the expected state, and
+it now says so.
+
+## The count
+
+Eight causes proposed, eight wrong, one real:
+
+| # | Proposed | Killed by |
+| --- | --- | --- |
+| 1 | writer lock on the target thread | `thread/start` hung too, on a thread that did not exist |
+| 2 | unanswered server→client requests | `REQUESTS seen: NONE` |
+| 3 | leaked app-servers | `LEAKED: 0` once the filter stopped hiding them |
+| 4 | sqlite contention | plain read-only open succeeded on every file |
+| 5 | TLS interception | real handshake, public CA issuers |
+| 6 | thread volume (#45246) | `threads has 4 row(s)` |
+| 7 | per-machine singleton | `app-server-startup.lock free` |
+| 8 | MCP startup timeout | 240s cleared it and nothing changed |
+| — | **an unread pipe blocking the server's `write()`** | **the fix; all four steps pass** |
+
+Each of the eight explained the evidence available when it was proposed. The
+real cause was in a number this script printed in every run since run 3 — `123
+lines total` — identical every time, and never once read as a measurement.
+
+# Run 28, resolved: the spike was strangling the server it was measuring
+
+The untruncated server log ends **7 milliseconds** after `thread/list` arrives,
+mid-span, on an `enter`, with no error — and then nothing for the remaining 240
+seconds.
+
+And the line this script printed at the end of every run since run 3:
+
+```
+[0 warn/error, 123 lines total; INFO deduped]
+```
+
+121, 123, 123, 121, 123. **Constant across every run.** That is not a property of
+Codex. That is a **64KB pipe buffer filling to the same point every time**, and
+it was printed in every report without once being questioned.
+
+## The cause
+
+The spike spawns app-server with `stdout=PIPE, stderr=STDOUT`, sets
+`RUST_LOG=info` **itself**, and then reads that pipe only at the very end, inside
+`report()` — which terminates the process first. So for the entire run, nobody
+reads it.
+
+A Rust server logging at INFO on every span poll fills 64KB in milliseconds. The
+pipe fills, `write()` blocks, and app-server stalls **inside whatever handler was
+logging when the buffer filled**. It never returns, never errors, and never logs
+again — because logging is the thing that is blocked.
+
+Everything fits, and fits only this:
+
+| Observation | Explanation |
+| --- | --- |
+| `initialize`, `thread/loaded/list` always work | they log almost nothing |
+| `thread/list`, `thread/start`, `turn/start` always hang | they log heavily |
+| the log always stops at the same line count | that is the buffer's capacity |
+| it stops 7ms after the request | that is how fast INFO fills what remains |
+| never a warn, never an error, never a timeout | a blocked writer is not a failure |
+| the TUI works fine | its stderr goes to a terminal, not to an unread pipe |
+| raising the timeout 20 → 90 → 240 changed nothing | the block is permanent |
+
+We turned the firehose on and then blocked the drain.
+
+## Demonstrated, not argued
+
+Controlled A/B against one stub server that writes ~510KB mid-handler:
+
+```
+old (pipe read only at the end) : thread/list failed after 20.0s -- TimeoutError
+new (reader thread)             : thread/list ANSWERED in 0.0s
+```
+
+An earlier attempt at this test wrote only ~28KB, stayed under the buffer, and
+showed both versions passing. That result proved nothing and was discarded
+rather than reported — a reproduction that does not reproduce is not evidence.
+
+## The honest tally
+
+Eight causes were proposed over twenty-eight runs. All eight were wrong:
+
+1. writer lock on the target thread
+2. unanswered server→client requests
+3. leaked app-servers from earlier runs
+4. sqlite contention on the thread store
+5. TLS interception by a corporate proxy
+6. thread volume (openai/codex#45246)
+7. a per-machine app-server singleton
+8. MCP startup timeout
+
+Each was proposed because it explained the evidence *available at the time*, and
+each was killed by a cheap probe. But the real cause was visible in every single
+run, in a number this script printed itself and treated as decoration.
+
+The pattern this README has now recorded six times — a diagnostic that cannot
+report its own failure — turns out to have a sibling that is worse: **a
+diagnostic that reports a constant, which nobody reads as a measurement.**
+
+# Run 28: the singleton is dead too, and one real answer fell out
+
+```
+app-server-startup.lock free — not a held lock
+01a0a666-…lock is HELD by a live process
+01a0a669-…lock is HELD by a live process
+```
+
+No per-machine singleton. Seven causes proposed across this investigation, seven
+wrong. For the record, in order: writer lock on the target thread, unanswered
+server requests, leaked servers, DB contention, TLS interception, thread volume
+(#45246), app-server singleton.
+
+## The one thing that is now settled
+
+The two held locks are the threads the human has open in the TUI, and they are
+held by **live** processes — confirmed by `flock`, not inferred from a file's
+existence.
+
+That answers the question this spike was built for, at least by half:
+
+> **A foreign client cannot drive a thread a human has open.** Codex takes a
+> per-thread writer lock and holds it for the life of the session.
+
+So the original framing of step 4 — "start a turn in a thread someone else is
+using" — is not a thing Codex will ever permit. Spanreed would have to own its
+thread. Whether *that* works is still unknown, because `thread/start` has never
+returned on this machine.
+
+## A label this spike got wrong
+
+Run 28 printed, for two perfectly ordinary thread locks:
+
+```
+01a0a666-….lock is HELD by a live process — a singleton is in force
+```
+
+Those two facts are unrelated. The startup lock being held would mean a
+per-machine singleton; a per-thread writer lock being held means somebody has
+that thread open, which is the normal state of a working editor. One message was
+written for the first case and applied to every lock file, turning the expected
+into an alarm. The two cases now say different things, and a free thread lock is
+no longer reported at all — it is not news.
+
+## What has not been read yet
+
+`spike-server.log` — the untruncated server log — has been written on the last
+three runs and not yet examined. It is the only artifact that contains
+`remote_control_url=…` and the `http.method`/URL of the two online calls that
+start at boot and never complete. Every remaining theory is guesswork until it
+is read.
+
+# Run 26: 240s, four threads, and three of this spike's own probes found blind
+
+240s also timed out. And the state store now reads:
+
+```
+state_5.sqlite: threads has 4 row(s)
+```
+
+**Four threads.** [#45246](https://github.com/openai/codex/issues/45246) is about
+hosts with hundreds; its scaling story cannot apply here. `thread/list` is not
+slow on this machine, it is blocked — and raising the fuse from 20 to 90 to 240
+was chasing a number that was never the constraint.
+
+Three defects in this spike, all of the same family: a probe that reports
+success in the exact case it cannot see.
+
+## 1. The sqlite probe could not detect a lock, by construction
+
+`probe_state_db()` opened with `immutable=1`, chosen so the probe could not
+become the contention it was looking for. The cost, unstated until now, is that
+`immutable=1` **skips locking entirely** — so a database held exclusively by
+another process reads back clean.
+
+Demonstrated: with a real `BEGIN EXCLUSIVE` held by another process, the
+immutable open returns `opened in 0.00s; threads: 1 row(s)`. Five runs of "state
+DB readable directly" were produced by a check structurally incapable of
+reporting the thing most likely to block app-server.
+
+A plain read-only open with a 3s busy timeout now runs alongside it. A reader is
+refused only by an exclusive lock, so it detects contention without ever taking
+a write lock. Against the same held lock it reports
+`LOCKED: database is locked`.
+
+## 2. The server's own log was being truncated by this script
+
+The one artifact that knows what the server is stuck on was printed as: the last
+**12** distinct lines, each cut to **200 characters**. That cut lands inside the
+span fields — so `remote_control_url=…` and the `http.method`/URL of the two
+online calls that never complete (`list_models{refresh_strategy=online}` and
+`plugins.remote_catalog.list`) were removed by this printer, in every run.
+
+The screen keeps the summary; the raw output now goes whole to
+`spike-server.log`.
+
+## 3. The run ended on a traceback
+
+```
+Exception ignored while flushing sys.stdout:
+ValueError: I/O operation on closed file.
+```
+
+Python flushes `sys.stdout` during shutdown, after `atexit` closed the tee's
+handle. A crash printed after the report, in the lines read as the result.
+Guarded.
+
+## Also now reported
+
+`auth_mode`, whose value is a mode name rather than a credential, and which says
+whether Codex is taking the ChatGPT-token path or the API-key path. `auth.json`
+holds keys for both and has not been written in 125 hours.
+
+# Run 25 (full log): step 0 was the answer all along
+
+The owner sent a complete run for the first time. Step 0 — the section every
+previous paste cut off — contained two facts that reframe everything above.
+
+## 1. The fuse is still below a documented ceiling, and the ceiling is in this config
+
+```toml
+[mcp_servers.node_repl]
+command = "/Applications/ChatGPT.app/.../node_repl"
+startup_timeout_sec = 120
+```
+
+`--timeout` was 90. **An MCP server on this machine is configured to take up to
+120 seconds to start.** A call that initialises it can legitimately block longer
+than our fuse, so "timed out after 90.0s" measured this script's patience for a
+second time. Run 22 raised 20 to 90 by reading an upstream issue; the actual
+number was sitting in the user's own config, which we had not read.
+
+The spike now scans for `startup_timeout_sec` and **raises its own timeout to
+twice the largest value found**, saying so in Key facts.
+
+## 2. thread/list reads a database this spike never opened
+
+`thread/list` reads the *state* store.
+[#45246](https://github.com/openai/codex/issues/45246) names the file:
+`state_5.sqlite`, and says the call's cost scales with the number of unarchived
+threads in it. It is listed in step 0 of every run.
+
+Runs 22-25 probed `thread_history*.sqlite`, reported it healthy in 0.00s, and
+put that in Key facts as "state DB readable directly" — a label that claimed the
+state DB while reading a different file. The probe now opens **every** `.sqlite`
+in `CODEX_HOME` and counts thread rows in each.
+
+## 3. What step 0 rules out
+
+- `LEAKED spanreed-spike servers: 0` — the reaper works.
+- `codex processes running: 3`, none of them an `app-server`. The TUI does not
+  expose one, so there is no existing server to join; spawning is correct after
+  all.
+- `app-server-control/` holds one file, `app-server-startup.lock`, **empty**.
+- `thread-writer-locks/` holds a lock for `01a0a590-…`, a *different* thread
+  from the one we were driving.
+- `auth.json` is 124 hours old with keys `OPENAI_API_KEY, auth_mode,
+  last_refresh, tokens` and no recognised expiry field.
+
+## Two overstatements in this spike's own output, fixed
+
+Writing the above surfaced two labels that claimed more than the evidence:
+
+- `3 MCP server(s), 0 required  <-- documented cause of thread/start hanging`.
+  The documented cause is a **required** server failing. With zero required, the
+  correct statement is that startup may be *delayed* by up to
+  `startup_timeout_sec` — a different claim. It now says which one applies.
+- `thread_items: 201  <-- LARGE`. #45246 is about the number of **threads**, not
+  rows of item detail. 201 items is a chatty conversation, not a finding. The
+  flag now applies only to tables that count threads, at a threshold of 500.
+
+# Run 25: "codex works fine" — so the thing that is broken is ours
+
+The owner confirmed the Codex TUI works normally on the target machine. That
+retires the whole class of theories at once: the account is valid, the network
+reaches the model service, sandboxing works, the store is fine. Everything
+app-server needs, Codex has, right now, on that machine.
+
+What does not work is the app-server **this script spawns**.
+
+## We were looking for the working server in the wrong directory
+
+Our own spawned server logs this, in every run since 22:
+
+```
+app-server control socket listening socket_path=/var/folders/8c/y...
+```
+
+`/var/folders/...` is **TMPDIR** on macOS. Step 0 globbed `CODEX_HOME` for
+`*.sock`, found nothing, printed "No existing sockets under CODEX_HOME", and
+spawned a second server beside the working one — twenty-five times. The log line
+naming the real location was four lines below that message in every run.
+
+Step 0 now searches TMPDIR as well, and reads `app-server-control/`: any
+absolute path in there that is a live socket is treated as an advertised
+endpoint and added to the candidate list. That directory is how a running server
+tells other clients where to reach it, and the spike has printed its contents
+since run 8 without ever acting on them.
+
+Verified end to end against a stand-in "TUI" server on a TMPDIR socket: the
+spike finds it, connects to it instead of spawning, and lists its threads.
+
+## Why every run was pasted back with its head cut off
+
+Twenty-five runs were reported as their last screenful, because step 0 — the
+inventory that holds sockets, config, processes, sign-in — scrolls off the top.
+So each round of analysis worked from the one section that contained the fewest
+facts.
+
+The run now tees itself to `./spike-run.log` and prints that path at the very
+bottom, where it cannot scroll away. **Send the file, not the tail.**
+
+That is the sixth instance in this README of the same defect: a diagnostic that
+exists but cannot be read is not a diagnostic. It has cost more runs here than
+any single wrong theory.
+
+# Run 24: TLS is clean, and the official docs name three causes — all in a file we never opened
+
+The real TLS probe came back clean: `issuer=Let's Encrypt`,
+`issuer=Google Trust Services`, handshakes in 0.0s, identical to an unproxied
+control machine. **No interception.** The proxy/CA theory is dead — and unlike
+the first twenty-three runs, the network is now actually tested rather than
+assumed.
+
+So the score on causes proposed: five offered, five wrong.
+
+## What the official documentation says
+
+From OpenAI's app-server docs, on `thread/list` and `thread/start`:
+
+> Neither operation typically hangs unless:
+> - Upstream model service is unavailable
+> - Sandbox initialization fails
+> - Required MCP servers fail to initialize (causes `thread/start`/`thread/resume` to fail entirely)
+
+All three are decided by `$CODEX_HOME/config.toml`. Twenty-four runs never
+opened it. The spike inventoried that directory by *name and size* from run 8
+onward — `config.toml` was listed, every run, unread.
+
+The docs also confirm the handshake this spike already does
+(`initialize` then `initialized`), and confirm `thread/list` is **not** supposed
+to block: *"It does not block — returns immediately with cursor-based
+pagination results."* So the hang is abnormal, not a slow path, which also
+retires what was left of the run-22 timing theory.
+
+## What now runs
+
+`probe_config()` prints `config.toml` with any key whose name looks like a
+credential redacted, then counts MCP servers and flags every line mentioning
+`required`. Both counts go to Key facts, including the zero case — "0 MCP
+servers" rules the documented cause out, and that is worth as much as finding
+one.
+
+Redaction is asserted against a config containing three planted secrets, not
+eyeballed.
+
+## The inconclusive probe that read as a pass
+
+Run 24's sign-in probe found `auth.json`, recognised none of its expiry field
+names, and appended **nothing** to Key facts. So the pasted output carried no
+auth line at all — indistinguishable from a machine where sign-in was checked
+and fine.
+
+That is the same defect as the TCP "OK": a check that cannot report its own
+failure. It now emits `expiry UNKNOWN` with the key names it did see.
+
+# Run 23: 90s was not enough either, and the probe that said "OK" was the problem
+
+90s did not help. `thread/list` does not take 20-42s here; it never returns. The
+fuse mattered — runs 21-22 really were cut short by it — but it was not the
+cause, and raising it turned a wrong answer into a slower wrong answer.
+
+What survived 23 runs unexamined is this line:
+
+```
+chatgpt.com TCP443 OK in 0.0s
+```
+
+That probe opened a TCP socket and printed OK. **A TLS-inspecting proxy accepts
+the connection and then intercepts it**, so on the exact network where this
+fails, a TCP connect succeeds. Twenty-three runs reported the network healthy
+using a check that could not detect the thing most likely to be wrong — the same
+"probe that cannot fail" this README has already caught twice.
+
+And app-server's own first log line, present in every single run, says:
+
+```
+using system root certificates because no CA override environment variable was selected
+```
+
+That is `CODEX_CA_CERTIFICATE` being unset. OpenAI documents it for corporate
+TLS proxies and private root CAs
+([openai/codex#6849](https://github.com/openai/codex/issues/6849) is login
+failing behind exactly that). The target machine is a **work** Mac. The one
+environment where this spike is meant to run is the one environment where that
+setting is likely to be required, and the server has been saying so from line
+one of every run while the reachability check printed OK above it.
+
+## What now runs instead
+
+- A **full TLS handshake** to each host, timed separately from the TCP connect,
+  followed by a real HTTP request.
+- The **certificate issuer**, printed. A public CA (Let's Encrypt, DigiCert,
+  Google Trust Services, Amazon, ISRG) means the connection reached OpenAI.
+  Anything else means it was terminated and re-signed in the middle, and the
+  probe says so outright.
+- **Proxy environment variables**, and whether `CODEX_CA_CERTIFICATE` is set.
+- **Sign-in state** — which auth files exist, their age, their key *names*, and
+  whether a token is expired. Never a value: these files hold live credentials,
+  and the leak check for that is asserted, not eyeballed.
+
+Control run on a machine with no proxy: `issuer=Let's Encrypt`,
+`issuer=Google Trust Services`, handshakes in 0.0s. That is what an
+uninterrupted connection looks like.
+
+## The correction this makes to the earlier runs
+
+Every run from 14 onward carried "chatgpt.com TCP443 OK" in its Key facts, and
+several of the theories above were built on top of it — network ruled out,
+therefore the fault must be in the protocol, the lock, the client, the queue.
+The network was never ruled out. It was never tested.
+
+# Run 22: the fuse was A bug (run 23: not the cause — read on)
+
+Run 22 cleared the remaining environmental theories in one pass:
+
+- **The store is fine.** Read directly with `immutable=1`: `thread_turns` 36 rows,
+  `thread_items` 201, `thread_history_projection_state` 2. Instant, unlocked.
+- **No leaked servers.** The stray count was zero.
+- **No server requests.** Ruled out in run 21 and still true.
+- **Network reachable**, both hosts, under 0.1s.
+
+And `thread/list` failed on all three variants at **exactly 20.0s** — which is
+this script's `--timeout` default, not a property of Codex.
+
+## The measured cost is 20-42s; the fuse was 20
+
+[openai/codex#45246](https://github.com/openai/codex/issues/45246) clocks
+`thread/list` at **20-42 seconds** on a host with many unarchived threads — it
+scales with thread count. [#36416](https://github.com/openai/codex/issues/36416)
+reports the same shape when the call scans rollouts.
+
+Runs 1-20 sat under that line and got 0.0s answers. The store then grew — 201
+items, largely from these runs — and crossed it. Nothing about the protocol
+changed between run 20 and run 21. The DB got bigger and the fuse stayed at 20.
+
+Default is now **90s**, above the reported ceiling.
+
+## Why the failures after the first one meant nothing
+
+A client-side timeout does **not** cancel the server-side work. app-server keeps
+the slot, and it has about six;
+[#36189](https://github.com/openai/codex/issues/36189) describes one slow call
+filling the queue until everything behind it expires.
+
+Runs 21 and 22 fired three `thread/list` variants and four `thread/start`
+attempts *after* the first timeout — seven requests into six slots, each queued
+behind a call still running. The script then printed:
+
+```
+thread/list  every variant failed — not a params problem
+```
+
+which is true, and not for the reason it implies. The variants were never
+reached. That line is now `no variant answered`, and a timeout stops the loop
+with the queue explained, in all three places that used to keep going.
+
+Verified both directions against a stub with a deliberately slow `thread/list`:
+a fuse below the server's cost stops after one attempt instead of seven; a fuse
+above it answers normally.
+
+## What this retracts
+
+The run-19 heading and the run-20 heading both named a cause that later runs
+disproved. They are kept, marked, because the sequence is the point — four
+plausible mechanisms (writer lock, unanswered server request, leaked servers,
+DB contention) each explained the evidence available when it was proposed, and
+each was killed by a cheap probe rather than by argument. The one that survived
+was visible in every run since run 14: the timeouts all landed on the same
+round number, and a round number is a fuse, not a finding.
+
+# Run 21: the server-request theory is dead, and the spike was hiding its own mess
+
+Run 21 answered the previous run's question cleanly, in the negative:
+
+```
+server->client REQUESTS seen: NONE.
+```
+
+app-server asked this client nothing. Unanswered server requests are **ruled
+out**. The responder stays — it is correct, and four other clients needed it —
+but it is not what hangs this spike.
+
+Run 21 also produced a regression that is more informative than the theory it
+killed. `thread/list` with `useStateDbOnly: true` **answered in 0.0s in every
+earlier run and now times out**. That call is the one documented to stay local.
+The protocol did not change between runs; the machine did.
+
+## What the spike was hiding
+
+The process inventory contained this:
+
+```python
+if "spike" in ln:
+    continue
+```
+
+Intended to skip the current run. It also skipped **every app-server leaked by
+the twenty runs before it**. Each run spawns a server against the same
+`CODEX_HOME`, cleanup lived only at the end of `report()`, and any Ctrl-C or
+exception skipped it. So the inventory printed "codex processes running: N"
+with our own survivors excluded from N — while the calls that touch that store
+got slower, and then stopped answering.
+
+Three fixes, in order of how much trouble they were:
+
+1. **Leaked servers are counted and named**, not filtered out.
+2. **`install_reaper()`** terminates spawned servers from `atexit` and from
+   SIGINT/SIGTERM/SIGHUP, so the paths that skip `report()` no longer leak.
+   Verified by sending SIGINT mid-run and counting survivors: zero.
+3. **`--kill-strays`** ends the ones already out there.
+
+### The bug inside the fix
+
+The first version of the detector tested `if "spanreed-spike" in ps_line`. Run
+against a test harness, it reported **3** strays where 1 existed — it had matched
+the shell running the test, whose command line merely quoted the string. With
+`--kill-strays` that is a SIGTERM to the user's shell.
+
+`is_stray_spike_server()` now requires all three of: argv[0] whose basename is
+`codex`, `app-server` in the arguments, and our own socket prefix. A shell
+quoting any of those fails the first test. Six cases are asserted, including the
+exact line that fooled the first version.
+
+The same bug then bit the test harness itself — `pkill -f "sleep 999"` killed
+the shell running it, for the identical reason. Substring is not identity, in
+either direction.
+
+## Reading the store without app-server in the way
+
+`probe_state_db()` opens `thread_history*.sqlite` directly with `immutable=1`,
+which skips locking entirely so the probe cannot itself become the contention it
+is looking for. If the file reads fine here while app-server cannot answer from
+it, the fault is in the server or in contention for the file — not in the
+protocol, and not in this client.
+
+# Run 20: the client was never holding up its end (run 21 ruled this out as the cause — read on)
+
+Run 20 killed the writer-lock theory in one line: `thread/start` **also** timed
+out. A thread that does not exist yet cannot be locked. The lock is real and
+documented, but it is not what hangs this spike.
+
+What the 20 runs actually show is a clean split:
+
+| Answers instantly | Hangs forever, span open, no error |
+| --- | --- |
+| `initialize` | `thread/list` without `useStateDbOnly` |
+| `thread/loaded/list` | `thread/resume` |
+| `thread/list` with `useStateDbOnly: true` | `thread/start` |
+| | `turn/start` |
+
+The right-hand column is every call that reaches the backend. The left-hand
+column is every call that does not.
+
+## The cause: app-server asks the client questions, and this client never answered
+
+app-server is **bidirectional** JSON-RPC. It sends *requests* to the client —
+`execCommandApproval`, `applyPatchApproval`, `mcpServer/elicitation/request` —
+and blocks until the client responds. There is no timeout on the server side.
+
+This spike's `jsonrpc()` matched inbound frames by `id` and dropped everything
+else. A server request has a `method` *and* an `id`, so it fell through to the
+notification branch and was discarded — and `on_notify` was only ever wired up
+during `turn/start`, so during `thread/start` the discard was silent.
+
+At least four other clients shipped this same bug:
+
+- [Clubhouse#1720](https://github.com/Agent-Clubhouse/Clubhouse/issues/1720) — "drops 7 of 9 server requests with no response, hanging the turn"
+- [signalxjs/ai#126](https://github.com/signalxjs/ai/issues/126) — "no default response, so an unmapped request leaves the thread hanging"
+- [solenta#1171](https://github.com/currentbits/solenta/issues/1171) — "left unanswered never times out; the thread stays in waitingOnApproval indefinitely"
+- [memql-cockpit#446](https://github.com/znasllc-io/memql-cockpit/issues/446) — a framing variant of the same stall
+
+Their recommended fix is the one taken here: answer *everything*, and answer
+unknown methods with `-32601` rather than silence, because a refusal is
+diagnosable and a stall is not.
+
+## What changed
+
+`handle_server_request()` replies to every server-initiated request on every
+call, not just during turns: approvals get `decision=decline`, elicitation gets
+`action=decline`, anything unrecognised gets `-32601`. Declining is correct for a
+probe whose prompt tells the model to touch nothing — it ends the turn with an
+answer instead of a hang.
+
+Per the app-server protocol the `"jsonrpc": "2.0"` member is **omitted** on
+replies; app-server leaves it off its own frames.
+
+Every server request is printed as it arrives, and the report prints the
+**zero case explicitly** — "REQUESTS seen: NONE" rules the theory out, where
+silence would leave the next run re-arguing it.
+
+Verified against a stub that reproduces the reported bug: a server that blocks
+`thread/start` until the client answers now gets its answer and completes, where
+before it timed out exactly as run 20 did.
+
+# Run 19: a writer lock looked like the cause (run 20 disproved this — read on)
+
+Run 19 added `thread/resume` with `excludeTurns: true` and it **also** timed out.
+The server log ends on the `thread/resume` span with 0 warn/error — entered,
+never returned. Same shape as `turn/start`, one call earlier.
+
+The cause is not in this script. Codex takes a **per-thread writer lock** at
+`$CODEX_HOME/thread-writer-locks/<thread>.lock`. A thread another client has open
+is already claimed, and resume blocks on the lock rather than failing, so the
+symptom is a hang with no error. This is a known upstream problem with issues
+open against codex itself and against several third-party clients:
+
+- openai/codex#44449 — threads viewed in the iOS app stay locked in the daemon; desktop fails with "already has an active writer"
+- openai/codex#40973 — remote cannot open a VS Code-owned thread; the writer stays held after the other client disconnects
+- manaflow-ai/cmux#11973, pingdotgg/t3code#8259, getpaseo/paseo#3573 — the same error from three unrelated clients
+
+So `--turn <a human's thread>` was testing the one case Codex is documented to
+refuse.
+
+## The question the spike never asked
+
+`thread/start` ran **only when `thread/list` came back empty**. Once step 3 began
+returning a real thread, the own-thread path stopped running entirely — six runs
+drove a locked thread and none created one.
+
+That inverted the priority. Spanreed does not need to hijack a human's Codex
+window; it would **own** its thread, the way it owns a Claude session. `--fresh`
+forces that path:
+
+```sh
+python3 spike.py --fresh                 # our own thread -- the case that matters
+python3 spike.py --turn <human-thread>   # the hijack -- expect a writer-lock refusal
+```
+
+Step 4 renames itself under `--fresh`, and the pass text no longer tells you to
+go look at the human's Codex window — a pass on our own thread is not a pass on
+someone else's, and the two must not print the same.
+
+The target's lock file is now checked before the attempt, so a held lock is named
+up front instead of rediscovered by spending the timeout.
+
+# The cause of the run-18 hang, found by reading a working client
+
+Runs 14-18 had `turn/start` hang with zero notifications. I burned five runs
+guessing parameters (`model`, `approvalPolicy`, `sandboxPolicy`). The answer was
+not a parameter. `kcosr/codex-threads` is a third-party client that drives
+app-server threads successfully, and its documented behaviour names all three
+mistakes:
+
+| What it does | What this spike did | Why it mattered |
+| --- | --- | --- |
+| `thread/resume` with `excludeTurns: true` | resumed without it | paginated threads *require* it; full-history resume is unavailable, so plain resume hangs |
+| loads the thread before driving it | never loaded it | `thread/loaded/list` returned **0** every run; app-server has an "unloaded thread error" for exactly this, and that client resumes-and-retries once on seeing it |
+| reads `canAcceptDirectInput` first | never read it | an explicit `false` is step 4's answer as *data* — a refusal, not a timeout |
+
+The signal was in the output the whole time: `thread/loaded/list` returned 0 on
+every single run, sitting next to a `thread/list` that returned a real thread. A
+thread that exists but is not loaded is the documented failure mode, and I read
+past it because I was looking at `turn/start`'s parameters instead.
+
+The same client waits **up to an hour** for a turn to reach terminal status, so a
+300s timeout was never on its own evidence of anything.
+
+# The cause, found on run 13
+
+**`thread/list` consults remote sources by default, and that request never
+returns on this network.** Passing the flag the schema already named fixes it:
+
+```
+thread/list [local DB only]  {"useStateDbOnly": true}   ANSWERED in 0.0s
+thread/list [default]        {}                          4 timeouts, to t+115s
+```
+
+Same run, same server, same connection. The contrast is the measurement.
+
+And it returned a thread **this script did not create** —
+`01a0a1a9-7892-7292-b341-81998259f405`, persisted from an earlier session. So
+step 3 is a real pass, not a self-created substitute.
+
+## What this retracts
+
+Everything above about the TUI exposing nothing is **suspect and probably
+wrong**. Every attempt to enumerate a human's threads was made with a call that
+could not return, so "no threads visible" was never evidence about visibility.
+The earlier conclusion should not be cited until re-tested.
+
+## The wrong answers, in order
+
+Each was stated with more confidence than it had earned, and each was
+falsified by the next run:
+
+| # | explanation | killed by |
+|---|---|---|
+| 1 | sqlite lock contention with the TUI | zero codex processes, still hung |
+| 2 | startup warmup / network fetches in flight | retries to t+115s |
+| 3 | missing `initialized` handshake | real, and necessary — but not sufficient |
+| 4 | `experimentalApi` gate | accepted, hang persisted |
+| 5 | wrong/missing params | `required: []` — `{}` was always valid |
+| 6 | **remote lookups on a blocked network** | **confirmed: the flag fixes it** |
+
+Five wrong, one right. The right one came from reading the `accepts` list the
+script had been printing for two runs — `sourceKinds`, `originators`,
+`useStateDbOnly` — rather than from reasoning about the logs.
+
+## The transferable part
+
+The script's value was never its correctness. It was wrong repeatedly and in
+ways that produced confident, plausible failure reports. What made the answer
+reachable is that every failure named **which assumption** it implicated, so a
+wrong guess cost one run instead of becoming the conclusion.
+
+The thing that actually ended it was going back to primary sources — the docs
+for the handshake, and the machine's own schema for the parameters. Both had
+been available from the first run. Nine runs of inference from logs produced
+five wrong answers; two readings of the spec produced the two right ones.

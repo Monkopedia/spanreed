@@ -9,7 +9,9 @@ State root is per-test via the ``SPANREED_STATE_ROOT`` env var.
 from __future__ import annotations
 
 import os
+import subprocess
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import anyio
@@ -18,6 +20,7 @@ import pytest
 from spanreed.mcp_server import (
     deregister_agent,
     list_agents,
+    list_peers,
     mcp_app,
     recv_messages,
     register_agent,
@@ -28,6 +31,8 @@ from spanreed.mcp_server import (
     set_status,
     wait_for_reply,
 )
+from spanreed.protocol import PeerLink
+from spanreed.store import StateStore, pid_start_time
 
 
 @pytest.fixture
@@ -347,3 +352,73 @@ def test_set_name_returns_none_when_not_registered(
 ) -> None:
     monkeypatch.setenv("SPANREED_AGENT_NAME", "unregistered")
     assert set_name(name="anything") is None
+
+
+# ---------------------------------------------------------------- #55
+
+
+def test_list_peers_is_empty_on_a_bus_with_no_bridges(mcp_env: None) -> None:
+    assert list_peers() == []
+
+
+def test_list_peers_reports_a_bridge_that_has_never_synced(mcp_env: None) -> None:
+    """The state that makes every agent on a peer invisible to list_agents."""
+    StateStore().write_peer_link(
+        PeerLink(
+            host="macbook",
+            role="connect",
+            bridge_pid=os.getpid(),
+            bridge_pid_start=pid_start_time(os.getpid()),
+            attached_at=datetime.now(UTC),
+            last_frame_at=datetime.now(UTC),
+            registry_requests_sent=9,
+        )
+    )
+    peers = list_peers()
+    assert [p["host"] for p in peers] == ["macbook"]
+    assert peers[0]["last_registry_at"] is None
+    assert peers[0]["registry_requests_sent"] == 9
+    # And list_agents shows nothing for that host, which is exactly why the two
+    # tools have to be read together.
+    assert not any("@macbook" in str(a["agent_id"]) for a in list_agents())
+
+
+def test_send_message_reports_delivery_to_a_live_session(ab: None) -> None:
+    result = send_message(from_agent="A", to_agent="B", body="hi")
+    assert result["delivered_to_live_session"] is True
+
+
+def test_send_message_does_not_report_success_for_a_stopped_session(mcp_env: None) -> None:
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    register_agent(name="gone", working_dir="/tmp", pid=proc.pid, agent_id="agent-gone")
+    result = send_message(from_agent="A", to_agent="agent-gone", body="hi")
+    assert result["delivered_to_live_session"] is False
+    assert str(result["delivery"]).startswith("NOT DELIVERED TO A LIVE SESSION")
+    assert "treat this as QUEUED, not delivered" in str(result["delivery"])
+
+
+def test_send_message_refuses_a_name_matching_only_stopped_sessions(mcp_env: None) -> None:
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    register_agent(name="ksrpc", working_dir="/tmp", pid=proc.pid, agent_id="agent-gone")
+    with pytest.raises(ValueError, match="every agent carrying it on this bus has STOPPED"):
+        send_message(from_agent="A", to_agent="ksrpc", body="hi")
+
+
+def test_send_message_to_an_unsynced_peer_names_the_sync_fault(mcp_env: None) -> None:
+    StateStore().write_peer_link(
+        PeerLink(
+            host="macbook",
+            role="connect",
+            bridge_pid=os.getpid(),
+            bridge_pid_start=pid_start_time(os.getpid()),
+            attached_at=datetime.now(UTC),
+            last_frame_at=datetime.now(UTC),
+        )
+    )
+    with pytest.raises(ValueError) as excinfo:
+        send_message(from_agent="A", to_agent="agent-r@macbook", body="hi")
+    text = str(excinfo.value)
+    assert "has NEVER RECEIVED A REGISTRY SNAPSHOT from 'macbook'" in text
+    assert "Call list_agents to find the recipient's agent_id" not in text
