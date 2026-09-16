@@ -111,6 +111,17 @@ _V1_METHODS = frozenset({EXEC_COMMAND_APPROVAL, APPLY_PATCH_APPROVAL})
 _V2_METHODS = frozenset(
     {EXEC_COMMAND_APPROVAL_V2, APPLY_PATCH_APPROVAL_V2, PERMISSIONS_APPROVAL_V2}
 )
+# PERMISSIONS_APPROVAL_V2 is here BY ANALOGY and that is worth stating, because
+# it is the same move this module criticises elsewhere. The vendored
+# ServerRequest.json defines requests, not responses: it carries
+# CommandExecutionApprovalDecision and FileChangeApprovalDecision, and NO
+# response enum for item/permissions/requestApproval. So its decision value is
+# inferred from its siblings rather than read.
+#
+# The exposure is bounded: decide() always declines a permissions request, so
+# the worst case is a possibly-invalid enum on a request that was going to be
+# refused anyway. It fails closed. Confirm against a real server when one is to
+# hand -- `spanreed codex --doctor` is where that would show up.
 
 
 def wire_decision(method: str, approved: bool) -> str:
@@ -160,7 +171,12 @@ def contains(root: Path, target: Path) -> bool:
     candidate = target if target.is_absolute() else root / target
     try:
         target_resolved = candidate.resolve()
-    except (OSError, RuntimeError):
+    # ValueError joins these because Path.resolve() raises it for an
+    # embedded NUL, and a raise here skips decision.log_line() -- the
+    # request is still answered (the client wraps handlers and replies
+    # -32603), but the approval appears in no log at all, which is the
+    # one outcome this module repeatedly says must not happen.
+    except (OSError, RuntimeError, ValueError):
         # Unresolvable means uncheckable, and uncheckable means denied. Both
         # exception types are needed: CPython 3.12 turns a symlink loop's ELOOP
         # into a *RuntimeError* inside resolve(), so catching OSError alone lets
@@ -215,6 +231,19 @@ def decide(root: Path, method: str, params: object) -> Decision:
             method=method,
             subject=_render_elicitation(params),
             reason="a Codex worker has no human attached, so an elicitation cannot be answered; declining ends the turn where silence would hang it",
+        )
+    if method == PERMISSIONS_APPROVAL_V2:
+        # Recognised and declined for a stated reason, which is NOT the same as
+        # unrecognised. It previously fell through to the terminal branch and
+        # logged "unrecognised approval method" about a method that is a named
+        # constant here and a member of APPROVAL_METHODS -- a log line that
+        # misdescribes a case the module explicitly handles, which is the same
+        # defect class this module was written to stop shipping, one tier down.
+        return Decision(
+            approved=False,
+            method=method,
+            subject=_render_permissions(params),
+            reason="a permissions request asks a HUMAN to widen what the session may do, and a worker has no human; declining is the answer, not a failure to understand the request",
         )
     return Decision(
         approved=False,
@@ -427,6 +456,21 @@ def _patch_paths(fields: dict[str, object]) -> list[str] | None:
     if not saw_key or not found:
         return None
     return found
+
+
+def _render_permissions(params: object) -> str:
+    """Name what was asked for, so the log says more than the method name."""
+    fields = _as_mapping(params)
+    if fields is None:
+        return "(permissions request, unreadable params)"
+    perms = fields.get("permissions")
+    if isinstance(perms, list):
+        items = cast("list[object]", perms)
+        named = [str(x) for x in items if isinstance(x, str)]
+        if named:
+            return "permissions: " + ", ".join(named[:6])
+    cwd = fields.get("cwd")
+    return f"permissions request (cwd {cwd})" if isinstance(cwd, str) else "permissions request"
 
 
 def _render_elicitation(params: object) -> str:

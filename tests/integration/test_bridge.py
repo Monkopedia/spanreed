@@ -748,6 +748,77 @@ class TestReaderSurvivesABadFrame:
             assert link.note is not None
             assert "could not be processed and was DROPPED" in link.note
 
+    def test_an_unknown_frame_kind_is_ignored_and_leaves_no_note(self, tmp_path: Path) -> None:
+        """A receiver must shrug at a `kind` it does not know.
+
+        This is the forward-compatibility half that had no test. Its dangerous
+        sibling above -- a frame the reader cannot model killing the reader,
+        after which mail keeps flowing while nothing is ingested -- is pinned,
+        and that was #55's failure mode. Nothing pinned this one, so the next
+        edit to the reader's if/elif chain could turn an unknown kind into a
+        crash, or into a DROPPED note, with no test going red.
+
+        The distinction matters: a frame from a newer peer is not an error and
+        must not be recorded as one, or every mixed-version bridge accumulates
+        notes about working correctly. The bridge carries no protocol version,
+        so compatibility between hosts is structural -- and a structural
+        guarantee with no test is a coincidence. Found by the cross-repo review
+        of #56.
+        """
+        store = StateStore(root=tmp_path / "local")
+        _register_live(store, "agent-local", "local")
+        peer_r, peer_w = os.pipe()
+        conn = Bridge(
+            os.fdopen(peer_r, "rb"),
+            io.BytesIO(),
+            "kaladin",
+            store,
+            poll_interval=0.05,
+            sync_interval=30,
+            recv_timeout=60,
+        )
+        with _running(conn), os.fdopen(peer_w, "wb") as peer:
+            peer.write((json.dumps({"kind": "hello", "host": "adolin"}) + "\n").encode())
+            # A frame from a version that does not exist yet.
+            peer.write(
+                (
+                    json.dumps(
+                        {"kind": "a-frame-from-the-future", "payload": {"anything": [1, 2, 3]}}
+                    )
+                    + "\n"
+                ).encode()
+            )
+            peer.write(
+                (
+                    json.dumps(
+                        {
+                            "kind": "msg",
+                            "message": {
+                                "msg_id": "m1",
+                                "from_agent": "agent-r@adolin",
+                                "to_agent": "agent-local",
+                                "body": "still delivering",
+                                "ts": "2026-01-01T00:00:00Z",
+                                "in_reply_to": None,
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            peer.flush()
+            _wait(
+                lambda: any(
+                    m.body == "still delivering" for m in store.recv_messages("agent-local")
+                )
+            )
+            link = store.read_peer_link("adolin")
+            assert link is not None
+            # Ignored, NOT dropped-with-a-note: an unknown kind is a newer peer,
+            # not a fault, and recording it as one would make every
+            # mixed-version bridge look broken.
+            assert link.note is None
+
     def test_non_json_noise_before_the_hello_is_recorded_not_dropped(self, tmp_path: Path) -> None:
         """A login banner on the far side is a leading cause of a dead handshake."""
         store = StateStore(root=tmp_path / "local")

@@ -45,8 +45,9 @@ Fixes [#55](https://github.com/Monkopedia/spanreed/issues/55).
 - Six distinct resolver errors replace the single message that said "Call
   `list_agents`" — advice that returned nothing and so confirmed the false
   belief that the agent had stopped.
-- `spanreed list` is a human bus report showing attached peers and sync state
-  (`--json` returns the previous array). Every surface that prints `last_seen`
+- **BREAKING: `spanreed list` now prints a human bus report by default, not JSON.**
+  It shows attached peers and sync state; `--json` returns the previous array.
+  See Upgrading below — this is the only breaking change in the release. Every surface that prints `last_seen`
   now prints beside it that nothing infers liveness from it.
 - `list_peers()` added to the MCP surface.
 
@@ -62,6 +63,12 @@ non-reproduction is recorded in `docs/findings.md`.
 - `wait_for_reply`'s description no longer says the opposite of what it does.
 
 ### Upgrading
+
+**Anything parsing `spanreed list` must add `--json`.** The default output is now a
+human report; a script doing `spanreed list | json.load` will fail to parse it. This
+was found by the review of #56, which identified a live consumer that takes its
+unparseable-input path and renders an empty roster on upgrade — failing closed, but
+failing.
 
 ```bash
 uv tool upgrade spanreed-bus

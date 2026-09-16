@@ -473,3 +473,40 @@ class TestFileChangeShapes:
     def test_v1_without_paths_is_still_declined(self, tmp_path: Path) -> None:
         # v1 does name its files, so silence there is malformed, not structural.
         assert not decide(tmp_path, APPLY_PATCH_APPROVAL, {"reason": "x"}).approved
+
+
+class TestReviewFindings:
+    """Regressions for the cross-repo review of #56.
+
+    Each of these is a case where the code did the right thing for a reason it
+    described wrongly, or lost a record it promises to keep. The module's own
+    standard -- a log that is fiction is worse than no log -- is what makes
+    them worth pinning rather than shrugging at.
+    """
+
+    def test_an_embedded_nul_still_produces_a_logged_decision(self, tmp_path: Path) -> None:
+        # Path.resolve() raises ValueError for an embedded NUL, which was not in
+        # contains()'s catch tuple. The request was still answered -- the client
+        # wraps handlers and replies -32603 -- but decision.log_line() never ran,
+        # so the approval appeared in no log at all.
+        d = decide(tmp_path, EXEC_COMMAND_APPROVAL, {"command": ["ls"], "cwd": "/etc\x00/passwd"})
+        assert d.approved is False
+        assert d.log_line()  # the whole point: there IS a line to write
+
+    def test_a_permissions_request_is_not_called_unrecognised(self, tmp_path: Path) -> None:
+        # It is a named constant and a member of APPROVAL_METHODS, so telling
+        # the operator it was unrecognised misdescribes a case the module
+        # explicitly handles.
+        d = decide(tmp_path, PERMISSIONS_APPROVAL_V2, {"permissions": ["network"], "cwd": "/tmp"})
+        assert d.approved is False
+        assert "unrecognised" not in d.reason
+        assert "no human" in d.reason
+        assert "network" in d.subject
+
+    def test_a_genuinely_unknown_method_is_still_called_unrecognised(self, tmp_path: Path) -> None:
+        # The other half: the terminal branch must keep saying what it means for
+        # methods that really are unknown, or the fix above has just moved the
+        # inaccuracy.
+        d = decide(tmp_path, "item/somethingNew/requestApproval", {})
+        assert d.approved is False
+        assert "unrecognised" in d.reason

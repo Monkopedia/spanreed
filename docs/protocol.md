@@ -367,6 +367,29 @@ A message addressed to `agent-X@hostB` is delivered by the normal `send_message`
 
 ### Pipe frames
 
+**Frames carry no version, and compatibility is structural.** `hello` announces
+`{"kind", "host"}` and nothing more, so two hosts running different `spanreed`
+versions agree only by the shape of what they send. That is a decision, not an
+oversight, and it puts two obligations on every receiver:
+
+- A receiver **MUST ignore an unrecognised `kind`.** A frame from a newer peer
+  is not a fault and must not be recorded as one, or every mixed-version bridge
+  accumulates notes about working correctly. Pinned by
+  `test_an_unknown_frame_kind_is_ignored_and_leaves_no_note`.
+- A receiver **MUST NOT let a frame it cannot model terminate the reader.**
+  Drop it, note it, keep reading. This is the direct lesson of #55: a
+  version-skewed `registry` frame raised inside the reader thread and killed
+  it, after which mail kept flowing in both directions while nothing was
+  ingested — a bridge that looks healthy from every angle except the one that
+  matters. Pinned by
+  `test_a_malformed_registry_does_not_stop_later_delivery`.
+
+Optional fields follow the same rule from the other side: a field a peer is too
+old to send reads as `null`, never as a zero value. `local_rows` absent means
+"that peer cannot tell us", which is a different claim from "that peer has no
+rows", and conflating them is what made "advertised zero agents" and "never
+answered" indistinguishable before.
+
 The pipe carries newline-delimited JSON frames, each with a `kind`:
 
 ```json

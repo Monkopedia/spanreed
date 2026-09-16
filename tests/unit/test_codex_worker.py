@@ -35,9 +35,11 @@ from typing import Any
 import pytest
 
 from spanreed import cli
+from spanreed.codex_approvals import MODES
 from spanreed.codex_worker import (
     AGENT_MESSAGE_DELTA,
     AUTH_TOKENS_REFRESH,
+    BOUNDARY_BY_MODE,
     DANGER_BANNER,
     RATE_LIMITS_UPDATED,
     THREAD_STATUS_CHANGED,
@@ -691,3 +693,36 @@ class TestAuthRefresh:
             "accessToken": SECRET_TOKEN,
             "chatgptAccountId": "acct-9f3",
         }
+
+
+class TestBoundaryInstructionMatchesTheMode:
+    """What the model is told must match what the code enforces.
+
+    The preamble used to claim unconditionally that writes outside --cwd are
+    "declined by the worker before they reach you". True in workspace mode;
+    false in danger, where approval_policy() is "never" and nothing is ever
+    declined -- while DANGER_BANNER, in the same file, told the operator exactly
+    that. Found by the cross-repo review of #56.
+    """
+
+    def test_danger_does_not_promise_a_boundary_it_does_not_have(self) -> None:
+        text = BOUNDARY_BY_MODE["danger"].format(cwd="/w")
+        assert "NO SANDBOX" in text
+        assert "declined by the worker" not in text
+        # A phrase that does not span the wrap. "nothing constrains you" broke
+        # across a line and the assertion failed on correct text -- the second
+        # time that has happened in this repo, hence the note.
+        assert "no mechanism will stop you" in text
+
+    def test_workspace_describes_the_sandbox_that_actually_confines_it(self) -> None:
+        text = BOUNDARY_BY_MODE["workspace"].format(cwd="/w")
+        assert "workspaceWrite" in text
+        assert "/w" in text
+
+    def test_read_only_says_read_only(self) -> None:
+        assert "read-only" in BOUNDARY_BY_MODE["read-only"].format(cwd="/w")
+
+    def test_every_mode_has_a_boundary_sentence(self) -> None:
+        # A mode added without one would fall back to a KeyError at start(),
+        # which is loud -- but this makes the omission visible at test time.
+        assert set(BOUNDARY_BY_MODE) == set(MODES)
