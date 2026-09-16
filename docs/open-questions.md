@@ -21,14 +21,18 @@ Things still to test, design, or decide.
   reached it. The class to watch: `safe_*`, `validated_*`, `*_only`, and `CONFINED_MODES` itself.
   No guard is proposed — the observation is recorded because the defect is invisible to every
   mechanism this repo has.
-- **A once-observed flake in `test_a_child_that_exits_zero_after_the_handshake_is_not_a_success`**
-  (2026-09-16). Failed once inside a full `make check`, then passed 12 consecutive runs of its own
-  module, 3 full-suite runs, and 18 runs under deliberate CPU contention. The test already documents
-  a race with the child's exit and accepts two outcomes; a third path is the obvious hypothesis and
-  is **not** evidenced. Recorded rather than fixed, because writing a fix against an unreproduced
-  cause is exactly what #55 taught this repo not to do.
-
-
+- **An intermittent failure in `test_a_child_that_exits_zero_after_the_handshake_is_not_a_success`**
+  (2026-09-16). Seen **twice**, both times inside a full `make check`, never under bare `pytest`
+  and never in isolation: ~44 full-suite runs, 12 runs of its own module, and 18 runs under
+  deliberate CPU contention all passed, and neither failure was captured with its assertion text.
+  The test already documents a race with the child's exit and accepts two outcomes for *which*
+  side notices first. A third path is the obvious hypothesis and remains unevidenced. What can be
+  pointed at in the code rather than guessed: two of its assertions (`EXITED with status 0`, and
+  the child's own final line) depend on the output drain having flushed, and `settle()` is a
+  bounded wait by construction — so a real race exists there whether or not it caused these two
+  failures. **Not fixed**, because a fix written against an unreproduced cause is what #55 taught
+  this repo to avoid; recorded so the third occurrence is recognised as the third rather than the
+  first.
 - **`/reload-plugins` doesn't restart already-running MCP servers.** Reloading the plugin picks up changes to the manifest, hooks, monitors, and `.mcp.json` config, but the MCP server process spawned at session start keeps running on the *old* code. Adding a new MCP tool, renaming a tool, or changing tool signatures all require a full Claude session restart to take effect. Existing tools continue to work because the MCP server reads StateStore state fresh on each call — so behavioral changes to *implementations* of existing tools land on next call, but new tool *registrations* don't surface until restart. Development-workflow gotcha; possibly worth `/feedback` asking for `/reload-plugins` to restart MCP server processes too.
 - **Monitor exit-warning UX**: a plugin Monitor shows up as "1 monitor still running" in the status line and triggers a "background work in progress" warning on session exit. There's no documented way to mark a monitor as essential infrastructure that should be quietly ignored on exit (no `essential` / `silent` / `quiet` field; no settings override). For an always-on bus, this gets annoying. Options: file `/feedback` asking Anthropic for the flag, or investigate whether MCP server-initiated notifications can replace Monitor as the wake mechanism (avoids the warning entirely, but unclear if Claude Code wakes on them).
 - **Multi-message delivery**: if N messages arrive between Claude's turns, do all N surface or do they coalesce / drop?

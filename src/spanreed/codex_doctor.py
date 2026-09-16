@@ -454,6 +454,13 @@ def _run_protocol_steps(
         turn_timeout=turn_timeout,
         on_server_request=on_request,
         on_notification=on_note,
+        # The DOCTOR asks the server to talk; the worker deliberately does not.
+        # A worker runs for days and its log volume is a cost. The doctor exists
+        # to produce one self-contained file, and app-server's own output is the
+        # single most valuable thing in it -- during the spike the answer lived
+        # there for thirty runs. Without this the section reads "0 lines", which
+        # looks like a silent server rather than a server nobody asked.
+        env={"RUST_LOG": os.environ.get("RUST_LOG", "info")},
     )
 
     try:
@@ -522,7 +529,20 @@ def _run_protocol_steps(
         try:
             client.turn_start(
                 thread_id,
-                f"Run the shell command `pwd` in {cwd} and reply with its output verbatim.",
+                # `pwd` is INSIDE the sandbox, so app-server never asks -- which
+                # is exactly what the first live run showed: the command ran, no
+                # approval arrived, and the one step that cannot be stubbed went
+                # unexercised.
+                #
+                # The approval channel is for going BEYOND the sandbox
+                # (ClientRequest.json documents ApprovalsReviewer as covering
+                # "sandbox escapes"). So ask for something outside --cwd, and
+                # deliberately a READ of a directory present on every unix: it
+                # exercises the escape path without writing anything, on a
+                # machine the author cannot inspect.
+                f"Run the shell command `ls /etc` -- note that path is OUTSIDE {cwd} -- "
+                f"and reply with the first line of its output. If you are not permitted "
+                f"to run it, reply with exactly why, in one line.",
                 **turn_params,
             )
             r2 = client.wait_for_turn()
@@ -559,9 +579,16 @@ def _run_protocol_steps(
     finally:
         rep.rule("What app-server itself said")
         log = client.server_log()
-        rep.say(f"  {len(log.splitlines())} line(s) captured  ({len(log)} bytes)")
-        rep.say("  (A line count that is IDENTICAL across runs means a fixed-size buffer,")
-        rep.say("   not a quiet server. That mistake cost this project thirty runs.)")
+        n_lines = len(log.splitlines())
+        rep.say(f"  {n_lines} line(s) captured  ({len(log)} bytes)")
+        if n_lines == 0:
+            rep.say("  NOTHING captured. The doctor sets RUST_LOG=info, so an empty section")
+            rep.say("  here means the server wrote nothing at all -- not that it was quiet by")
+            rep.say("  choice. Worth reporting: this is the section that answers 'why did the")
+            rep.say("  call hang' when one does.")
+        else:
+            rep.say("  (A line count that is IDENTICAL across runs means a fixed-size buffer,")
+            rep.say("   not a quiet server. That mistake cost this project thirty runs.)")
         rep.say("")
         for line in log.splitlines():
             rep.say(f"  | {line}")
