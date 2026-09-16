@@ -926,6 +926,18 @@ def test_no_prose_states_the_size_of_the_blacklist() -> None:
 
     The fix is not to correct the number. It is to stop stating it: the list is
     right there and can be counted.
+
+    **DECLARED LIMIT: this refuses a CONSTRUCT, not a claim.** It cannot
+    distinguish an assertion from a citation, so it will also refuse a
+    legitimate quotation of the old wording, or a sentence explaining that the
+    count used to be wrong. That is the same defect shape as the doctor's step 3
+    passing on its own prompt -- a predicate that cannot tell who is speaking.
+
+    Kept blunt deliberately: the scope is the three files that describe this
+    guard, where a citation of the old count is exactly the thing that drifts
+    back into being a claim. If a fourth file ever needs to quote one, narrow
+    the scope rather than adding a quote exemption -- an exemption would be a
+    hole shaped like the thing it forbids.
     """
     import re
 
