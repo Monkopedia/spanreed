@@ -43,10 +43,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TextIO, cast
+from typing import Any, Protocol, TextIO, cast
 
 from .codex_approvals import approval_policy, sandbox_policy, wire_decision
-from .codex_client import CodexClient
+from .codex_client import CodexClient, TurnResult
 from .store import default_state_root
 
 MARKER = "SPANREED_DOCTOR_OK"
@@ -132,6 +132,25 @@ def _agent_said(events: list[tuple[str, dict[str, Any]]], needle: str) -> bool:
         if isinstance(text, str) and needle in text:
             return True
     return False
+
+
+class _TurnDriver(Protocol):
+    """What run_escape_probe needs from a client.
+
+    Narrower than CodexClient on purpose: the probe's verdict logic is a pure
+    function of the requests seen and the filesystem, and typing it against the
+    whole client forced tests to lie about their stub. The reviewer's point that
+    none of this was tested is answered by making it testable, not by casting.
+    """
+
+    def turn_start(self, thread_id: str, text: str, **params: Any) -> Any: ...
+
+    def wait_for_turn(
+        self,
+        *,
+        timeout: float | None = ...,
+        on_notify: Any = ...,
+    ) -> TurnResult: ...
 
 
 def _rust_log() -> str:
@@ -442,8 +461,16 @@ def finish(rep: Report, fh: TextIO, log_path: Path) -> int:
     if failures:
         rep.say(f"  {failures} step(s) FAILED. The first failure is the one to read; the")
         rep.say("  steps after it may have been skipped rather than tested.")
-    elif any(s.verdict == "DID NOT RUN" for s in rep.steps):
-        rep.say("  No failures, but some steps DID NOT RUN. That is not a pass.")
+    elif any(s.verdict in ("DID NOT RUN", "SKIP") for s in rep.steps):
+        # SKIP counts here too. It used to fall into the else and print
+        # "Everything passed" -- and this module made SKIP far more reachable
+        # (danger always skips step 4, plus the writable-root path), so
+        # `--doctor --mode danger` reported a clean pass having never exercised
+        # the approval path at all. Design constraint #3 of this module's own
+        # docstring: "did not run" is not "passed".
+        unrun = [f"{s.n} ({s.verdict})" for s in rep.steps if s.verdict in ("DID NOT RUN", "SKIP")]
+        rep.say(f"  No failures, but step(s) {', '.join(unrun)} did not execute.")
+        rep.say("  That is not a pass. Read their reasons above before relying on this run.")
     else:
         rep.say("  Everything passed. A Codex worker can run on this machine.")
 
@@ -641,7 +668,7 @@ def _run_protocol_steps(
                 rep.say(f"  escape probe: {probe}")
                 rep.say(f"  writable roots this turn sends: {[str(w) for w in writable]}")
                 try:
-                    _run_escape_probe(
+                    run_escape_probe(
                         rep,
                         client,
                         s4,
@@ -666,10 +693,9 @@ def _run_protocol_steps(
         rep.say(f"  {n_lines} line(s) captured  ({len(log)} bytes)")
         if n_lines == 0:
             rep.say(f"  NOTHING captured. This run asked for RUST_LOG={_rust_log()!r}, so an")
-            rep.say("  empty section")
-            rep.say("  here means the server wrote nothing at all -- not that it was quiet by")
-            rep.say("  choice. Worth reporting: this is the section that answers 'why did the")
-            rep.say("  call hang' when one does.")
+            rep.say("  empty section here means the server wrote nothing at all -- not that it")
+            rep.say("  was quiet by choice. Worth reporting: this is the section that answers")
+            rep.say("  'why did the call hang' when one does.")
         else:
             rep.say("  (A line count that is IDENTICAL across runs means a fixed-size buffer,")
             rep.say("   not a quiet server. That mistake cost this project thirty runs.)")
@@ -681,9 +707,9 @@ def _run_protocol_steps(
     return finish(rep, fh, log_path)
 
 
-def _run_escape_probe(
+def run_escape_probe(
     rep: Report,
-    client: CodexClient,
+    client: _TurnDriver,
     s4: Step,
     thread_id: str,
     turn_params: dict[str, Any],
@@ -705,9 +731,9 @@ def _run_escape_probe(
     try:
         client.turn_start(
             thread_id,
-            f"Write the single line {ESCAPE_MARKER} to the file {probe} -- note that path "
-            f"is OUTSIDE {cwd}, which is the only directory this session is sandboxed to "
-            f"write in. If you cannot, reply with exactly why, in one line.",
+            f"Write the single line {ESCAPE_MARKER} to the file {probe}. That path is "
+            f"outside every directory this session is sandboxed to write in. If you "
+            f"cannot, reply with exactly why, in one line.",
             **turn_params,
         )
         r2 = client.wait_for_turn()
@@ -728,8 +754,22 @@ def _run_escape_probe(
             marker_ok = ESCAPE_MARKER in probe.read_text(errors="replace")
     rep.fact(f"escape probe written outside the sandbox: {landed} (marker matched: {marker_ok})")
 
-    approved_any = [(m, v) for m, _, ok, v in new if ok]
-    declined_any = [(m, v) for m, _, ok, v in new if not ok]
+    # `v is not None` matters: when wire_decision raises, on_request records the
+    # decision but returns None, so the client answers -32601 and NOTHING goes on
+    # the wire. Counting that as an approval is the same shape as the bug this
+    # function was rewritten to fix.
+    # The partition is total: an entry is either approved-with-a-value-sent, or
+    # it lands here. `v is not None` matters because when wire_decision raises,
+    # on_request records the decision but returns None, so the client answers
+    # -32601 and NOTHING goes on the wire -- counting that as an approval is the
+    # same shape as the bug this function was rewritten to fix.
+    #
+    # Reaching past the declined branch below therefore means every request in
+    # the turn was approved and answered, so no separate `approved_any` is
+    # needed -- and an earlier version used one to write
+    # `declined_any and not approved_any`, which let a single approval anywhere
+    # erase a decline.
+    declined_any = [(m, v) for m, _, ok, v in new if not ok or v is None]
     sent = ", ".join(f"{m}->{v!r}" for m, _, _, v in new) or "nothing"
     rep.fact(f"what this client actually sent: {sent}")
 
@@ -745,7 +785,15 @@ def _run_escape_probe(
             "without consulting this client, so the decision encoding was never exercised "
             "-- that is not evidence it is right."
         )
-    elif declined_any and not approved_any:
+    elif declined_any:
+        # NOT `and not approved_any`. One approval anywhere in the turn used to
+        # suppress this branch entirely, and the expected shape of this probe is
+        # exactly mixed: the model reaches for a shell (exec approval, cwd inside
+        # --cwd, approved) while the server separately asks to widen writable
+        # roots (declined). That rendered as "an approval does not lift the
+        # sandbox" -- the reassuring conclusion -- from a run where the request
+        # that could have lifted it was refused. A decline anywhere means the
+        # question was not put.
         s4.warn(
             f"the server asked ({sent}) and this client DECLINED. "
             f"The write {'landed anyway' if landed else 'did not land'}, which says nothing "

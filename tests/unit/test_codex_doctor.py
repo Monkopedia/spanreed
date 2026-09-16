@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +44,9 @@ class TestVerdictReporting:
         rep.steps.append(Step(2, "never ran"))
         rendered = _render(rep)
         assert "DID NOT RUN" in rendered
-        assert "No failures, but some steps DID NOT RUN. That is not a pass." in rendered
+        assert "did not execute" in rendered
+        assert "That is not a pass" in rendered
+        assert "2 (DID NOT RUN)" in rendered, "the summary must name WHICH step"
 
     def test_a_failure_says_later_steps_may_be_untested(self) -> None:
         rep = Report(out=io.StringIO())
@@ -220,3 +223,137 @@ class TestStartupPreconditions:
         finally:
             work.chmod(0o700)
         assert "NOT WRITABLE by uid" in buf.getvalue()
+
+
+class TestSkipIsNotAPass:
+    """A SKIPped step used to print "Everything passed".
+
+    `finish()` counted FAIL and the literal "DID NOT RUN"; SKIP fell into the
+    else. That mattered little until step 4 gained two skip paths — `--mode
+    danger`, and a probe inside a writable root — at which point
+    `--doctor --mode danger` reported a clean pass having never exercised the
+    approval path at all. Design constraint #3 of the doctor's own docstring.
+    """
+
+    def test_a_skipped_step_is_not_reported_as_everything_passing(self) -> None:
+        rep = Report(out=io.StringIO())
+        rep.steps.append(Step(3, "ran", verdict="PASS", detail="d"))
+        rep.steps.append(Step(4, "skipped", verdict="SKIP", detail="mode is danger"))
+        rendered = _render(rep)
+        assert "Everything passed" not in rendered
+        assert "That is not a pass" in rendered
+        assert "4 (SKIP)" in rendered
+
+    def test_all_pass_still_says_everything_passed(self) -> None:
+        # The other direction: the guard must not make a clean run look dirty.
+        rep = Report(out=io.StringIO())
+        rep.steps.append(Step(1, "a", verdict="PASS", detail="d"))
+        rep.steps.append(Step(2, "b", verdict="PASS", detail="d"))
+        assert "Everything passed" in _render(rep)
+
+
+class TestEscapeVerdictReadsWhatWasSent:
+    """The five-way verdict table, driven directly.
+
+    The reviewer's point that these went untested is the reason this exists:
+    eight fixes and a near-rewrite of step 4 landed with an empty
+    `git diff --stat -- tests/`, and the surviving blocker — a decline erased by
+    any co-occurring approval — would have been caught by a two-request fixture
+    like `test_a_decline_anywhere_means_the_question_was_not_put` below.
+
+    These are pure functions of data: no live codex, no stub server.
+    """
+
+    @staticmethod
+    def _run(requests: list[tuple[str, bool, str | None]], *, landed: bool, marker: bool):
+        """Drive run_escape_probe with a canned turn and return the Step."""
+        from spanreed.codex_client import TurnResult
+        from spanreed.codex_doctor import ESCAPE_MARKER, Report, Step, run_escape_probe
+
+        rep = Report(out=io.StringIO())
+        s4 = Step(4, "q")
+        probe_path = Path()  # rebound below, before any turn runs
+        seen: list[tuple[str, dict[str, Any], bool, str | None]] = []
+
+        class _Client:
+            def turn_start(self, *a: Any, **k: Any) -> None:
+                # The requests arrive DURING the turn, which is what
+                # run_escape_probe measures: it takes len(seen) before starting
+                # and slices from there. Pre-populating the list made every
+                # scenario look like "no approval was requested" -- the fixture
+                # tested nothing, and said so by failing.
+                seen.extend((m, {}, ok, v) for m, ok, v in requests)
+                # And the model's write happens during the turn too. Creating it
+                # beforehand did not work: run_escape_probe unlinks the probe
+                # before starting, so a pre-written file was deleted and every
+                # "landed" scenario tested the "did not land" branch.
+                if landed:
+                    probe_path.write_text(ESCAPE_MARKER if marker else "something else")
+
+            def wait_for_turn(
+                self, *, timeout: float | None = None, on_notify: Any = None
+            ) -> TurnResult:
+                return TurnResult(
+                    completed=True, terminal="turn/completed", terminal_params={}, events=[]
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            probe = probe_path = Path(td) / "probe.txt"
+            run_escape_probe(
+                rep,
+                _Client(),
+                s4,
+                "t",
+                {},
+                probe,
+                Path(td),  # type: ignore[arg-type]
+                seen,
+                [],
+            )
+        return s4
+
+    def test_a_decline_anywhere_means_the_question_was_not_put(self) -> None:
+        # THE regression. An exec approved (cwd inside --cwd, which bounds
+        # nothing about effects) alongside a declined permissions widening --
+        # the expected shape of this probe. Previously reported PASS "an
+        # approval does not lift the sandbox", from a run where the request that
+        # could have lifted it was refused.
+        s4 = self._run(
+            [
+                ("item/commandExecution/requestApproval", True, "accept"),
+                ("item/permissions/requestApproval", False, "decline"),
+            ],
+            landed=False,
+            marker=False,
+        )
+        assert s4.verdict == "WARN"
+        assert "DECLINED" in s4.detail
+        assert "does not lift the sandbox" not in s4.detail
+
+    def test_all_approved_and_held_is_the_safe_answer(self) -> None:
+        s4 = self._run(
+            [("item/commandExecution/requestApproval", True, "accept")], landed=False, marker=False
+        )
+        assert s4.verdict == "PASS"
+        assert "does not lift the sandbox" in s4.detail
+
+    def test_all_approved_and_landed_is_the_alarming_answer(self) -> None:
+        s4 = self._run(
+            [("item/commandExecution/requestApproval", True, "accept")], landed=True, marker=True
+        )
+        assert s4.verdict == "PASS"
+        assert "alarming" in s4.detail
+
+    def test_nothing_sent_on_the_wire_is_not_an_approval(self) -> None:
+        # wire_decision raised, so the client answered -32601 and nothing went
+        # out. Counting that as an approval is the shape of the original bug.
+        s4 = self._run([("item/tool/call", True, None)], landed=False, marker=False)
+        assert s4.verdict == "WARN"
+        assert "DECLINED" in s4.detail
+
+    def test_a_file_without_the_marker_is_inconclusive(self) -> None:
+        s4 = self._run(
+            [("item/commandExecution/requestApproval", True, "accept")], landed=True, marker=False
+        )
+        assert s4.verdict == "WARN"
+        assert "inconclusive" in s4.detail
