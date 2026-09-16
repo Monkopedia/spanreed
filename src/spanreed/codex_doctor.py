@@ -90,6 +90,19 @@ class Report:
 
     steps: list[Step] = field(default_factory=lambda: [])
     facts: list[str] = field(default_factory=lambda: [])
+    findings: list[str] = field(default_factory=lambda: [])
+    """Material findings, independent of any step's verdict.
+
+    A confirmed sandbox escape is a PASS for step 4 -- the question is "does a
+    real approval round-trip work end to end", and it did -- while being the
+    most alarming thing this tool can discover. Reading the banner off the
+    verdicts put "Everything passed. A Codex worker can run on this machine."
+    four lines under "answered the alarming way", and exited 0.
+
+    It also made the exit code flip on the wrong axis: the same physical escape
+    returned rc 0 when this client had approved something and rc 1 when it had
+    not, though the sandbox failed to stop it in both. A finding is recorded
+    once, by whatever observes it, and the banner and exit code read it."""
     out: TextIO = sys.stdout
 
     def say(self, line: str = "") -> None:
@@ -97,6 +110,11 @@ class Report:
 
     def rule(self, title: str) -> None:
         self.say(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
+
+    def finding(self, line: str) -> None:
+        """Record something the banner must not be able to talk over."""
+        self.findings.append(line)
+        self.say(f"  ** FINDING: {line}")
 
     def fact(self, line: str) -> None:
         """A finding worth surviving truncation. Also printed where it happens."""
@@ -459,6 +477,14 @@ def finish(rep: Report, fh: TextIO, log_path: Path) -> int:
         failures += s.verdict == "FAIL"
 
     rep.say("")
+    if rep.findings:
+        # Above the verdict summary on purpose: a finding outranks the
+        # verdicts, because a step can legitimately PASS while having just
+        # discovered the worst thing this tool looks for.
+        rep.say(f"  {len(rep.findings)} FINDING(S), whatever the verdicts above say:")
+        for line in rep.findings:
+            rep.say(f"    ** {line}")
+        rep.say("")
     if failures:
         rep.say(f"  {failures} step(s) FAILED. The first failure is the one to read; the")
         rep.say("  steps after it may have been skipped rather than tested.")
@@ -473,6 +499,10 @@ def finish(rep: Report, fh: TextIO, log_path: Path) -> int:
         detail = ", ".join(f"{s.n} ({s.verdict})" for s in not_passed)
         rep.say(f"  No failures, but step(s) {detail} did not pass.")
         rep.say("  That is not a pass. Read their reasons above before relying on this run.")
+    elif rep.findings:
+        rep.say("  Every step passed, and the findings above still stand. A worker will")
+        rep.say("  RUN on this machine; whether it is confined the way the docs claim is")
+        rep.say("  what the findings answer. Read them before relying on this.")
     else:
         rep.say("  Everything passed. A Codex worker can run on this machine.")
 
@@ -481,7 +511,10 @@ def finish(rep: Report, fh: TextIO, log_path: Path) -> int:
     rep.out.flush()
     if not fh.closed:
         fh.close()
-    return 1 if failures else 0
+    # A finding sets the exit code too, so the same physical escape cannot
+    # return 0 in one run and 1 in another depending on what we happened to
+    # approve. Anything gating on rc gets one answer for one outcome.
+    return 1 if (failures or rep.findings) else 0
 
 
 def _run_protocol_steps(
@@ -764,11 +797,6 @@ def run_escape_probe(
     # -32601 and NOTHING goes on the wire -- counting that as an approval is the
     # same shape as the bug this function was rewritten to fix.
     #
-    # Reaching past the declined branch below therefore means every request in
-    # the turn was approved and answered, so no separate `approved_any` is
-    # needed -- and an earlier version used one to write
-    # `declined_any and not approved_any`, which let a single approval anywhere
-    # erase a decline.
     approved_any = [(m, v) for m, _, ok, v in new if ok and v is not None]
     declined_any = [(m, v) for m, _, ok, v in new if not ok or v is None]
     sent = ", ".join(f"{m}->{v!r}" for m, _, _, v in new) or "nothing"
@@ -783,6 +811,22 @@ def run_escape_probe(
     # exists to capture, which is worse than the unearned "safe" that ordering
     # was written to fix. A decline only tells us the question was not put when
     # nothing escaped anyway.
+    if landed:
+        # The probe was unlinked immediately before the turn, so a file here now
+        # was written DURING it, outside every writable root the policy sent.
+        # That is the finding, and it does not depend on what this client
+        # answered -- the sandbox failed to stop it either way. Recording it
+        # here, once, is what stops the exit code flipping on whether we
+        # happened to approve (round 5, blocker 2).
+        rep.finding(
+            f"a write landed at {probe}, outside every writable root this run sent. "
+            f"The sandbox did not prevent it."
+            + (
+                ""
+                if marker_ok
+                else " The content is NOT this turn's marker, so what wrote it is unconfirmed."
+            )
+        )
     if landed and marker_ok:
         if approved_any:
             s4.ok(
@@ -798,11 +842,23 @@ def run_escape_probe(
                 f"this client approved nothing ({sent}). Neither the sandbox nor the policy "
                 f"here stopped it, so on this path nothing is confining the worker at all."
             )
+    elif landed and not new:
+        # Restores a FAIL the reorder had downgraded to WARN. At the parent this
+        # was the first branch and did not require the marker; `elif landed`
+        # caught it first and called it "something else wrote there", which is
+        # weaker than the evidence supports -- the probe is unlinked immediately
+        # before the turn, so the file appeared during it, and nothing was asked.
+        s4.no(
+            "a write landed at the probe path and the server never asked. Nothing "
+            "consulted this client and the sandbox did not stop it. The content is not "
+            "this turn's marker, so what wrote it is unconfirmed -- but something wrote "
+            "outside every writable root during this turn."
+        )
     elif landed:
         s4.warn(
             f"a file exists at the probe path WITHOUT the expected marker (sent: {sent}). "
-            f"Something else wrote there; treat this run as inconclusive rather than as "
-            f"either answer."
+            f"It appeared during this turn -- the probe is unlinked immediately before -- "
+            f"so treat the content as unconfirmed rather than the escape as unreal."
         )
     elif not new:
         s4.warn(

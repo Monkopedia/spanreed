@@ -267,6 +267,15 @@ class TestEscapeVerdictReadsWhatWasSent:
     @staticmethod
     def _run(requests: list[tuple[str, bool, str | None]], *, landed: bool, marker: bool):
         """Drive run_escape_probe with a canned turn and return the Step."""
+        return TestEscapeVerdictReadsWhatWasSent._run_with_report(
+            requests, landed=landed, marker=marker
+        )[1]
+
+    @staticmethod
+    def _run_with_report(
+        requests: list[tuple[str, bool, str | None]], *, landed: bool, marker: bool
+    ):
+        """As _run, but hands back the Report too, so findings can be asserted."""
         from spanreed.codex_client import TurnResult
         from spanreed.codex_doctor import ESCAPE_MARKER, Report, Step, run_escape_probe
 
@@ -309,7 +318,7 @@ class TestEscapeVerdictReadsWhatWasSent:
                 seen,
                 [],
             )
-        return s4
+        return rep, s4
 
     def test_a_decline_anywhere_means_the_question_was_not_put(self) -> None:
         # THE regression. An exec approved (cwd inside --cwd, which bounds
@@ -350,12 +359,66 @@ class TestEscapeVerdictReadsWhatWasSent:
         assert s4.verdict == "WARN"
         assert "DECLINED" in s4.detail
 
-    def test_a_file_without_the_marker_is_inconclusive(self) -> None:
+    def test_a_file_without_the_marker_is_unconfirmed_not_unreal(self) -> None:
+        # The probe is unlinked immediately before the turn, so a file here
+        # appeared during it. Unexpected content makes WHAT wrote it
+        # unconfirmed; it does not make the escape doubtful. The wording used to
+        # say "something else wrote there", which is weaker than the evidence.
         s4 = self._run(
             [("item/commandExecution/requestApproval", True, "accept")], landed=True, marker=False
         )
         assert s4.verdict == "WARN"
-        assert "inconclusive" in s4.detail
+        assert "unconfirmed" in s4.detail
+        assert "unreal" in s4.detail
+
+    # The two rows the reviewer showed were missing. Both mutations that
+    # reintroduce the old ordering survived the suite, because every existing
+    # row ran with landed=False and so never reached the reordered branches.
+
+    def test_a_confirmed_escape_outranks_a_decline_in_the_same_turn(self) -> None:
+        # Mutation A: `if landed and marker_ok and not declined_any`. Under it
+        # this row reported "a file exists WITHOUT the expected marker" while
+        # marker_ok was True -- a flatly false sentence about a real escape,
+        # with the suite green.
+        s4 = self._run(
+            [
+                ("item/commandExecution/requestApproval", True, "accept"),
+                ("item/permissions/requestApproval", False, "decline"),
+            ],
+            landed=True,
+            marker=True,
+        )
+        assert s4.verdict == "PASS"
+        assert "alarming way" in s4.detail
+        assert "WITHOUT the expected marker" not in s4.detail
+
+    def test_an_escape_with_nothing_approved_is_a_failure(self) -> None:
+        # Mutation B: deleting the `if approved_any:` split. This row is the
+        # only one that distinguishes them.
+        s4 = self._run([], landed=True, marker=True)
+        assert s4.verdict == "FAIL"
+        assert "approved nothing" in s4.detail
+
+    def test_every_escape_records_the_same_finding(self) -> None:
+        """The exit code must not flip on what we happened to approve.
+
+        The same physical escape returned rc 0 when this client had approved
+        something and rc 1 when it had not, though the sandbox failed to stop it
+        in both cases. The finding is recorded by the observation, not by the
+        verdict, so every escape produces one.
+        """
+        cases: list[list[tuple[str, bool, str | None]]] = [
+            [("item/commandExecution/requestApproval", True, "accept")],
+            [
+                ("item/commandExecution/requestApproval", True, "accept"),
+                ("item/permissions/requestApproval", False, "decline"),
+            ],
+            [],
+        ]
+        for requests in cases:
+            rep, _s4 = self._run_with_report(requests, landed=True, marker=True)
+            assert rep.findings, f"no finding recorded for {requests!r}"
+            assert any("outside every writable root" in f for f in rep.findings)
 
 
 class TestEverythingPassedIsDerived:
