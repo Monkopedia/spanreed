@@ -84,6 +84,18 @@ failure path for mail that was in fact queued and will be delivered on restart �
 it discards stderr, the line explaining that is lost with it. Treat exit 3 as *queued*,
 not as failed; exit 2 is the only status that means nothing was written.
 
+**If you pin `mcp`, `uv tool upgrade` will silently do nothing useful.** This release
+requires `mcp>=2.0,<3`; `0.0.9` was the last release accepting `mcp<2`. With a 1.x `mcp`
+pinned, uv resolves to the newest *compatible* `spanreed-bus` — 0.0.9 — and reports a
+successful upgrade. Check with `uv tool list`; if it does not say `v0.2.0`:
+
+```bash
+uv tool list --show-with --show-version-specifiers   # find the pin
+uv tool install --force spanreed-bus                  # reinstall without it
+```
+
+Otherwise:
+
 ```bash
 uv tool upgrade spanreed-bus
 ```
