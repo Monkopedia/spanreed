@@ -10,6 +10,7 @@ the *same* worker wiring.
 
 from __future__ import annotations
 
+import io
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from spanreed.codex_client import CodexClient
 from spanreed.codex_worker import CodexWorker, WorkerConfig
 from spanreed.store import StateStore
 from tests.unit.test_codex_client import Handler, StubServer
-from tests.unit.test_codex_worker import MakeWorker, app_server
+from tests.unit.test_codex_worker import FakeTerminal, MakeWorker, app_server
 
 
 @pytest.fixture
@@ -45,6 +46,16 @@ def make_worker(tmp_path: Path, store: StateStore, worker_cwd: Path) -> Iterator
         handler: Handler | None = None, *, start: bool = True, **config_kw: Any
     ) -> tuple[StubServer, CodexWorker]:
         counter[0] += 1
+        # The ask-mode terminal. Split out of config_kw because these are
+        # CodexWorker arguments, not WorkerConfig fields, and defaulted here so
+        # that every ask-mode test does not have to remember: a worker built
+        # with the REAL stdin would either refuse to start (no TTY under pytest)
+        # or block the suite forever on the first approval. A test that wants
+        # either of those passes its own stream.
+        prompt_in = config_kw.pop("prompt_in", None)
+        prompt_out = config_kw.pop("prompt_out", None)
+        if config_kw.get("mode") == "ask" and prompt_in is None:
+            prompt_in = FakeTerminal()  # a terminal that answers nothing: EOF
         stub = StubServer(
             tmp_path / f"worker-stub-{counter[0]}.sock",
             handler if handler is not None else app_server(),
@@ -72,6 +83,8 @@ def make_worker(tmp_path: Path, store: StateStore, worker_cwd: Path) -> Iterator
             client_factory=factory,
             log_stream=None,
             poll_interval=0.3,
+            prompt_in=prompt_in,
+            prompt_out=prompt_out if prompt_out is not None else io.StringIO(),
         )
         workers.append(worker)
         if start:

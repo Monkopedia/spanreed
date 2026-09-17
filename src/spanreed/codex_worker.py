@@ -8,11 +8,13 @@ can: the lifecycle, the inbox→turn→reply loop, and the log.
 
 The shape, restated from the doc because every line below depends on it:
 
-1. ``--cwd`` is **required and has no default**. Auto-approval plus
-   any-registered-sender means an unauthenticated inbox write becomes code
-   execution, and ``--cwd`` is the only thing bounding it. The machine this was
-   validated on marks all of ``$HOME`` trusted, so *any* inherited default hands
-   over the whole home directory.
+1. ``--cwd`` is **required and has no default**. In ``--mode auto`` the
+   worker approves on behalf of an unauthenticated sender, and ``--cwd`` is
+   what those approvals are checked against and what is sent as
+   ``writableRoots``. It is not a bound this project claims Codex enforces
+   (``architecture.md``, "What spanreed does NOT claim"). The machine this was
+   validated on marks all of ``$HOME`` trusted, so *any* inherited default
+   hands over the whole home directory.
 2. One thread for the worker's life, one turn per message, FIFO. Senders may
    wait; Codex's native ``steer`` is not used, because a steered turn produces
    one reply for two senders' messages and the bus cannot express that.
@@ -23,6 +25,12 @@ The shape, restated from the doc because every line below depends on it:
    ``<state_root>/codex/<name>.log``. An auto-approved command that appears
    nowhere is precisely the one that cannot be reviewed. Credentials are never
    logged — see :meth:`CodexWorker.refresh_auth_tokens`.
+5. ``--mode`` mirrors Codex's own three permission modes — ``ask``, ``auto``
+   (the default), ``full`` — and **both sandbox levels are sent**: the
+   ``SandboxMode`` enum on ``thread/start`` and the ``SandboxPolicy`` object on
+   every ``turn/start``. In ``ask`` the approvals go to the operator on this
+   process's terminal and block there with no timeout, which is why that mode
+   refuses to start without a TTY (:func:`no_terminal_for_ask`).
 
 Two things here are *not* in the doc and are implemented anyway, because the
 doc's claim was wrong:
@@ -49,7 +57,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO, cast
@@ -62,8 +70,10 @@ from spanreed.codex_approvals import (
     EXEC_COMMAND_APPROVAL_V2,
     MODES,
     PERMISSIONS_APPROVAL_V2,
+    Decision,
     approval_policy,
     decide,
+    sandbox_mode,
     sandbox_policy,
     wire_decision,
 )
@@ -118,17 +128,12 @@ the spike (``findings.md``, test 5) — this name is empirical, not schema'd."""
 THREAD_STATUS_CHANGED = "thread/status/changed"
 RATE_LIMITS_UPDATED = "account/rateLimits/updated"
 
-SANDBOX_MODES = {
-    # thread/start takes `sandbox`, which is a *SandboxMode enum*, while
-    # turn/start takes `sandboxPolicy`, which is the *SandboxPolicy object*
-    # codex_approvals.sandbox_policy() builds. Different parameter, different
-    # type, same concept — checked in ClientRequest.json rather than guessed,
-    # because sending the object under the enum's name is exactly the kind of
-    # mistake app-server accepts and ignores.
-    "workspace": "workspace-write",
-    "danger": "danger-full-access",
-}
-"""``--mode`` → ``SandboxMode``, the enum ``thread/start`` accepts."""
+# The ``--mode`` -> SandboxMode table lives in codex_approvals now
+# (``SANDBOX_MODES`` / :func:`sandbox_mode`), beside the SandboxPolicy object
+# that rides on turn/start. Both levels are sent, they are different parameters
+# with different types, and --doctor needs the same table: a second copy here is
+# how the doctor came to send no `sandbox` at all while reporting that it used
+# the worker's real params.
 
 OBSERVED_STATUS: dict[str, Status] = {
     # `thread/status/changed` reports the thread's own active/idle transitions.
@@ -142,14 +147,38 @@ OBSERVED_STATUS: dict[str, Status] = {
 """Codex thread status → bus status. Shape unverified; unknown values are logged
 and ignored rather than guessed at."""
 
-DANGER_BANNER = (
-    "!!! DANGER MODE: sandbox=danger-full-access, approvalPolicy=never. This worker runs "
-    "commands with NO confinement, on behalf of ANY registered agent, and the bus does not "
-    "authenticate senders. --cwd bounds nothing in this mode. !!!"
+FULL_ACCESS_BANNER = (
+    "!!! MODE=full: sandbox=danger-full-access, approvalPolicy=never. This worker runs "
+    "commands with NO confinement and asks NOBODY anything, on behalf of ANY registered "
+    "agent, and the bus does not authenticate senders. --cwd bounds nothing in this mode. !!!"
 )
 """Shown at startup and again on every single turn — the owner's explicit choice
-was that ``--mode danger`` stays allowed with any sender *provided* the warning
-is impossible to miss."""
+was that ``--mode full`` stays allowed with any sender *provided* the warning is
+impossible to miss. (It was called ``--mode danger`` until the modes were made
+to mirror Codex's own three; the behaviour is the same one, under the name Codex
+uses for it.)"""
+
+ASK_BLOCKED_NOTICE = (
+    "THE WORKER IS BLOCKED AND WILL WAIT HERE INDEFINITELY. Nothing else runs until you "
+    "answer: the turn is stopped mid-flight and every message queued behind it waits too. "
+    "There is no timeout and nothing is declined on your behalf."
+)
+"""Printed on the terminal above every ``ask``-mode prompt.
+
+Both halves are owner decisions (2026-09-17): the prompt waits indefinitely
+rather than auto-declining, and the cost of that — one unanswered prompt stalls
+the worker and its whole queue — is said out loud rather than discovered."""
+
+ASK_NO_TTY = (
+    "--mode ask needs a terminal to ask at, and this process's stdin is not a TTY. "
+    "Every approval in ask mode is put to the operator on this terminal and waits "
+    "indefinitely for a y/n answer, so a worker started this way would block on its first "
+    "approval forever while still looking healthy in the registry — the silent wedge this "
+    "project has paid for more than once. Run it attached to a terminal, or start it with "
+    "--mode auto (the worker answers approvals itself, inside --cwd) or --mode full "
+    "(nothing is asked at all)."
+)
+"""Why an ``ask`` worker refuses to start without a TTY. See :func:`no_terminal_for_ask`."""
 
 _BUS_PREAMBLE = """\
 You are a Spanreed bus worker named {name}. You have no human attached and no terminal.
@@ -186,13 +215,15 @@ per round produced the next one:
 The history is worth keeping because the same defect returned four times, each
 in a branch the previous round had not read. It started as one unconditional
 sentence claiming writes outside ``--cwd`` are declined before they reach the
-model -- false in ``danger``, where nothing is ever asked, and false in
-``workspace`` too, where the check never reads what a command targets. Each
+model -- false in what is now ``full``, where nothing is ever asked, and false
+in the confined modes too, where the check never reads what a command targets.
+(The modes were called ``workspace`` and ``danger`` then; they mirror Codex's
+own names now, and the defect was never about the naming.) Each
 round fixed the branch under discussion and shipped the next one. The rule that
 came out of it is the one above: say what is sent, and let the guards in
 ``tests/unit/test_codex_worker.py`` decide whether a new sentence is allowed."""
 
-_BOUNDARY_CONFINED = """\
+_BOUNDARY_AUTO = """\
 You work in {cwd}. The worker asks Codex for a workspaceWrite sandbox scoped to that
 directory, so writes outside it are expected to be refused by the sandbox.
 
@@ -201,14 +232,34 @@ runs in, never by what the command does, so `rm -rf /somewhere/else` run from {c
 approved. Stay inside {cwd} by your own judgement; the approval you get is not a statement
 that what you asked for is safe."""
 
-_BOUNDARY_DANGER = """\
+_BOUNDARY_ASK = """\
+You work in {cwd}. The worker asks Codex for a workspaceWrite sandbox scoped to that
+directory, so writes outside it are expected to be refused by the sandbox.
+
+Approvals in this mode are put to a HUMAN at the worker's own terminal, one at a time, and
+the worker waits for an answer with no timeout. An approval is therefore expensive: it
+stops your turn and every message queued behind it until a person reads the request. Ask
+for what you need and no more, and make each request legible on its own — the person
+answering sees the command or the paths and little else."""
+
+_BOUNDARY_FULL = """\
 You are running with NO SANDBOX (dangerFullAccess) and approvals set to never, so nothing
 constrains you to {cwd} or to anything else on this machine. Confine yourself to {cwd} by
 your own judgement: the operator was warned, but no mechanism will stop you."""
 
+ANSWERED_BY = {
+    # Rule 7, visibility over hiding: the startup line says who will answer the
+    # approvals this worker is about to start generating, in words, rather than
+    # leaving it to be inferred from an approvalPolicy value.
+    "ask": "THE OPERATOR, on this terminal (the worker blocks until answered)",
+    "auto": "the worker itself, from --cwd; every decision is logged below",
+    "full": "NOBODY -- approvalPolicy is never, so none is requested",
+}
+
 BOUNDARY_BY_MODE = {
-    "workspace": _BOUNDARY_CONFINED,
-    "danger": _BOUNDARY_DANGER,
+    "ask": _BOUNDARY_ASK,
+    "auto": _BOUNDARY_AUTO,
+    "full": _BOUNDARY_FULL,
 }
 
 
@@ -233,7 +284,7 @@ class WorkerConfig:
     cwd: Path
     model: str | None = None
     effort: str | None = None
-    mode: str = "workspace"
+    mode: str = "auto"
     instructions: str | None = None
 
     def __post_init__(self) -> None:
@@ -285,6 +336,40 @@ class InboxUnreadable(RuntimeError):
     nothing new, ingesting nothing — the exact shape of issue #55, which cost a
     human three days. Stopping with the reason named is the lesser failure.
     """
+
+
+class NoTerminalForAskMode(RuntimeError):
+    """``--mode ask`` was asked for where there is nobody to ask.
+
+    Carries :data:`ASK_NO_TTY` as its message. A refusal at startup rather than
+    a warning, because the alternative is a worker that registers, reports
+    ``idle``, accepts mail, and then blocks forever on its first approval with
+    no way to answer it — healthy-looking and completely stuck.
+    """
+
+
+def no_terminal_for_ask(mode: str, stdin: TextIO | None = None) -> str | None:
+    """Why ``mode`` cannot run here, or ``None`` if it can.
+
+    One predicate, two callers: the CLI refuses before anything is spawned (so
+    the operator gets a sentence on stderr, not a traceback), and
+    :meth:`CodexWorker.start` refuses again for anyone driving the worker as a
+    library. Duplicating the check would let the two disagree.
+
+    Only ``ask`` needs a terminal. ``auto`` answers approvals itself and
+    ``full`` is never asked, so both run headless — which is the normal case
+    for a worker, and why this is a per-mode question rather than a global one.
+    """
+    if mode != "ask":
+        return None
+    stream = stdin if stdin is not None else sys.stdin
+    try:
+        interactive = stream is not None and stream.isatty()
+    except (AttributeError, OSError, ValueError):
+        # A closed or detached stdin raises rather than answering False. Either
+        # way there is no terminal, which is the answer we needed.
+        interactive = False
+    return None if interactive else ASK_NO_TTY
 
 
 class WorkerLog:
@@ -392,11 +477,20 @@ class CodexWorker:
         client_factory: ClientFactory = default_client_factory,
         log_stream: TextIO | None = sys.stderr,
         poll_interval: float = 0.5,
+        prompt_out: TextIO | None = None,
+        prompt_in: TextIO | None = None,
     ) -> None:
         self.config = config
         self.store = store if store is not None else StateStore()
         self.log = WorkerLog(config.log_path, log_stream)
         self.poll_interval = poll_interval
+        # The ask-mode terminal, kept separate from the log's stream: the log
+        # may be silenced (tests pass log_stream=None) and a prompt nobody sees
+        # is a worker that hangs. Defaulted lazily to sys.stderr/sys.stdin so a
+        # test -- or a caller that reassigns them -- gets the stream that is
+        # actually current rather than whichever one existed at construction.
+        self._prompt_out = prompt_out
+        self._prompt_in = prompt_in
         self.client = client_factory(self.handle_server_request, self.handle_notification)
         # Not a factory argument: every caller's factory would have to grow a
         # parameter to route faults that the client already captures anyway.
@@ -417,18 +511,30 @@ class CodexWorker:
         nowhere to go.
         """
         config = self.config
+        refusal = no_terminal_for_ask(config.mode, self._prompt_in)
+        if refusal is not None:
+            # Before connect(), before registration: nothing is spawned and
+            # nothing is left behind. The CLI refuses earlier still; this is
+            # the check for anyone driving the worker as a library.
+            self.log.write(f"[codex-worker] REFUSING TO START: {refusal}")
+            raise NoTerminalForAskMode(refusal)
         self.log.write(
             f"[codex-worker] starting {config.agent_id} ({config.name}) "
             f"cwd={config.cwd} mode={config.mode} "
             f"model={config.model or '(server default)'} effort={config.effort or '(server default)'}"
         )
         self.log.write(
-            f"[codex-worker] sandbox={SANDBOX_MODES[config.mode]} "
-            f"approvalPolicy={approval_policy(config.mode)} "
+            # Both sandbox levels, and the approval policy as JSON rather than
+            # as a repr: in ask mode approvalPolicy is the granular OBJECT, and
+            # the log is where an operator checks what was actually sent.
+            f"[codex-worker] sandbox={sandbox_mode(config.mode)} (thread/start) "
+            f"sandboxPolicy={_render(sandbox_policy(config.cwd, config.mode))} (every turn/start) "
+            f"approvalPolicy={_render(approval_policy(config.mode))} "
+            f"approvals answered by={ANSWERED_BY[config.mode]} "
             f"log={self.log.path}"
         )
-        if config.mode == "danger":
-            self.log.write(DANGER_BANNER)
+        if config.mode == "full":
+            self.log.write(FULL_ACCESS_BANNER)
         if not os.access(config.cwd, os.W_OK):
             # A warning, not a refusal: a worker that only reads is legitimate,
             # and nothing here decides what the sandbox permits. But every file
@@ -449,7 +555,7 @@ class CodexWorker:
             # `sandbox`, NOT `sandboxPolicy`: thread/start's parameter is the
             # SandboxMode enum. The policy *object* (with writableRoots scoped
             # to --cwd) rides on every turn/start instead — see _turn_params.
-            "sandbox": SANDBOX_MODES[config.mode],
+            "sandbox": sandbox_mode(config.mode),
             "developerInstructions": self._developer_instructions(),
         }
         if config.model:
@@ -492,6 +598,15 @@ class CodexWorker:
         """
         try:
             self.start()
+        except NoTerminalForAskMode as exc:
+            # Not routed through the FAILED TO START arm below: that one prints
+            # the app-server's output and its exit status, and here there is no
+            # app-server -- nothing was spawned. A page of empty server capture
+            # under a one-line configuration error is how a diagnosable refusal
+            # reads as a crash.
+            print(f"spanreed codex: {exc}", file=sys.stderr, flush=True)
+            self.close()
+            return 1
         except Exception as exc:
             # The spawned server's own output is usually the whole diagnosis
             # ("no such subcommand", a config error, a missing login), and it
@@ -622,10 +737,10 @@ class CodexWorker:
         self.log.write(
             f"[codex-worker] TURN for {message.msg_id} from {message.from_agent}: {preview}"
         )
-        if config.mode == "danger":
+        if config.mode == "full":
             # Every turn, not just at startup: a log the owner scrolls through
             # must say what mode the command they are reading ran under.
-            self.log.write(DANGER_BANNER)
+            self.log.write(FULL_ACCESS_BANNER)
         if not config.cwd.is_dir():
             # The directory this worker checks approvals against, and asks Codex
             # to sandbox, is gone. Running the turn anyway would mean approving
@@ -715,6 +830,8 @@ class CodexWorker:
             return self.refresh_auth_tokens(params)
         if method in APPROVAL_METHODS:
             decision = decide(self.config.cwd, method, params)
+            if self.config.mode == "ask":
+                decision = self.ask_operator(decision)
             self.log.write(decision.log_line())
             return {"decision": wire_decision(method, decision.approved)}
         if method == ELICITATION_REQUEST:
@@ -809,6 +926,106 @@ class CodexWorker:
             f"{account} (token value not logged, here or anywhere)"
         )
         return {"accessToken": access, "chatgptAccountId": account}
+
+    def ask_operator(self, decision: Decision) -> Decision:
+        """Put one approval to the operator on the terminal, and wait. Forever.
+
+        ``ask`` mode's whole shape, and both halves are owner decisions
+        (2026-09-17, ``architecture.md``):
+
+        - **The prompt goes to the terminal, never to the bus.** The bus is for
+          work; an approval stream on it would drown the messages it exists to
+          carry, and the peer whose mail triggered this has no standing to
+          answer it anyway.
+        - **It waits indefinitely.** No timeout and no auto-decline: nothing is
+          refused on the operator's behalf. The cost — this turn and every
+          message behind it are stopped until a person answers — is printed
+          above the prompt rather than left to be discovered.
+
+        The worker's own verdict from :func:`decide` is shown as *information*
+        and then overridden either way: in this mode the operator decides, and
+        a prompt that only offered to confirm a decline would be a different
+        feature. The returned :class:`Decision` carries the operator's answer
+        and a reason naming them, so it reaches the approval log through the
+        same line as every other decision.
+        """
+        out = self._prompt_out if self._prompt_out is not None else sys.stderr
+        stdin = self._prompt_in if self._prompt_in is not None else sys.stdin
+        worker_view = "APPROVE" if decision.approved else "DECLINE"
+        self.log.write(
+            f"[codex-worker] ASK MODE: PUTTING {decision.method} TO THE OPERATOR and "
+            f"blocking until it is answered. subject={decision.subject} "
+            f"(the worker's own view would have been {worker_view}: {decision.reason})"
+        )
+        print(
+            f"\n{'=' * 78}\n"
+            f"[codex-worker {self.config.name}] CODEX IS ASKING PERMISSION.\n"
+            f"{ASK_BLOCKED_NOTICE}\n\n"
+            f"  request  : {decision.method}\n"
+            f"  subject  : {decision.subject}\n"
+            f"  --cwd    : {self.config.cwd}\n"
+            f"  the worker's own view, for information only: {worker_view}\n"
+            f"      {decision.reason}\n"
+            f"{'=' * 78}",
+            file=out,
+            flush=True,
+        )
+        blocked_from = time.monotonic()
+        answer = self._read_yes_or_no(out, stdin)
+        # The operator's thinking time is not the server going quiet, and the
+        # turn's deadline is a measure of the latter. Without this the worker
+        # would take the answer and then tell the sender the turn never
+        # finished, because the clock ran while a person read the prompt.
+        self.client.credit_deadline(time.monotonic() - blocked_from)
+        if answer is None:
+            # Not a timeout -- there is none. The terminal went away: stdin hit
+            # EOF, so there is no longer anybody to ask and no amount of waiting
+            # produces one. Declining is the closed answer and it is said in
+            # full, because an operator who reads this line later must be able
+            # to tell it from an answer they gave.
+            reason = (
+                f"DECLINED WITHOUT BEING ASKED: the worker's terminal went away (stdin "
+                f"reached EOF) while --mode ask was waiting for a y/n answer, so there is "
+                f"nobody left to ask. This is not a timeout and not the operator's answer. "
+                f"The worker's own view was {worker_view}: {decision.reason}"
+            )
+            self.log.write(f"[codex-worker] ASK MODE: {reason}")
+            print(f"[codex-worker {self.config.name}] {reason}", file=out, flush=True)
+            return replace(decision, approved=False, reason=reason)
+        verdict = "APPROVED" if answer else "DECLINED"
+        reason = (
+            f"{verdict} BY THE OPERATOR at the worker's terminal (--mode ask). The "
+            f"worker's own view was {worker_view}: {decision.reason}"
+        )
+        self.log.write(f"[codex-worker] ASK MODE: the operator answered {verdict}")
+        return replace(decision, approved=answer, reason=reason)
+
+    def _read_yes_or_no(self, out: TextIO, stdin: TextIO) -> bool | None:
+        """Read until the operator says yes or no. ``None`` means stdin ended.
+
+        Anything that is not a yes or a no is re-asked rather than guessed at:
+        a stray newline in a terminal the operator is also typing into must not
+        become an approval.
+        """
+        while True:
+            print("Approve this? [y/n]: ", file=out, end="", flush=True)
+            try:
+                line = stdin.readline()
+            except (OSError, ValueError):
+                return None
+            if line == "":
+                return None  # EOF: no operator, no answer
+            answer = line.strip().lower()
+            if answer in ("y", "yes"):
+                return True
+            if answer in ("n", "no"):
+                return False
+            print(
+                f"[codex-worker {self.config.name}] {answer!r} is not an answer; "
+                f"type y to approve or n to decline. The worker is still blocked.",
+                file=out,
+                flush=True,
+            )
 
     # -- internals ---------------------------------------------------------
 
@@ -980,8 +1197,13 @@ def _turn_input(message: Message) -> str:
     )
 
 
-def _render(params: dict[str, Any], limit: int = 400) -> str:
-    """One-line JSON for the log, truncated loudly rather than silently."""
+def _render(params: Any, limit: int = 400) -> str:
+    """One-line JSON for the log, truncated loudly rather than silently.
+
+    Takes anything, not only an object: ``approvalPolicy`` is a string in two
+    modes and the granular *object* in the third, and the line that reports what
+    was sent cannot assume either.
+    """
     try:
         text = json.dumps(params, default=str)
     except (TypeError, ValueError):  # pragma: no cover - default=str takes everything

@@ -12,8 +12,11 @@ wrong:
 
 - ``--cwd`` missing → refuse. It is the only bound on an unauthenticated
   sender's ability to run commands.
-- ``--mode danger`` → warn at startup **and on every turn**. The owner allowed
+- ``--mode full`` → warn at startup **and on every turn**. The owner allowed
   the mode on condition the warning is impossible to miss.
+- ``--mode ask`` → refuse to start without a TTY, then prompt on the terminal
+  and block there. A worker with nobody to ask blocks forever while looking
+  healthy in the registry.
 - approvals → both outcomes in the log file. An auto-approved command that
   appears nowhere is the one that cannot be reviewed.
 - ``effort`` → on ``turn/start``, never on ``thread/start``, which accepts it
@@ -27,8 +30,10 @@ wrong:
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -36,17 +41,20 @@ from typing import Any
 import pytest
 
 from spanreed import cli
-from spanreed.codex_approvals import CONFINED_MODES, MODES
+from spanreed.codex_approvals import CONFINED_MODES, MODES, SANDBOX_MODES
 from spanreed.codex_worker import (
     AGENT_MESSAGE_DELTA,
+    ANSWERED_BY,
+    ASK_BLOCKED_NOTICE,
     AUTH_TOKENS_REFRESH,
     BOUNDARY_BY_MODE,
-    DANGER_BANNER,
+    FULL_ACCESS_BANNER,
     RATE_LIMITS_UPDATED,
-    SANDBOX_MODES,
     THREAD_STATUS_CHANGED,
     CodexWorker,
+    NoTerminalForAskMode,
     WorkerConfig,
+    no_terminal_for_ask,
 )
 from spanreed.protocol import Message
 from spanreed.store import StateStore
@@ -92,6 +100,38 @@ def app_server(turn: TurnStream | None = None) -> Handler:
             stub.reply(msg["id"], {"ok": method})
 
     return handler
+
+
+class FakeTerminal(io.StringIO):
+    """A stdin that claims to be a terminal and answers a scripted queue.
+
+    ``ask`` mode reads from stdin and blocks there forever, so a test cannot use
+    the real one: a wrong answer here is a hung suite rather than a failure.
+    Exhausting the queue is EOF, which is also the "the operator's terminal went
+    away" case the worker has to survive — one object covers both because they
+    are the same event.
+    """
+
+    def __init__(self, *answers: str) -> None:
+        super().__init__("".join(f"{answer}\n" for answer in answers))
+
+    def isatty(self) -> bool:
+        return True
+
+
+GRANULAR: dict[str, Any] = {
+    # The granular AskForApproval object `ask` sends, written out here rather
+    # than imported from the code it checks: a test that asserts a constant
+    # equals itself cannot fail. The schema-conformance test below is the other
+    # half -- this pins what is SENT, that one pins that it is LEGAL.
+    "granular": {
+        "sandbox_approval": True,
+        "mcp_elicitations": True,
+        "rules": True,
+        "request_permissions": False,
+        "skill_approval": False,
+    }
+}
 
 
 def frames(stub: StubServer, method: str) -> list[dict[str, Any]]:
@@ -165,6 +205,18 @@ class TestCwdIsRequired:
         with pytest.raises(ValueError, match="--mode"):
             WorkerConfig(name="reviewer", cwd=worker_cwd, mode="yolo")
 
+    def test_the_retired_mode_names_are_refused_rather_than_silently_accepted(
+        self, worker_cwd: Path
+    ) -> None:
+        """`workspace` and `danger` were the names until the modes were made to
+        mirror Codex's own. A stale invocation must fail loudly rather than fall
+        through to a default -- `danger` silently becoming `auto` would confine a
+        worker its operator believes is unconfined, and `workspace` silently
+        becoming `auto` is the harmless direction of the same defect."""
+        for retired in ("workspace", "danger"):
+            with pytest.raises(ValueError, match="--mode"):
+                WorkerConfig(name="reviewer", cwd=worker_cwd, mode=retired)
+
 
 # ------------------------------------------------------------------ startup
 
@@ -185,18 +237,37 @@ class TestStartup:
         assert params["cwd"] == str(_worker.config.cwd)
 
     @pytest.mark.parametrize(
-        ("mode", "sandbox", "policy"),
+        ("mode", "sandbox", "policy", "sandbox_policy_type"),
         [
-            ("workspace", "workspace-write", "on-request"),
-            ("danger", "danger-full-access", "never"),
+            ("ask", "workspace-write", GRANULAR, "workspaceWrite"),
+            ("auto", "workspace-write", "on-request", "workspaceWrite"),
+            ("full", "danger-full-access", "never", "dangerFullAccess"),
         ],
     )
-    def test_mode_maps_to_the_schema_values(
-        self, make_worker: MakeWorker, mode: str, sandbox: str, policy: str
+    def test_mode_maps_to_the_schema_values_at_BOTH_levels(
+        self,
+        make_worker: MakeWorker,
+        store: StateStore,
+        mode: str,
+        sandbox: str,
+        policy: Any,
+        sandbox_policy_type: str,
     ) -> None:
-        stub, _worker = make_worker(mode=mode)
+        """Both sandbox levels, per mode, in one place.
+
+        `sandbox` (the SandboxMode enum on thread/start) and `sandboxPolicy`
+        (the SandboxPolicy object on turn/start) are different parameters, and a
+        run on 2026-09-17 measured the turn-level object ALONE confining
+        nothing. A test that checked only the thread level would have passed
+        against a worker that sent no policy at all, and vice versa.
+        """
+        stub, worker = make_worker(mode=mode)
         params = params_of(stub, "thread/start")
         assert (params["sandbox"], params["approvalPolicy"]) == (sandbox, policy)
+        register_sender(store)
+        mail(store, worker, "one")
+        worker.run(max_polls=1)
+        assert params_of(stub, "turn/start")["sandboxPolicy"]["type"] == sandbox_policy_type
 
     def test_instructions_are_additive_developer_instructions(
         self, make_worker: MakeWorker
@@ -231,28 +302,271 @@ class TestStartup:
         assert len(frames(stub, "thread/start")) == 1
 
 
-class TestDangerMode:
-    """`--mode danger` is allowed with any sender, but must warn loudly — at
-    startup *and* on every turn. That was the owner's explicit choice."""
+class TestFullMode:
+    """`--mode full` is allowed with any sender, but must warn loudly — at
+    startup *and* on every turn. That was the owner's explicit choice, and it
+    survived the rename from `danger`: the mode is Codex's, the warning is
+    this project's."""
 
     def test_warns_at_startup(self, make_worker: MakeWorker) -> None:
-        _stub, worker = make_worker(mode="danger")
-        assert DANGER_BANNER in log_of(worker)
-        assert "DANGER MODE" in log_of(worker)
+        _stub, worker = make_worker(mode="full")
+        assert FULL_ACCESS_BANNER in log_of(worker)
+        assert "MODE=full: sandbox=danger-full-access, approvalPolicy=never" in log_of(worker)
 
     def test_warns_again_on_every_turn(self, make_worker: MakeWorker, store: StateStore) -> None:
-        _stub, worker = make_worker(mode="danger")
+        _stub, worker = make_worker(mode="full")
         register_sender(store)
         mail(store, worker, "first")
         mail(store, worker, "second")
         worker.run(max_polls=1)
         # Once at startup, once per turn: a log the owner scrolls through must
         # say what mode the command they are reading ran under.
-        assert log_of(worker).count(DANGER_BANNER) == 3
+        assert log_of(worker).count(FULL_ACCESS_BANNER) == 3
 
     def test_confined_modes_do_not_warn(self, make_worker: MakeWorker) -> None:
-        _stub, worker = make_worker(mode="workspace")
-        assert "DANGER MODE" not in log_of(worker)
+        for mode in CONFINED_MODES:
+            _stub, worker = make_worker(mode=mode)
+            assert "MODE=full" not in log_of(worker), mode
+
+
+class TestAskModeNeedsATerminal:
+    """`ask` refuses to start where there is nobody to ask (owner, 2026-09-17).
+
+    The failure it prevents is the one this project keeps paying for: the worker
+    would register, report `idle`, accept mail, and then block on its first
+    approval forever — with no timeout, because not-auto-declining is the other
+    half of the same decision. Healthy in the registry, wedged in fact.
+    """
+
+    def test_the_predicate_answers_per_mode(self) -> None:
+        # Only `ask` needs one: `auto` answers approvals itself and `full` is
+        # never asked, so both are legitimately headless — which is the normal
+        # way a worker runs.
+        assert no_terminal_for_ask("ask", io.StringIO()) is not None
+        assert no_terminal_for_ask("ask", FakeTerminal()) is None
+        for headless in ("auto", "full"):
+            assert no_terminal_for_ask(headless, io.StringIO()) is None, headless
+
+    def test_a_closed_stdin_is_not_a_terminal(self) -> None:
+        # A detached or closed stream raises from isatty() rather than
+        # answering False. Letting that escape would turn a refusal into a
+        # traceback on the one machine whose only channel back is a paste.
+        closed = io.StringIO()
+        closed.close()
+        assert no_terminal_for_ask("ask", closed) is not None
+
+    def test_the_worker_refuses_to_start_and_leaves_no_registry_row(
+        self, make_worker: MakeWorker, store: StateStore
+    ) -> None:
+        _stub, worker = make_worker(mode="ask", prompt_in=io.StringIO(), start=False)
+        with pytest.raises(NoTerminalForAskMode):
+            worker.start()
+        assert all(a.agent_id != worker.config.agent_id for a in store.list_agents())
+        assert "REFUSING TO START" in log_of(worker)
+
+    def test_serve_exits_non_zero_with_the_reason_and_no_app_server_dump(
+        self, make_worker: MakeWorker, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Exit 1 and a sentence. NOT through the FAILED TO START arm: nothing
+        was spawned, so that arm's page of empty app-server capture would bury a
+        one-line configuration error under evidence about a process that does
+        not exist."""
+        _stub, worker = make_worker(mode="ask", prompt_in=io.StringIO(), start=False)
+        assert worker.serve() == 1
+        err = capsys.readouterr().err
+        assert "--mode ask needs a terminal to ask at" in err
+        assert "block on its first approval forever while still looking healthy" in err
+        assert "FAILED TO START" not in log_of(worker)
+
+    def test_the_cli_refuses_before_anything_is_spawned(
+        self, worker_cwd: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr("sys.stdin", io.StringIO())
+        assert cli.main(["codex", "--name", "r", "--cwd", str(worker_cwd), "--mode", "ask"]) == 2
+        err = capsys.readouterr().err
+        assert "--mode ask needs a terminal to ask at" in err
+
+    def test_the_cli_runs_ask_when_stdin_is_a_terminal(
+        self, worker_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half: a guard that refuses everything is not a guard. With a
+        terminal present the command gets all the way to connecting to an
+        app-server, and fails there instead — on a connect that is stubbed out,
+        so no `codex` is spawned on a machine that happens to have one."""
+        monkeypatch.setattr("sys.stdin", FakeTerminal())
+
+        def no_server(self: Any) -> dict[str, Any]:
+            raise RuntimeError("stubbed: this test does not spawn a real app-server")
+
+        monkeypatch.setattr("spanreed.codex_client.CodexClient.connect", no_server)
+        assert cli.main(["codex", "--name", "r", "--cwd", str(worker_cwd), "--mode", "ask"]) == 1
+        log = (worker_cwd.parent / "spanreed-state" / "codex" / "r.log").read_text()
+        assert "FAILED TO START" in log, "it did not get as far as the app-server"
+        assert "this test does not spawn a real app-server" in log
+
+
+class TestAskModePromptsTheOperator:
+    """Every approval goes to the terminal, and the operator's answer is the
+    verdict — not a confirmation of the worker's own."""
+
+    def test_a_yes_approves_a_request_the_worker_would_have_declined(
+        self, make_worker: MakeWorker, store: StateStore, worker_cwd: Path, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        out = io.StringIO()
+        stub, worker = make_worker(
+            app_server(_approval_turn(str(worker_cwd), str(outside))),
+            mode="ask",
+            prompt_in=FakeTerminal("y", "y"),
+            prompt_out=out,
+        )
+        register_sender(store)
+        mail(store, worker, "do the thing")
+        worker.run(max_polls=1)
+
+        # Both approved, including the one decide() would have refused for
+        # being outside --cwd: in this mode the operator decides.
+        assert [r["result"]["decision"] for r in stub.client_replies] == ["approved", "approved"]
+        assert "APPROVE execCommandApproval" in log_of(worker)
+        assert "APPROVED BY THE OPERATOR at the worker's terminal" in log_of(worker)
+        # And the operator saw what they were approving.
+        printed = out.getvalue()
+        assert "rm -rf junk" in printed
+        assert "execCommandApproval" in printed
+        assert str(outside) in printed
+
+    def test_a_no_declines_a_request_the_worker_would_have_approved(
+        self, make_worker: MakeWorker, store: StateStore, worker_cwd: Path, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        stub, worker = make_worker(
+            app_server(_approval_turn(str(worker_cwd), str(outside))),
+            mode="ask",
+            prompt_in=FakeTerminal("n", "n"),
+        )
+        register_sender(store)
+        mail(store, worker, "do the thing")
+        worker.run(max_polls=1)
+        assert [r["result"]["decision"] for r in stub.client_replies] == ["abort", "abort"]
+        assert "DECLINED BY THE OPERATOR at the worker's terminal" in log_of(worker)
+
+    def test_the_prompt_says_the_worker_and_its_queue_are_blocked(
+        self, make_worker: MakeWorker, store: StateStore, worker_cwd: Path
+    ) -> None:
+        """Rule 7, and the owner's decision that this waits indefinitely: the
+        cost of the choice is printed rather than discovered."""
+        out = io.StringIO()
+        _stub, worker = make_worker(
+            app_server(_approval_turn(str(worker_cwd), str(worker_cwd))),
+            mode="ask",
+            prompt_in=FakeTerminal("y", "y"),
+            prompt_out=out,
+        )
+        register_sender(store)
+        mail(store, worker, "go")
+        worker.run(max_polls=1)
+        printed = out.getvalue()
+        assert ASK_BLOCKED_NOTICE in printed
+        assert "THE WORKER IS BLOCKED AND WILL WAIT HERE INDEFINITELY" in printed
+        assert "every message queued behind it waits too" in printed
+        assert "Approve this? [y/n]: " in printed
+
+    def test_an_unreadable_answer_is_re_asked_rather_than_guessed_at(
+        self, make_worker: MakeWorker, worker_cwd: Path
+    ) -> None:
+        """A stray newline in a terminal the operator is also typing into must
+        not become an approval."""
+        out = io.StringIO()
+        _stub, worker = make_worker(
+            mode="ask", prompt_in=FakeTerminal("", "maybe", "Y"), prompt_out=out
+        )
+        reply = worker.handle_server_request(
+            "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)}
+        )
+        assert reply == {"decision": "approved"}
+        assert out.getvalue().count("Approve this? [y/n]: ") == 3
+        assert "'maybe' is not an answer" in out.getvalue()
+
+    def test_a_terminal_that_goes_away_declines_and_says_it_was_not_asked(
+        self, make_worker: MakeWorker, worker_cwd: Path
+    ) -> None:
+        """EOF is not a timeout and not an answer. There is no longer anybody to
+        ask, and no amount of waiting produces one, so the request fails closed —
+        and the log says, in full, that nobody answered it."""
+        out = io.StringIO()
+        _stub, worker = make_worker(mode="ask", prompt_in=FakeTerminal(), prompt_out=out)
+        reply = worker.handle_server_request(
+            "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)}
+        )
+        assert reply == {"decision": "abort"}
+        log = log_of(worker)
+        assert "DECLINED WITHOUT BEING ASKED" in log
+        assert "This is not a timeout and not the operator's answer" in log
+        assert "DECLINE execCommandApproval" in log
+
+    def test_every_prompt_and_answer_reaches_the_approval_log(
+        self, make_worker: MakeWorker, worker_cwd: Path
+    ) -> None:
+        """ "Every prompt and answer goes to the approval log like any other
+        decision" — so the file shows the question as well as the verdict."""
+        _stub, worker = make_worker(mode="ask", prompt_in=FakeTerminal("y"))
+        worker.handle_server_request(
+            "execCommandApproval", {"command": ["git", "push"], "cwd": str(worker_cwd)}
+        )
+        log = log_of(worker)
+        assert "PUTTING execCommandApproval TO THE OPERATOR and blocking until" in log
+        assert "the operator answered APPROVED" in log
+        assert "[codex-approval] APPROVE execCommandApproval subject=git push" in log
+
+    def test_a_slow_operator_does_not_lose_the_turn(
+        self, make_worker: MakeWorker, store: StateStore, worker_cwd: Path
+    ) -> None:
+        """The prompt waits indefinitely, so the turn's deadline must not be
+        running while it waits.
+
+        The deadline measures the SERVER's silence. Time spent inside this
+        worker's own approval handler is not silence, and without crediting it
+        back an ask-mode worker would take the operator's answer and then tell
+        the sender the turn never finished — turning "waits indefinitely" into
+        "waits indefinitely and then throws the turn away".
+        """
+
+        class SlowOperator(FakeTerminal):
+            def readline(self, size: int = -1) -> str:  # type: ignore[override]
+                time.sleep(0.5)
+                return super().readline(size)
+
+        def ask_then_answer(stub: StubServer, msg: dict[str, Any]) -> None:
+            stub.ask("slow-1", "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)})
+            stub.wait_for(lambda: bool(stub.client_replies))
+            stub.notify(AGENT_MESSAGE_DELTA, {"delta": "done"})
+            stub.notify("turn/completed", {})
+
+        _stub, worker = make_worker(
+            app_server(ask_then_answer), mode="ask", prompt_in=SlowOperator("y")
+        )
+        # Shorter than the operator takes, so the turn can only complete if that
+        # time is not charged against it.
+        worker.client.turn_timeout = 0.3
+        register_sender(store)
+        mail(store, worker, "go")
+        worker.run(max_polls=1)
+        (reply,) = replies(store)
+        assert "did not finish" not in reply.body
+        assert reply.body == "done", "the turn was abandoned while the operator read the prompt"
+
+    def test_the_other_modes_do_not_prompt(self, make_worker: MakeWorker, worker_cwd: Path) -> None:
+        """A prompt in `auto` would block a worker whose whole point is that it
+        does not need anybody, and `full` is never asked at all."""
+        for mode in ("auto", "full"):
+            out = io.StringIO()
+            _stub, worker = make_worker(mode=mode, prompt_out=out, prompt_in=FakeTerminal("y"))
+            worker.handle_server_request(
+                "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)}
+            )
+            assert out.getvalue() == "", mode
 
 
 # ---------------------------------------------------------------- approvals
@@ -703,17 +1017,17 @@ class TestBoundaryInstructionMatchesTheMode:
     "declined by the worker before they reach you". That is false in EVERY mode,
     the default included: _decide_exec reads params["cwd"] and never what the
     command targets, so `rm -rf /elsewhere` launched from --cwd is approved. It
-    is false a second way in danger, where approval_policy() is "never" and
+    is false a second way in `full`, where approval_policy() is "never" and
     nothing is asked at all.
 
     An earlier version of this docstring said the claim was "true in workspace
-    mode", which is the belief that produced rounds three and four of the review
-    of #56 -- the defect kept reappearing in whichever branch nobody had
-    executed. Nothing here is true in workspace mode.
+    mode" (the mode now called `auto`), which is the belief that produced rounds
+    three and four of the review of #56 -- the defect kept reappearing in
+    whichever branch nobody had executed. Nothing here is true in `auto` either.
     """
 
-    def test_danger_does_not_promise_a_boundary_it_does_not_have(self) -> None:
-        text = BOUNDARY_BY_MODE["danger"].format(cwd="/w")
+    def test_full_does_not_promise_a_boundary_it_does_not_have(self) -> None:
+        text = BOUNDARY_BY_MODE["full"].format(cwd="/w")
         assert "NO SANDBOX" in text
         assert "declined by the worker" not in text
         # A phrase that does not span the wrap. "nothing constrains you" broke
@@ -721,10 +1035,20 @@ class TestBoundaryInstructionMatchesTheMode:
         # time that has happened in this repo, hence the note.
         assert "no mechanism will stop you" in text
 
-    def test_workspace_describes_the_sandbox_that_actually_confines_it(self) -> None:
-        text = BOUNDARY_BY_MODE["workspace"].format(cwd="/w")
-        assert "workspaceWrite" in text
-        assert "/w" in text
+    def test_confined_modes_describe_the_sandbox_that_is_asked_for(self) -> None:
+        for mode in CONFINED_MODES:
+            text = BOUNDARY_BY_MODE[mode].format(cwd="/w")
+            assert "workspaceWrite" in text, mode
+            assert "/w" in text, mode
+
+    def test_ask_tells_the_model_an_approval_costs_a_human(self) -> None:
+        """The model is the only party that can keep the prompt count sane, and
+        it cannot do that without being told what a prompt costs: in ask mode
+        every approval stops the turn and the whole queue behind it until a
+        person answers."""
+        text = BOUNDARY_BY_MODE["ask"].format(cwd="/w")
+        assert "put to a HUMAN at the worker's own terminal" in text
+        assert "waits for an answer with no timeout" in text
 
     # ---------------------------------------------------------------- claims
     # Three review rounds found three false sentences here, each in a branch the
@@ -777,6 +1101,13 @@ class TestBoundaryInstructionMatchesTheMode:
         # A mode added without one would fall back to a KeyError at start(),
         # which is loud -- but this makes the omission visible at test time.
         assert set(BOUNDARY_BY_MODE) == set(MODES)
+
+    def test_every_mode_says_who_answers_its_approvals(self) -> None:
+        # The startup line names the answerer in words (rule 7): "the operator,
+        # on this terminal", "the worker itself", "NOBODY". It is a third table
+        # keyed by mode, and a mode missing from it is a KeyError at start() --
+        # visible here instead.
+        assert set(ANSWERED_BY) == set(MODES)
 
     def test_every_mode_has_a_sandbox_mode(self) -> None:
         # SANDBOX_MODES is indexed with the same KeyError-at-start shape as

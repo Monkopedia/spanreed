@@ -668,12 +668,12 @@ class TestCwdBoundary:
     def test_a_cwd_that_cannot_be_written_warns_at_startup_in_write_modes(
         self, make_worker: MakeWorker, worker_cwd: Path
     ) -> None:
-        """Workspace mode tells Codex it may write there. If it cannot, every
-        edit fails inside the sandbox where the only visible symptom is the
-        model reporting its own failure — so the reason is named once, up top."""
+        """Every mode tells Codex it may write there. If it cannot, every edit
+        fails inside the sandbox where the only visible symptom is the model
+        reporting its own failure — so the reason is named once, up top."""
         worker_cwd.chmod(0o500)
         try:
-            _stub, worker = make_worker(mode="workspace", name="writer")
+            _stub, worker = make_worker(mode="auto", name="writer")
         finally:
             worker_cwd.chmod(0o700)
         log = log_of(worker)

@@ -392,6 +392,10 @@ class CodexClient:
         self.timeout = timeout
         self.turn_timeout = turn_timeout
         self.spawn_timeout = spawn_timeout
+        self._deadline_credit = 0.0
+        """Seconds this client spent blocked inside its OWN handler — see
+        :meth:`credit_deadline`. Reset at the top of every call and every turn
+        wait, so it can never accumulate across them."""
         self._on_server_request = on_server_request
         self._on_notification = on_notification
         self.on_protocol_error: ProtocolFaultHandler | None = on_protocol_error
@@ -719,6 +723,7 @@ class CodexClient:
             }
         )
         deadline = time.monotonic() + (timeout if timeout is not None else self.timeout)
+        self._deadline_credit = 0.0
         while True:
             msg = self._read_message(deadline, method)
             # A response, not a request: server→client requests carry a
@@ -750,6 +755,7 @@ class CodexClient:
         raising, so a partial turn stays distinguishable from a finished one.
         """
         deadline = time.monotonic() + (timeout if timeout is not None else self.turn_timeout)
+        self._deadline_credit = 0.0
         result = TurnResult(completed=False)
         while True:
             try:
@@ -857,6 +863,23 @@ class CodexClient:
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
+    def credit_deadline(self, seconds: float) -> None:
+        """Do not count ``seconds`` against the call or turn now in flight.
+
+        A deadline is meant to measure *the server's* silence. Time this client
+        spends inside its own server-request handler is not silence — it is
+        this process, holding the loop — and in ``--mode ask`` that is a human
+        reading an approval prompt, which is allowed to take as long as it
+        takes (``architecture.md``: the prompt waits indefinitely).
+
+        Without this, an ask-mode worker would answer the operator and then
+        report the turn as never finished, because the deadline ran while the
+        person was thinking. Only the handler's own elapsed time is credited,
+        so a server that goes quiet still times out exactly as before.
+        """
+        if seconds > 0:
+            self._deadline_credit += seconds
+
     def _read_message(self, deadline: float, context: str) -> dict[str, Any]:
         """Next JSON-RPC message off the wire. Ping/pong and control frames are
         handled here so no caller has to know they exist."""
@@ -866,7 +889,9 @@ class CodexClient:
         while True:
             decoded = ws_decode(self._buf)
             if decoded is None:
-                remaining = deadline - time.monotonic()
+                # The credit is added rather than the deadline moved, so the
+                # caller that set the deadline still owns it.
+                remaining = deadline + self._deadline_credit - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"no response to {context} before the deadline")
                 sock.settimeout(remaining)

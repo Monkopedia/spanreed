@@ -21,6 +21,7 @@ claiming it does.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -28,13 +29,16 @@ import pytest
 from spanreed.codex_approvals import (
     APPLY_PATCH_APPROVAL,
     APPLY_PATCH_APPROVAL_V2,
+    CONFINED_MODES,
     ELICITATION_REQUEST,
     EXEC_COMMAND_APPROVAL,
     EXEC_COMMAND_APPROVAL_V2,
+    MODES,
     PERMISSIONS_APPROVAL_V2,
     approval_policy,
     contains,
     decide,
+    sandbox_mode,
     sandbox_policy,
     wire_decision,
 )
@@ -327,34 +331,110 @@ class TestModePolicies:
     failure being guarded, and only the discriminator catches it.
     """
 
-    def test_workspace_uses_the_schema_discriminator_and_scopes_writes(
+    def test_confined_modes_use_the_schema_discriminator_and_scope_writes(
         self, tmp_path: Path
     ) -> None:
-        pol = sandbox_policy(tmp_path, "workspace")
-        assert pol["type"] == "workspaceWrite"
-        assert pol["writableRoots"] == [str(tmp_path.resolve())]
-        assert pol["networkAccess"] is False
+        # Both confined modes, derived: `ask` and `auto` differ in who answers
+        # an approval, not in what they ask Codex to confine.
+        for mode in CONFINED_MODES:
+            pol = sandbox_policy(tmp_path, mode)
+            assert pol["type"] == "workspaceWrite", mode
+            assert pol["writableRoots"] == [str(tmp_path.resolve())], mode
+            assert pol["networkAccess"] is False, mode
 
-    def test_danger_is_full_access_and_is_not_downgraded(self, tmp_path: Path) -> None:
-        # If a caller asks for danger they get danger; quietly confining it
-        # would make the loud warning a lie.
-        assert sandbox_policy(tmp_path, "danger") == {"type": "dangerFullAccess"}
+    def test_full_is_full_access_and_is_not_downgraded(self, tmp_path: Path) -> None:
+        # If a caller asks for full they get full; quietly confining it would
+        # make the loud warning a lie.
+        assert sandbox_policy(tmp_path, "full") == {"type": "dangerFullAccess"}
 
-    def test_confined_modes_ask_so_decisions_can_be_logged(self) -> None:
-        assert approval_policy("workspace") == "on-request"
+    def test_each_mode_sends_the_sandbox_MODE_enum_thread_start_takes(self) -> None:
+        # The OTHER sandbox level. thread/start takes the SandboxMode enum and
+        # turn/start takes the SandboxPolicy object; a run on 2026-09-17
+        # measured the object alone confining nothing, so both are sent and
+        # both are pinned. The values are members of SandboxMode in
+        # ClientRequest.json -- read, not guessed.
+        assert sandbox_mode("ask") == "workspace-write"
+        assert sandbox_mode("auto") == "workspace-write"
+        assert sandbox_mode("full") == "danger-full-access"
 
-    def test_danger_does_not_ask(self) -> None:
-        assert approval_policy("danger") == "never"
+    def test_auto_asks_so_decisions_can_be_logged(self) -> None:
+        assert approval_policy("auto") == "on-request"
+
+    def test_full_does_not_ask(self) -> None:
+        assert approval_policy("full") == "never"
+
+    def test_ask_sends_the_granular_object_with_sandbox_approval_on(self) -> None:
+        # The variant that makes app-server put a sandbox escape to somebody
+        # rather than settling it itself. A plain string here would have been
+        # accepted by the schema and would have routed nothing to the operator.
+        policy = approval_policy("ask")
+        assert isinstance(policy, dict)
+        granular = policy["granular"]
+        assert isinstance(granular, dict)
+        assert granular["sandbox_approval"] is True
+
+    def test_the_granular_object_carries_every_field_the_schema_requires(self) -> None:
+        """Read out of the vendored schema, not out of a copy of the code.
+
+        An approval policy app-server rejects or ignores leaves the worker on
+        whatever default it had, which is the silent-failure shape this project
+        keeps hitting -- and an incomplete object is the way to produce one.
+        """
+        schema = json.loads(
+            (
+                Path(__file__).parents[2]
+                / "experiments"
+                / "codex-app-server-spike"
+                / "schema"
+                / "ClientRequest.json"
+            ).read_text()
+        )
+        variants = schema["definitions"]["AskForApproval"]["oneOf"]
+        granular_schema = next(v for v in variants if v.get("title") == "GranularAskForApproval")[
+            "properties"
+        ]["granular"]
+        sent = approval_policy("ask")
+        assert isinstance(sent, dict)
+        granular = sent["granular"]
+        assert isinstance(granular, dict)
+        for required in granular_schema["required"]:
+            assert required in granular, f"the schema requires {required!r} and it is not sent"
+        # And nothing invented: every key sent is a key the schema defines.
+        assert set(granular) <= set(granular_schema["properties"])
+        for key, value in granular.items():
+            assert granular_schema["properties"][key]["type"] == "boolean", key
+            assert isinstance(value, bool), key
 
     def test_unknown_mode_raises(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError):
             sandbox_policy(tmp_path, "yolo")
         with pytest.raises(ValueError):
             approval_policy("yolo")
+        with pytest.raises(ValueError):
+            sandbox_mode("yolo")
+
+    def test_the_retired_mode_names_are_not_quietly_honoured(self, tmp_path: Path) -> None:
+        # `workspace` and `danger` were the names before the modes were made to
+        # mirror Codex's own. `danger` falling through to a confined default
+        # would be the dangerous direction of that mistake.
+        for retired in ("workspace", "danger"):
+            with pytest.raises(ValueError):
+                sandbox_policy(tmp_path, retired)
+            with pytest.raises(ValueError):
+                approval_policy(retired)
+
+    def test_confined_modes_is_derived_from_what_each_mode_sends(self) -> None:
+        # Not a literal: a hand-written list here has been the source of two
+        # defects (a mode added without being looked at, then a rename that
+        # left `!= "danger"` matching nothing).
+        assert set(CONFINED_MODES) == {
+            m for m in MODES if sandbox_policy(Path("/"), m)["type"] != "dangerFullAccess"
+        }
+        assert "full" not in CONFINED_MODES
 
     def test_relative_root_still_raises(self) -> None:
         with pytest.raises(ValueError):
-            sandbox_policy(Path("rel"), "workspace")
+            sandbox_policy(Path("rel"), "auto")
 
 
 class TestV2ApprovalNames:

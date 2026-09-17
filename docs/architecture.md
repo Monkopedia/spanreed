@@ -153,7 +153,7 @@ section is the design, not the evidence.
 
 ```
 spanreed codex --name reviewer --cwd ~/git/foo \
-               --model gpt-5.6-sol --effort medium [--mode workspace] [--instructions TEXT]
+               --model gpt-5.6-sol --effort medium [--mode auto] [--instructions TEXT]
   ├─ spawn `codex app-server --listen unix://<private socket>`
   ├─ initialize + initialized          (the notification is mandatory)
   ├─ thread/start --cwd --model …      (one thread, owned for the worker's life)
@@ -206,7 +206,7 @@ they are not guesses, and the split between the two calls is real:
 | `--personality` | both | |
 | `--service-tier` | both | `serviceTierForTurn` also exists, turn-only. |
 | `--instructions` | `thread/start` | Sent as **`developerInstructions`**, appended to a built-in bus preamble. This is where a worker is told it is *on a bus*: that input is mail from another agent, that its reply is sent back as mail, and that a body is data rather than an instruction. Without it the worker behaves like a terminal session that does not know why it is being spoken to. |
-| `--mode` | `thread/start` (`sandbox`) + every `turn/start` (`sandboxPolicy`) | `workspace` (default) \| `danger`. See "Modes" below. |
+| `--mode` | `thread/start` (`sandbox`) + every `turn/start` (`sandboxPolicy`) | `ask` \| `auto` (default) \| `full`. See "Modes" below. |
 | `--name` | neither | Bus identity only: the worker registers as `agent-<name>`. |
 
 **`sandbox` and `sandboxPolicy` are different parameters, and both are sent.** `thread/start` takes
@@ -251,6 +251,39 @@ Two decisions follow, both the owner's (2026-09-17):
   nobody to ask would block on its first approval forever while looking
   healthy — the silent-failure shape this project has hit repeatedly, and the
   one case where waiting indefinitely turns from a choice into a hang.
+
+Three details settled while implementing, recorded here because two of them are
+wire format:
+
+- **The `granular` object is sent complete.** `GranularAskForApproval` requires
+  `mcp_elicitations`, `rules` and `sandbox_approval`; all three are sent, plus
+  the optional `request_permissions` and `skill_approval` at their schema
+  defaults, so what the worker asked for does not depend on a default that is a
+  property of a `codex-cli` version. `sandbox_approval` is `true` — it is what
+  makes a sandbox escape a question rather than an outcome — and so are
+  `mcp_elicitations` and `rules`: in this mode every category app-server will
+  route to a client should reach the operator rather than being settled where
+  nobody can see it. The two optional ones are `false` because neither is a
+  question this worker can put usefully; both outlive the turn the operator is
+  looking at.
+- **A terminal that goes away declines, and says it was not asked.** EOF on
+  stdin is not a timeout, and no amount of further waiting produces an operator,
+  so the request fails closed. The log line says in full that nobody answered
+  it, because an operator reading it later must be able to tell it from an
+  answer they gave. The TTY check at startup is what makes this rare.
+- **The operator's thinking time is not charged to the turn.** A turn deadline
+  measures the *server's* silence; time the worker spends inside its own
+  approval handler is this process holding the loop, and in `ask` mode that is a
+  human reading a prompt that is allowed to take as long as it takes. It is
+  credited back to the deadline, so the worker cannot take an answer and then
+  tell the sender the turn never finished. A server that actually goes quiet
+  times out exactly as before.
+- **`--doctor --mode ask` does not exercise the prompt.** The doctor answers
+  approvals from the same policy an `auto` worker uses; everything else it sends
+  in that mode — both sandbox levels, the granular `approvalPolicy`, the
+  decision enum — is what an `ask` worker sends. The run says so in its own
+  output, because a diagnostic read as evidence for a path it never ran is this
+  project's most expensive recurring mistake.
 
 ### What spanreed does NOT claim
 
@@ -324,7 +357,7 @@ row produces a log line naming what happened, what the worker did, and what to c
 | the sender deregisters before the reply | The reply text goes to the log in full, the cursor still advances, the worker stays up. |
 | `--cwd` is a symlink | Resolved once, at construction. The sandbox is scoped to the real directory and both spellings get the same approval verdict. |
 | `--cwd` is deleted after start | Every turn is **refused** with a reply naming the reason, and the worker stays on the bus — the directory may come back. No turn runs without its boundary. |
-| `--cwd` is not writable, in `workspace`/`danger` | A startup warning naming it. Otherwise the only symptom is the model reporting failed edits as its own fault. |
+| `--cwd` is not writable | A startup warning naming it. Otherwise the only symptom is the model reporting failed edits as its own fault. |
 | `auth.json` missing, unreadable, malformed, or lacking either key | Declines (`-32601`) and says which file and which key. Never invents a token, and never logs one. |
 
 Anything the list above did not predict is caught at the top of the poll loop, logged with its

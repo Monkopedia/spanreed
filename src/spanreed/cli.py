@@ -644,15 +644,20 @@ def _cmd_codex(args: argparse.Namespace) -> int:
     """Run a Codex worker: a bus agent with no human attached.
 
     ``--cwd`` is checked *here*, before anything is spawned, and refused with
-    the reason rather than argparse's generic "required" line. It is the
-    worker's entire security boundary: auto-approval plus unauthenticated
-    senders means an inbox write becomes code execution, and nothing else bounds
-    it. See ``docs/architecture.md``, "``--cwd`` is the security boundary".
+    the reason rather than argparse's generic "required" line: in ``--mode
+    auto`` an approval inside it is granted without asking anyone, and senders
+    are unauthenticated, so an inbox write becomes code execution. What ``--cwd``
+    does and does not bound is ``docs/architecture.md``, "``--cwd`` is required,
+    and what it actually bounds".
+
+    ``--mode ask`` is refused here too when stdin is not a terminal — same
+    reason, same place: a worker that cannot ask anybody would block on its
+    first approval forever while looking healthy.
     """
     # Local import (as in _cmd_conjoin): the worker drags in the app-server
     # client — sockets, subprocess, threads — and every session's SessionStart
     # hook goes through this module.
-    from spanreed.codex_worker import CodexWorker, WorkerConfig
+    from spanreed.codex_worker import CodexWorker, WorkerConfig, no_terminal_for_ask
 
     if getattr(args, "doctor", False):
         # Runs the same calls a worker makes, then reports and exits. Kept in
@@ -685,13 +690,21 @@ def _cmd_codex(args: argparse.Namespace) -> int:
     if not args.cwd:
         print(
             "spanreed codex: --cwd is required and has no default. It is what the worker "
-            "checks approvals against and what it asks Codex to sandbox: approvals are "
-            "auto-approved inside it, any registered agent may wake the worker, and the bus "
-            "does not authenticate senders. Inheriting a default (the process cwd, $HOME, or "
-            "whatever config.toml marks trusted) would scope the worker to a whole home "
-            "directory. Pass --cwd <the one repo this worker owns>.",
+            "checks approvals against and what it sends as writableRoots: in --mode auto "
+            "an approval inside it is granted without asking anyone, any registered agent "
+            "may wake the worker, and the bus does not authenticate senders. Inheriting a "
+            "default (the process cwd, $HOME, or whatever config.toml marks trusted) would "
+            "scope the worker to a whole home directory. Pass --cwd <the one repo this "
+            "worker owns>.",
             file=sys.stderr,
         )
+        return 2
+    refusal = no_terminal_for_ask(args.mode)
+    if refusal is not None:
+        # Before the worker is built, so nothing is spawned and no log file is
+        # created for a worker that will not run. CodexWorker.start() refuses
+        # again from the same predicate, for anyone driving it as a library.
+        print(f"spanreed codex: {refusal}", file=sys.stderr)
         return 2
     try:
         config = WorkerConfig(
@@ -873,8 +886,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_codex.add_argument(
         "--mode",
         choices=list(MODES),
-        default="workspace",
-        help="Sandbox/approval mode. danger removes all confinement and warns on every turn.",
+        default="auto",
+        help="Which of Codex's three permission modes to run in. ask: workspace-write, and "
+        "every approval is put to you on this terminal, where it waits indefinitely (so it "
+        "refuses to start without a TTY). auto (default): workspace-write, and the worker "
+        "answers approvals itself from --cwd, logging every one. full: no sandbox and "
+        "nothing is asked of anyone, warned at startup and on every turn.",
     )
     p_codex.add_argument(
         "--instructions",

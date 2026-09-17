@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+### Codex worker: `--mode ask | auto | full`
+
+**`--mode workspace` and `--mode danger` are gone.** The modes now mirror
+Codex's own three permission modes, because the thing being configured is
+Codex's and a name invented here would have to be kept true to software this
+project does not control. A stale `--mode workspace` or `--mode danger` is
+**refused**, not quietly mapped: `danger` silently becoming a confined mode
+would confine a worker its operator believes is unconfined.
+
+| old | new | what it does |
+|---|---|---|
+| `workspace` (default) | `auto` (default) | `workspace-write` scoped to `--cwd`, `on-request` approvals, answered by the worker and logged |
+| — | `ask` | same sandbox, granular approvals, answered by **you** at the worker's terminal |
+| `danger` | `full` | `danger-full-access`, `never`, nobody is asked; still warns at startup and on every turn |
+
+- **`ask` prompts on the worker's terminal, never on the bus**, and waits there
+  **indefinitely** — nothing is declined on your behalf, and until you answer,
+  that turn and everything queued behind it are stopped, which the prompt says
+  out loud. It therefore **refuses to start when stdin is not a terminal**: a
+  worker with nobody to ask would block on its first approval forever while
+  still looking healthy in the registry. Every prompt and every answer goes to
+  the approval log.
+- **Both sandbox levels are now sent, and the doctor sends them too.**
+  `thread/start` takes `sandbox` (the `SandboxMode` enum) and `turn/start` takes
+  `sandboxPolicy` (the object with `writableRoots`); the turn-level object alone
+  was measured confining nothing on 2026-09-17. `--doctor` was sending only
+  `approvalPolicy` and `cwd` at `thread/start` while reporting that it used "the
+  worker's real params" — so it drove a thread that had been given no
+  thread-level sandbox, and reported the absence of confinement it measured as
+  Codex's. **Re-run the doctor**; a 0.2.1 run's step 4 was answering a question
+  it had not set up.
+- **spanreed does not claim to confine Codex.** It selects Codex's sandbox and
+  approval settings, answers the approvals it is asked to answer, and records
+  every one. Whether a selected sandbox holds is a property of `codex-cli` and
+  is what `--doctor` is for. The docs no longer describe `--cwd` as the worker's
+  blast radius; it is the value sent as `writableRoots` and the scope of the
+  checks the worker performs itself.
+
 ## 0.2.1
 
 Fixes to `spanreed codex --doctor`. **If you ran 0.2.0's doctor, re-run this one** —

@@ -23,7 +23,15 @@ from typing import Any
 
 import pytest
 
-from spanreed.codex_doctor import MARKER, Report, Step, redacted_auth, run_doctor
+from spanreed.codex_approvals import MODES
+from spanreed.codex_doctor import (
+    MARKER,
+    Report,
+    Step,
+    redacted_auth,
+    run_doctor,
+    thread_start_params,
+)
 from tests.unit.test_codex_client import StubServer
 
 
@@ -121,15 +129,28 @@ class TestAgainstAStubServer:
         assert "Result" in text
         assert "FULL LOG" in text
 
-    def test_danger_mode_warns_unmissably(self, tmp_path: Path, monkeypatch: Any) -> None:
+    def test_full_mode_warns_unmissably(self, tmp_path: Path, monkeypatch: Any) -> None:
         monkeypatch.setenv("PATH", str(tmp_path / "empty"))
         monkeypatch.setenv("CODEX_HOME", str(tmp_path))
         buf = io.StringIO()
-        run_doctor(cwd=tmp_path, mode="danger", log_path=tmp_path / "d.log", out=buf)
+        run_doctor(cwd=tmp_path, mode="full", log_path=tmp_path / "d.log", out=buf)
         text = buf.getvalue()
-        assert "MODE=danger" in text
-        assert "NO SANDBOX" in text
+        assert "MODE=full: NO SANDBOX, and approvalPolicy is never" in text
         assert "!!" in text
+
+    def test_ask_mode_says_the_run_does_not_exercise_the_operator_prompt(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """The doctor answers approvals from decide(), the way an `auto` worker
+        does. An `ask` worker puts every one to a human instead, so a clean
+        `--doctor --mode ask` run is not evidence about that path — and a
+        diagnostic read as evidence for something it never ran is this file's
+        founding complaint."""
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        buf = io.StringIO()
+        run_doctor(cwd=tmp_path, mode="ask", log_path=tmp_path / "d.log", out=buf)
+        assert "THIS RUN DOES NOT EXERCISE THAT PROMPT" in buf.getvalue()
 
     def test_marker_is_specific_enough_not_to_occur_by_chance(self) -> None:
         # A marker that could appear in ordinary model output would make step 3
@@ -226,6 +247,59 @@ class TestStartupPreconditions:
         finally:
             work.chmod(0o700)
         assert "NOT WRITABLE by uid" in buf.getvalue()
+
+
+class TestTheDoctorSendsWhatAWorkerSends:
+    """Step 2 says it uses "the worker's real params". It did not.
+
+    It sent ``cwd`` and ``approvalPolicy`` and **no ``sandbox``**, so every run
+    drove a thread that had been given no thread-level sandbox — and then
+    reported the absence of confinement it measured as Codex's. This is the
+    cross-check that would have caught it: the doctor's params and the worker's
+    own ``thread/start`` frame, for every mode, compared rather than each
+    asserted against its own copy of the expected values.
+    """
+
+    @pytest.mark.parametrize("mode", list(MODES))
+    def test_thread_start_params_match_the_worker_frame_for_every_mode(
+        self, mode: str, make_worker: Any, tmp_path: Path
+    ) -> None:
+        stub, worker = make_worker(mode=mode)
+        sent = next(m for m in stub.received if m.get("method") == "thread/start")["params"]
+        doctor = thread_start_params(worker.config.cwd, mode)
+        assert doctor["sandbox"] == sent["sandbox"]
+        assert doctor["approvalPolicy"] == sent["approvalPolicy"]
+        assert doctor["cwd"] == sent["cwd"]
+        # And the params the doctor sends are not a subset that happens to
+        # agree: `sandbox` is present, which is the whole defect.
+        assert "sandbox" in doctor
+
+    def test_the_model_rides_along_only_when_one_was_asked_for(self, tmp_path: Path) -> None:
+        assert "model" not in thread_start_params(tmp_path, "auto")
+        assert thread_start_params(tmp_path, "auto", "gpt-5.6-sol")["model"] == "gpt-5.6-sol"
+
+    def test_the_inventory_names_both_sandbox_levels(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Step 0 prints what the run will send. Printing only the turn-level
+        object is how a reader concluded the thread had a sandbox it never
+        got."""
+        monkeypatch.setenv("SPANREED_STATE_ROOT", str(tmp_path / "state"))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        # A fake `codex` on PATH: the inventory is printed at the END of step 0,
+        # after the PATH check, so a run with no codex at all never reaches it.
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        fake = bindir / "codex"
+        fake.write_text("#!/bin/sh\necho stub-codex 0.0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bindir))
+        buf = io.StringIO()
+        run_doctor(cwd=tmp_path, log_path=tmp_path / "d.log", out=buf, timeout=5.0)
+        text = buf.getvalue()
+        assert 'sandbox (thread/start) we will send: "workspace-write"' in text
+        assert 'sandboxPolicy (every turn/start) we will send: {"type": "workspaceWrite"' in text
+        assert 'approvalPolicy we will send: "on-request"' in text
 
 
 class TestSkipIsNotAPass:
