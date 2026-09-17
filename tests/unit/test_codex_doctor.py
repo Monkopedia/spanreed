@@ -853,12 +853,71 @@ def test_a_landed_escape_is_a_finding_and_sets_the_exit_code(doctored: Doctored)
     assert rc == 1
 
 
-def test_ok_does_not_erase_a_warn_but_fail_still_overrides() -> None:
-    """The invariant behind F4's fix, stated once at the unit level."""
-    s = Step(n=1, question="q")
-    s.warn("qualified")
-    s.ok("succeeded")
-    assert s.verdict == "WARN"
-    assert "qualified" in s.detail and "succeeded" in s.detail
-    s.no("broke")
-    assert s.verdict == "FAIL" and s.detail == "broke"
+def test_ask_mode_keeps_its_qualification_when_step_4_skips(doctored: Doctored) -> None:
+    """Round 3, observation A: `skip` had the hole `ok` had just been fixed for.
+
+    Reachable, and reached: an `ask` run whose `--cwd` contains the home
+    directory puts the escape probe inside a writable root, so step 4 SKIPs --
+    and the SKIP overwrote the WARN naming the un-exercised operator prompt.
+    The banner was still honest ("step(s) 4 (SKIP) did not pass") and the Key
+    facts still carried the caveat, but the comment at the warn site says in as
+    many words that a fact in the Key-facts block was not enough.
+    """
+    out = io.StringIO()
+
+    def make_client(**kw: Any) -> FakeAppServer:
+        return FakeAppServer(cwd=doctored.home, probe=doctored.home / "unused", **kw)
+
+    rc = run_doctor(
+        cwd=doctored.home,  # contains the probe path, so step 4 cannot run
+        mode="ask",
+        log_path=doctored.tmp / "doctor-ask-skip.log",
+        out=out,
+        make_client=make_client,
+    )
+    text = out.getvalue()
+    assert "inside a writable root" in text, text
+    assert "4. [WARN" in text, text
+    assert "was not exercised" in text
+    assert "Everything passed" not in text
+    assert rc == 0
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [
+        # A reservation is never raised away by a later sub-check.
+        ("warn", "ok", "WARN"),
+        ("warn", "skip", "WARN"),
+        ("no", "ok", "FAIL"),
+        ("no", "skip", "FAIL"),
+        ("no", "warn", "FAIL"),
+        # ...but a worse verdict always applies.
+        ("warn", "no", "FAIL"),
+        ("ok", "warn", "WARN"),
+        ("ok", "no", "FAIL"),
+        ("skip", "warn", "WARN"),
+        # The initial state is not a verdict; anything replaces it.
+        (None, "ok", "PASS"),
+        (None, "skip", "SKIP"),
+    ],
+)
+def test_a_verdict_is_never_silently_raised(first: str | None, second: str, expected: str) -> None:
+    """The invariant behind F4's fix, over every transition rather than one.
+
+    The first fix special-cased `ok` after `warn`. That is one of four
+    transitions; `skip` after `warn` was still open and reachable, and `ok`
+    after `no` silently reset FAIL to PASS.
+    """
+    step = Step(n=1, question="q")
+    if first is not None:
+        getattr(step, first)("earlier")
+    getattr(step, second)("later")
+    assert step.verdict == expected
+    # Whichever call was demoted, its detail survives under the one that won.
+    assert "later" in step.detail
+    if first is not None and step.verdict != _VERDICT_NAMES[second]:
+        assert "earlier" in step.detail
+
+
+_VERDICT_NAMES = {"ok": "PASS", "no": "FAIL", "warn": "WARN", "skip": "SKIP"}

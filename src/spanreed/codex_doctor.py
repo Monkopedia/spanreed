@@ -70,6 +70,13 @@ Existence alone would not distinguish this turn's write from something
 coincidental at the same path; the content does."""
 
 
+# Severity, so a verdict cannot be silently raised by a later call. "DID NOT
+# RUN" is 0 because it is the initial state and anything must be able to
+# replace it; PASS and SKIP are level because neither is a reservation about
+# the step; WARN outranks both because it IS one; FAIL outranks everything.
+_VERDICT_RANK = {"DID NOT RUN": 0, "PASS": 1, "SKIP": 1, "WARN": 2, "FAIL": 3}
+
+
 @dataclass
 class Step:
     """One question, its verdict, and why -- printed even when it cannot run."""
@@ -80,32 +87,48 @@ class Step:
     detail: str = "an earlier step did not get far enough"
     answers: str = ""
 
-    def ok(self, detail: str) -> None:
-        """Record a success -- but never erase a qualification already made.
+    def _record(self, verdict: str, detail: str) -> None:
+        """Apply ``verdict`` unless it would RAISE the step above what it has.
 
-        Step 4 in ``ask`` mode warns, at the top of the step, that the run does
-        not exercise the operator prompt; it then runs the escape probe, whose
-        success called ``ok`` and reset the verdict to PASS. The qualification
-        was written before the verdict that overwrote it, so a clean ``--doctor
-        --mode ask`` printed "Everything passed" over the one path it does not
-        take. The ordering is the trap, so the fix is not to reorder the two
-        calls: a WARN is an observation about this step, and a later success in
-        some other sub-check of the same step does not un-observe it. FAIL still
-        overrides -- a failure outranks a qualification.
+        A step accumulates observations, and a later call reporting on some
+        other sub-check must not erase an earlier reservation about this one.
+        Step 4 in ``ask`` mode warns, at the top, that the run does not
+        exercise the operator prompt; it then runs the escape probe, whose
+        success called ``ok`` and reset the verdict to PASS, so a clean
+        ``--doctor --mode ask`` printed "Everything passed" over the one path
+        it does not take. The ordering is the trap, so reordering those two
+        calls is not the fix.
+
+        It is centralised here because the first fix was not: it special-cased
+        ``ok`` after ``warn``, which is one of four transitions, and left
+        ``skip`` after ``warn`` open -- reachable, and reached, by an `ask` run
+        whose ``--cwd`` contains the home directory, where the probe is inside
+        a writable root and the SKIP erased the qualification naming the
+        un-exercised prompt. It also left ``ok`` after ``no`` silently
+        resetting FAIL to PASS, latent only because every ``no`` in this module
+        happens to return or sit in an exclusive chain. A principle stated
+        generally and encoded in one transition is a principle that will be
+        re-broken at the next one.
+
+        The demoted call's detail is kept, not dropped: the successful probe
+        still reports what it found, under the verdict that outranks it.
         """
-        if self.verdict == "WARN":
+        if _VERDICT_RANK[verdict] < _VERDICT_RANK[self.verdict]:
             self.detail = f"{self.detail} (the rest of the step: {detail})"
             return
-        self.verdict, self.detail = "PASS", detail
+        self.verdict, self.detail = verdict, detail
+
+    def ok(self, detail: str) -> None:
+        self._record("PASS", detail)
 
     def no(self, detail: str) -> None:
-        self.verdict, self.detail = "FAIL", detail
+        self._record("FAIL", detail)
 
     def warn(self, detail: str) -> None:
-        self.verdict, self.detail = "WARN", detail
+        self._record("WARN", detail)
 
     def skip(self, detail: str) -> None:
-        self.verdict, self.detail = "SKIP", detail
+        self._record("SKIP", detail)
 
 
 @dataclass
