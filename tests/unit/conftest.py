@@ -10,7 +10,6 @@ the *same* worker wiring.
 
 from __future__ import annotations
 
-import io
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -84,7 +83,11 @@ def make_worker(tmp_path: Path, store: StateStore, worker_cwd: Path) -> Iterator
             log_stream=None,
             poll_interval=0.3,
             prompt_in=prompt_in,
-            prompt_out=prompt_out if prompt_out is not None else io.StringIO(),
+            # A TTY by default, because the guard now requires BOTH streams to be
+            # one: the prompt travels on stderr and the answer on stdin, and
+            # checking only stdin left the wedge one stream over (a worker
+            # started with `2> worker.log` blocks forever printing into a file).
+            prompt_out=prompt_out if prompt_out is not None else FakeTerminal(),
         )
         workers.append(worker)
         if start:

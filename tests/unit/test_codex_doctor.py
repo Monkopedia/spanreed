@@ -577,3 +577,60 @@ class TestAFindingReachesTheBannerAndTheExitCode:
         rep.steps.append(Step(1, "a", verdict="FAIL", detail="d"))
         rc, _text = _render(rep)
         assert rc == 1
+
+
+class TestTheDoctorQualifiesWhatItDidNotRun:
+    """Two ways this tool could hand back a confident answer about an unrun path.
+
+    Both were found by review of #61 rather than by use, and both are the
+    founding complaint of this module restated: a diagnostic read as evidence
+    for a path it never exercised.
+    """
+
+    def test_ask_mode_warns_because_the_prompt_was_never_exercised(self) -> None:
+        # `full` got an s4.skip, which flips the banner. `ask` got only a fact,
+        # so a clean run printed "Everything passed. A Codex worker can run on
+        # this machine" for a mode whose defining behaviour -- the operator
+        # prompt -- the doctor does not execute.
+        rep = Report(out=io.StringIO())
+        s4 = Step(4, "escape")
+        assert s4.verdict != "WARN"
+        rep.steps.append(s4)
+        # drive only the qualification, not a whole run
+        s4.warn("answered by decide(), not by an operator")
+        rc, text = _render(rep)
+        assert "Everything passed" not in text
+        assert rc == 0, "a qualification is not a failure"
+
+    def test_a_version_mismatch_is_a_finding_not_a_fact(self) -> None:
+        """Every wire shape here was read from ONE codex-cli's schemas.
+
+        A different version answering is the "it could stop holding silently"
+        the PR body concedes and nothing detected. A fact would sit in a block
+        nobody quotes; a finding reaches the banner and the exit code.
+        """
+        from spanreed.codex_doctor import SCHEMA_CODEX_VERSION
+
+        rep = Report(out=io.StringIO())
+        rep.steps.append(Step(0, "env", verdict="PASS", detail="d"))
+        rep.findings.append(f"this codex is 0.9.9, schemas came from {SCHEMA_CODEX_VERSION}")
+        rc, text = _render(rep)
+        assert rc == 1
+        assert "Everything passed" not in text
+        assert SCHEMA_CODEX_VERSION in text
+
+    def test_the_recorded_schema_version_matches_the_vendored_readme(self) -> None:
+        # The constant and the schemas must not drift: if someone re-dumps the
+        # schemas they must move both, and this is what tells them.
+        from spanreed.codex_doctor import SCHEMA_CODEX_VERSION
+
+        readme = (
+            Path(__file__).parents[2]
+            / "experiments"
+            / "codex-app-server-spike"
+            / "schema"
+            / "README.md"
+        ).read_text()
+        assert SCHEMA_CODEX_VERSION in readme, (
+            "codex_doctor.SCHEMA_CODEX_VERSION disagrees with the vendored schema README"
+        )

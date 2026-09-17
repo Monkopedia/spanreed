@@ -119,6 +119,19 @@ class FakeTerminal(io.StringIO):
         return True
 
 
+class CapturingTerminal(io.StringIO):
+    """A stream that captures what is written AND reports itself a terminal.
+
+    The guard requires BOTH stdin and the prompt stream to be TTYs, because the
+    prompt travels on stderr and the answer on stdin -- checking only stdin left
+    the wedge one stream over. A plain StringIO used as prompt_out is therefore
+    correctly refused, which is why these tests need this rather than StringIO.
+    """
+
+    def isatty(self) -> bool:
+        return True
+
+
 GRANULAR: dict[str, Any] = {
     # The granular AskForApproval object `ask` sends, written out here rather
     # than imported from the code it checks: a test that asserts a constant
@@ -342,10 +355,14 @@ class TestAskModeNeedsATerminal:
         # Only `ask` needs one: `auto` answers approvals itself and `full` is
         # never asked, so both are legitimately headless — which is the normal
         # way a worker runs.
-        assert no_terminal_for_ask("ask", io.StringIO()) is not None
-        assert no_terminal_for_ask("ask", FakeTerminal()) is None
+        tty = FakeTerminal()
+        assert no_terminal_for_ask("ask", io.StringIO(), tty) is not None
+        assert no_terminal_for_ask("ask", tty, tty) is None
+        # BOTH streams, not just stdin. A TTY stdin with a redirected prompt is
+        # the `2> worker.log` invocation, and it must be refused too.
+        assert no_terminal_for_ask("ask", tty, io.StringIO()) is not None
         for headless in ("auto", "full"):
-            assert no_terminal_for_ask(headless, io.StringIO()) is None, headless
+            assert no_terminal_for_ask(headless, io.StringIO(), io.StringIO()) is None, headless
 
     def test_a_closed_stdin_is_not_a_terminal(self) -> None:
         # A detached or closed stream raises from isatty() rather than
@@ -353,7 +370,7 @@ class TestAskModeNeedsATerminal:
         # traceback on the one machine whose only channel back is a paste.
         closed = io.StringIO()
         closed.close()
-        assert no_terminal_for_ask("ask", closed) is not None
+        assert no_terminal_for_ask("ask", closed, FakeTerminal()) is not None
 
     def test_the_worker_refuses_to_start_and_leaves_no_registry_row(
         self, make_worker: MakeWorker, store: StateStore
@@ -393,7 +410,10 @@ class TestAskModeNeedsATerminal:
         terminal present the command gets all the way to connecting to an
         app-server, and fails there instead — on a connect that is stubbed out,
         so no `codex` is spawned on a machine that happens to have one."""
+        # Both streams, since the guard now checks both: the CLI constructs the
+        # worker with no explicit prompt stream, so it falls back to sys.stderr.
         monkeypatch.setattr("sys.stdin", FakeTerminal())
+        monkeypatch.setattr("sys.stderr", CapturingTerminal())
 
         def no_server(self: Any) -> dict[str, Any]:
             raise RuntimeError("stubbed: this test does not spawn a real app-server")
@@ -414,7 +434,7 @@ class TestAskModePromptsTheOperator:
     ) -> None:
         outside = tmp_path / "elsewhere"
         outside.mkdir()
-        out = io.StringIO()
+        out = CapturingTerminal()
         stub, worker = make_worker(
             app_server(_approval_turn(str(worker_cwd), str(outside))),
             mode="ask",
@@ -457,7 +477,7 @@ class TestAskModePromptsTheOperator:
     ) -> None:
         """Rule 7, and the owner's decision that this waits indefinitely: the
         cost of the choice is printed rather than discovered."""
-        out = io.StringIO()
+        out = CapturingTerminal()
         _stub, worker = make_worker(
             app_server(_approval_turn(str(worker_cwd), str(worker_cwd))),
             mode="ask",
@@ -478,7 +498,7 @@ class TestAskModePromptsTheOperator:
     ) -> None:
         """A stray newline in a terminal the operator is also typing into must
         not become an approval."""
-        out = io.StringIO()
+        out = CapturingTerminal()
         _stub, worker = make_worker(
             mode="ask", prompt_in=FakeTerminal("", "maybe", "Y"), prompt_out=out
         )
@@ -495,7 +515,7 @@ class TestAskModePromptsTheOperator:
         """EOF is not a timeout and not an answer. There is no longer anybody to
         ask, and no amount of waiting produces one, so the request fails closed —
         and the log says, in full, that nobody answered it."""
-        out = io.StringIO()
+        out = CapturingTerminal()
         _stub, worker = make_worker(mode="ask", prompt_in=FakeTerminal(), prompt_out=out)
         reply = worker.handle_server_request(
             "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)}
@@ -561,7 +581,7 @@ class TestAskModePromptsTheOperator:
         """A prompt in `auto` would block a worker whose whole point is that it
         does not need anybody, and `full` is never asked at all."""
         for mode in ("auto", "full"):
-            out = io.StringIO()
+            out = CapturingTerminal()
             _stub, worker = make_worker(mode=mode, prompt_out=out, prompt_in=FakeTerminal("y"))
             worker.handle_server_request(
                 "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)}
@@ -1300,3 +1320,40 @@ def test_no_prose_states_the_size_of_the_blacklist() -> None:
             f"FORBIDDEN has {len(TestNoBoundaryClaimInAnyEmittedString.FORBIDDEN)} "
             f"entries and can be counted"
         )
+
+
+def test_the_design_docs_make_no_retracted_boundary_claim() -> None:
+    """The prose guard globs `src/spanreed/*.py` and reads nothing else.
+
+    So a false claim in `architecture.md` or `README.md` is invisible to it --
+    and that is exactly where the review of #61 found one: a sentence saying
+    every category routed to a client "should reach the operator", about
+    `mcp_elicitations`, which are declined in every mode. A newly-worded false
+    claim in the document the PR existed to correct.
+
+    The docs are where the claims that matter actually live, so they get the
+    same blacklist the emitted strings do.
+    """
+    root = Path(__file__).parents[2]
+    docs = [root / "README.md", root / "docs" / "architecture.md"]
+    forbidden = (
+        "entire blast radius",
+        "the only bound on what",
+        "declines approvals for paths outside",
+        "declines every approval",
+        # The #61 instance, in its own words.
+        "every category app-server will route to a client should reach the operator",
+    )
+    for doc in docs:
+        text = doc.read_text()
+        for phrase in forbidden:
+            assert phrase not in text, f"{doc.name}: {phrase!r}"
+
+
+def test_that_docs_guard_can_actually_fail() -> None:
+    # A guard over files it cannot read passes everything. Prove both that the
+    # files exist and that the phrase list matches real text.
+    root = Path(__file__).parents[2]
+    arch = (root / "docs" / "architecture.md").read_text()
+    assert len(arch) > 5000, "architecture.md did not load; the guard above reads nothing"
+    assert "--cwd" in arch, "the guard is reading a file that does not discuss the boundary"

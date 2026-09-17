@@ -259,13 +259,23 @@ wire format:
   `mcp_elicitations`, `rules` and `sandbox_approval`; all three are sent, plus
   the optional `request_permissions` and `skill_approval` at their schema
   defaults, so what the worker asked for does not depend on a default that is a
-  property of a `codex-cli` version. `sandbox_approval` is `true` — it is what
-  makes a sandbox escape a question rather than an outcome — and so are
-  `mcp_elicitations` and `rules`: in this mode every category app-server will
-  route to a client should reach the operator rather than being settled where
-  nobody can see it. The two optional ones are `false` because neither is a
-  question this worker can put usefully; both outlive the turn the operator is
-  looking at.
+  property of a `codex-cli` version. `sandbox_approval`, `mcp_elicitations` and `rules` are
+  `true`; the two optional ones are `false`, because neither is a question this
+  worker can put usefully and both outlive the turn the operator is looking at.
+
+  **Two things this does NOT mean.** The booleans' *polarity* is not established
+  by the schema — `ClientRequest.json` defines all five as bare
+  `{"type": "boolean"}` with no descriptions, so "`sandbox_approval: true` makes
+  an escape a question" is an inference from the field's name. If `true` in fact
+  means *grant this category without asking*, `ask` would be the most permissive
+  confined mode rather than the least. See "Not verifiable here".
+
+  And **`mcp_elicitations: true` does not mean elicitations reach the operator.**
+  They are declined in every mode, `ask` included: an elicitation wants
+  structured content and a y/n cannot supply it, so a decline is the only honest
+  answer. The flag asks app-server to route the category to a client, which makes
+  the decline visible in the log rather than settled invisibly upstream. An
+  earlier version of this paragraph claimed the opposite.
 - **A terminal that goes away declines, and says it was not asked.** EOF on
   stdin is not a timeout, and no amount of further waiting produces an operator,
   so the request fails closed. The log line says in full that nobody answered
@@ -285,6 +295,28 @@ wire format:
   output, because a diagnostic read as evidence for a path it never ran is this
   project's most expensive recurring mistake.
 
+### Not verifiable here
+
+Four things about Codex's behaviour that this repository cannot settle, because
+`codex` is not installed on the host where it is developed. `spanreed codex
+--doctor` exists to answer them on a machine where it is.
+
+1. **Whether the granular booleans mean what their names suggest.** The schema
+   types them and does not describe them. If `sandbox_approval: true` grants
+   rather than asks, `ask` is the most permissive confined mode. Highest-risk
+   unknown here.
+2. **Whether app-server honours the thread-level `sandbox`** now that it is sent.
+3. **Whether the granular `approvalPolicy` is applied at all**, as opposed to
+   accepted and ignored.
+4. **Whether `item/permissions/requestApproval`'s decision enum is accepted** —
+   it is still inferred by analogy with its siblings, since `ServerRequest.json`
+   defines requests and carries no response enum for it.
+
+And one about this project rather than Codex: **the 2026-09-17 measurement that
+motivated the three-mode redesign has not been re-taken since the doctor was
+fixed.** It was made with no thread-level sandbox, so what it showed is what
+that configuration predicts. The position above does not depend on it.
+
 ### What spanreed does NOT claim
 
 **spanreed does not confine Codex.** It selects Codex's own sandbox and approval
@@ -293,11 +325,11 @@ Whether a selected sandbox actually holds is a property of `codex-cli`, not of
 this project, and it is checked by `spanreed codex --doctor` rather than
 asserted here.
 
-This is a correction. An earlier version of this document called `--cwd` "the
-worker's entire blast radius" — a claim invented as a design decision and then
-defended against software we do not control. Two things it could not survive:
-an approval channel that may not fire at all (Codex requested no approval for a
-write outside `writableRoots` on 2026-09-17), and a shell command, whose effects
+This is a correction. An earlier version of this document described `--cwd` as
+bounding everything the worker could touch — a claim invented as a design
+decision and then defended against software this project does not control. What
+it could not survive was not a measurement but a reading of the schema: a shell
+command, whose effects
 no path check can bound. `--cwd` is now what it always actually was: the
 directory the worker works in, the value passed to `writableRoots`, and the
 scope of the checks this worker performs itself.

@@ -348,7 +348,9 @@ class NoTerminalForAskMode(RuntimeError):
     """
 
 
-def no_terminal_for_ask(mode: str, stdin: TextIO | None = None) -> str | None:
+def no_terminal_for_ask(
+    mode: str, stdin: TextIO | None = None, prompt_out: TextIO | None = None
+) -> str | None:
     """Why ``mode`` cannot run here, or ``None`` if it can.
 
     One predicate, two callers: the CLI refuses before anything is spawned (so
@@ -362,14 +364,28 @@ def no_terminal_for_ask(mode: str, stdin: TextIO | None = None) -> str | None:
     """
     if mode != "ask":
         return None
-    stream = stdin if stdin is not None else sys.stdin
-    try:
-        interactive = stream is not None and stream.isatty()
-    except (AttributeError, OSError, ValueError):
-        # A closed or detached stdin raises rather than answering False. Either
-        # way there is no terminal, which is the answer we needed.
-        interactive = False
-    return None if interactive else ASK_NO_TTY
+    # BOTH streams, because the prompt and the answer travel on different ones
+    # and checking only stdin leaves the wedge one stream over. The prompt is
+    # written to stderr, and `2> worker.log` is the natural way to capture this
+    # worker's log -- stdin stays a TTY, so the worker starts, and then the
+    # first approval prints THE WORKER IS BLOCKED into a file while it waits
+    # forever on a terminal showing nothing. Registry says idle. That is the
+    # exact failure the stdin check exists to prevent, reached by redirecting
+    # the other half.
+    streams = (
+        ("stdin", stdin if stdin is not None else sys.stdin),
+        ("the prompt stream", prompt_out if prompt_out is not None else sys.stderr),
+    )
+    for name, stream in streams:
+        try:
+            interactive = stream is not None and stream.isatty()
+        except (AttributeError, OSError, ValueError):
+            # A closed or detached stream raises rather than answering False.
+            # Either way there is no terminal, which is the answer we needed.
+            interactive = False
+        if not interactive:
+            return ASK_NO_TTY.replace("this process's stdin is not a TTY", f"{name} is not a TTY")
+    return None
 
 
 class WorkerLog:
@@ -511,7 +527,7 @@ class CodexWorker:
         nowhere to go.
         """
         config = self.config
-        refusal = no_terminal_for_ask(config.mode, self._prompt_in)
+        refusal = no_terminal_for_ask(config.mode, self._prompt_in, self._prompt_out)
         if refusal is not None:
             # Before connect(), before registration: nothing is spawned and
             # nothing is left behind. The CLI refuses earlier still; this is
