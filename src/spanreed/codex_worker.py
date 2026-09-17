@@ -170,7 +170,7 @@ rather than auto-declining, and the cost of that — one unanswered prompt stall
 the worker and its whole queue — is said out loud rather than discovered."""
 
 ASK_NO_TTY = (
-    "--mode ask needs a terminal to ask at, and this process's stdin is not a TTY. "
+    "--mode ask needs a terminal to ask at, and {stream} is not a TTY. "
     "Every approval in ask mode is put to the operator on this terminal and waits "
     "indefinitely for a y/n answer, so a worker started this way would block on its first "
     "approval forever while still looking healthy in the registry — the silent wedge this "
@@ -178,7 +178,14 @@ ASK_NO_TTY = (
     "--mode auto (the worker answers approvals itself, inside --cwd) or --mode full "
     "(nothing is asked at all)."
 )
-"""Why an ``ask`` worker refuses to start without a TTY. See :func:`no_terminal_for_ask`."""
+"""Why an ``ask`` worker refuses to start without a TTY. See :func:`no_terminal_for_ask`.
+
+``{stream}`` is filled in with the stream that failed. It is a format field
+rather than a phrase substituted by :meth:`str.replace` because the replace
+form silently no-ops when the sentence is reworded: the message would then say
+"stdin is not a TTY" for a `2> worker.log` redirect, naming the wrong stream
+for the wedge that actually shipped (#61 round 2). A missing field raises.
+"""
 
 _BUS_PREAMBLE = """\
 You are a Spanreed bus worker named {name}. You have no human attached and no terminal.
@@ -294,9 +301,9 @@ class WorkerConfig:
             raise ValueError(f"--mode must be one of {', '.join(MODES)}; got {self.mode!r}")
         resolved = self.cwd.expanduser().resolve()
         if not resolved.is_dir():
-            # A typo'd --cwd would otherwise become a security boundary drawn
-            # around a directory that does not exist, which reads as "contained"
-            # for nothing and fails at the first command instead of at startup.
+            # A typo'd --cwd would otherwise anchor every path check at a
+            # directory that does not exist, which reads as "contained" for
+            # nothing and fails at the first command instead of at startup.
             raise ValueError(f"--cwd must be an existing directory; {resolved} is not")
         object.__setattr__(self, "cwd", resolved)
 
@@ -384,7 +391,7 @@ def no_terminal_for_ask(
             # Either way there is no terminal, which is the answer we needed.
             interactive = False
         if not interactive:
-            return ASK_NO_TTY.replace("this process's stdin is not a TTY", f"{name} is not a TTY")
+            return ASK_NO_TTY.format(stream=name)
     return None
 
 

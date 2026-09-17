@@ -33,6 +33,7 @@ import ast
 import io
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -363,6 +364,29 @@ class TestAskModeNeedsATerminal:
         assert no_terminal_for_ask("ask", tty, io.StringIO()) is not None
         for headless in ("auto", "full"):
             assert no_terminal_for_ask(headless, io.StringIO(), io.StringIO()) is None, headless
+
+    def test_the_refusal_names_the_stream_that_actually_failed(self) -> None:
+        """`is not None` does not check WHICH stream the message blames.
+
+        The message is built by filling a `{stream}` field in ASK_NO_TTY. The
+        earlier form substituted a phrase with `str.replace`, which silently
+        no-ops if the sentence is reworded -- and the failure mode is a `2>
+        worker.log` worker told its *stdin* is the problem, sending the
+        operator to fix the one stream that was fine.
+        """
+        tty = FakeTerminal()
+        piped_stdin = no_terminal_for_ask("ask", io.StringIO(), tty)
+        redirected_prompt = no_terminal_for_ask("ask", tty, io.StringIO())
+        assert piped_stdin is not None and redirected_prompt is not None
+        assert "stdin is not a TTY" in piped_stdin
+        assert "the prompt stream is not a TTY" in redirected_prompt
+        # Distinct messages, and neither still carries the unfilled field.
+        assert piped_stdin != redirected_prompt
+        assert "{stream}" not in piped_stdin + redirected_prompt
+        # stdin is checked first, so a run with neither stream on a terminal
+        # reports stdin rather than silently blaming whichever came last.
+        both_bad = no_terminal_for_ask("ask", io.StringIO(), io.StringIO())
+        assert both_bad is not None and "stdin is not a TTY" in both_bad
 
     def test_a_closed_stdin_is_not_a_terminal(self) -> None:
         # A detached or closed stream raises from isatty() rather than
@@ -1322,38 +1346,119 @@ def test_no_prose_states_the_size_of_the_blacklist() -> None:
         )
 
 
-def test_the_design_docs_make_no_retracted_boundary_claim() -> None:
-    """The prose guard globs `src/spanreed/*.py` and reads nothing else.
+RETRACTED_IN_PROSE = (
+    "entire blast radius",
+    "the only bound on what",
+    "declines approvals for paths outside",
+    "declines every approval",
+    # The #61 round-1 instance, in its own words.
+    "every category app-server will route to a client should reach the operator",
+    # Round 2: this survived in `codex_client.py`'s ValueError and in
+    # `open-questions.md`, both outside the population the guard then read.
+    "bounds everything the worker may touch",
+    "security boundary",
+)
 
-    So a false claim in `architecture.md` or `README.md` is invisible to it --
-    and that is exactly where the review of #61 found one: a sentence saying
-    every category routed to a client "should reach the operator", about
-    `mcp_elicitations`, which are declined in every mode. A newly-worded false
-    claim in the document the PR existed to correct.
+
+def _prose_files() -> list[Path]:
+    """Every prose file in the repo, found rather than listed.
+
+    Round 2 of #61: the guard read `README.md` and `docs/architecture.md` --
+    the two files the previous review named -- out of a population of eight,
+    and the retracted claim survived in one of the six it skipped
+    (`docs/open-questions.md`, in the sentence pointing at this very design).
+    Naming the files the last reviewer found is how a guard stays exactly one
+    instance behind. A glob does not.
+    """
+    root = Path(__file__).parents[2]
+    return sorted([*root.glob("docs/*.md"), root / "README.md", root / "CHANGELOG.md"])
+
+
+def _hits(text: str) -> list[str]:
+    return [p for p in RETRACTED_IN_PROSE if p in text]
+
+
+def test_the_design_docs_make_no_retracted_boundary_claim() -> None:
+    """A false claim in prose is invisible to the `src/spanreed/*.py` guard.
+
+    That is exactly where the review of #61 found one: a sentence saying every
+    category routed to a client "should reach the operator", about
+    `mcp_elicitations`, which are declined in every mode -- a newly-worded
+    false claim in the document the PR existed to correct.
 
     The docs are where the claims that matter actually live, so they get the
     same blacklist the emitted strings do.
     """
-    root = Path(__file__).parents[2]
-    docs = [root / "README.md", root / "docs" / "architecture.md"]
-    forbidden = (
-        "entire blast radius",
-        "the only bound on what",
-        "declines approvals for paths outside",
-        "declines every approval",
-        # The #61 instance, in its own words.
-        "every category app-server will route to a client should reach the operator",
-    )
-    for doc in docs:
-        text = doc.read_text()
-        for phrase in forbidden:
-            assert phrase not in text, f"{doc.name}: {phrase!r}"
+    files = _prose_files()
+    assert len(files) >= 6, f"the glob found only {len(files)} prose files: {files}"
+    for doc in files:
+        hits = _hits(doc.read_text())
+        assert not hits, f"{doc.relative_to(Path(__file__).parents[2])}: {hits}"
 
 
 def test_that_docs_guard_can_actually_fail() -> None:
-    # A guard over files it cannot read passes everything. Prove both that the
-    # files exist and that the phrase list matches real text.
+    """A control for the PREDICATE, not just for the files loading.
+
+    The previous version asserted that `architecture.md` was non-empty and
+    mentioned `--cwd`. That proves the guard reads something; it does not prove
+    any phrase in the blacklist is detectable, and a blacklist whose entries
+    match nothing passes identically to a working one.
+    """
+    # Every phrase is individually detectable, so none is a typo that can never fire.
+    for phrase in RETRACTED_IN_PROSE:
+        assert _hits(f"prelude {phrase} coda") == [phrase], phrase
+    # ...and a clean document is clean, so the predicate is not matching everything.
+    assert _hits("`--cwd` anchors the sandbox's writable roots. Nothing here is forbidden.") == []
+    # The files really do load, which is the old control, kept.
     root = Path(__file__).parents[2]
     arch = (root / "docs" / "architecture.md").read_text()
     assert len(arch) > 5000, "architecture.md did not load; the guard above reads nothing"
     assert "--cwd" in arch, "the guard is reading a file that does not discuss the boundary"
+
+
+def _slug(heading: str) -> str:
+    """GitHub's anchor slug: lowercase, drop punctuation, EACH space to a hyphen.
+
+    Each, not each run: GitHub does not collapse whitespace, so a heading whose
+    punctuation sat between two spaces (`` `peers/<host>.json` — peer records ``)
+    slugs with a double hyphen. Collapsing here made this checker's first run
+    report a link in architecture.md as broken when the link was correct and the
+    rule was wrong -- a link checker that is wrong about slugs is worse than
+    none, because it teaches you to edit working links.
+    """
+    text = re.sub(r"`|\*|_", "", heading.strip())
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    return re.sub(r"\s", "-", text.strip()).lower()
+
+
+def test_every_cross_document_anchor_resolves() -> None:
+    """#61's F2: `architecture.md` cited a `findings.md` entry that did not exist.
+
+    It was a bare link with no anchor, so nothing could notice — the file
+    existed, and the run it pointed at was recorded nowhere. A reader following
+    the citation for a measurement under a breaking change landed on a document
+    that does not mention the date.
+
+    This checks the whole docs tree rather than that one link: a citation to a
+    heading that is not there is the same defect wherever it appears, and the
+    reason the original survived review twice is that no test read the links.
+    """
+    root = Path(__file__).parents[2]
+    files = {p.name: p for p in [*root.glob("docs/*.md"), root / "README.md"]}
+    headings = {
+        name: {_slug(m) for m in re.findall(r"^#{1,6}\s+(.+)$", p.read_text(), re.M)}
+        for name, p in files.items()
+    }
+    checked = 0
+    for name, path in files.items():
+        for target, anchor in re.findall(r"\]\(([\w./-]*\.md)#([\w-]+)\)", path.read_text()):
+            target_name = Path(target).name
+            if target_name not in headings:
+                continue  # a link out of the checked tree
+            checked += 1
+            assert anchor in headings[target_name], (
+                f"{name} links to {target_name}#{anchor}, which has no such heading. "
+                f"Headings there: {sorted(headings[target_name])}"
+            )
+    # A link checker that found no links passes everything.
+    assert checked >= 2, f"only {checked} cross-document anchors found; the regex is not matching"

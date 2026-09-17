@@ -594,14 +594,24 @@ GRANULAR_ASK: dict[str, object] = {
         # apply, and a policy it ignores leaves the worker on whatever default
         # it had -- the silent-failure shape this project keeps paying for.
         #
-        # `sandbox_approval` is the one the design names: it is what makes a
-        # sandbox escape a question rather than an outcome.
+        # `sandbox_approval` is the one the design names, and `True` is INFERRED
+        # to mean "ask about this category" from the field's name alone.
+        # ClientRequest.json types all five as bare booleans with no
+        # description, so the polarity is not readable from the schema. If
+        # `True` in fact means "grant this category without asking", every
+        # value in this object is backwards and `ask` is the most permissive
+        # confined mode rather than the least. This is the highest-risk unknown
+        # in the design; it is item 1 of architecture.md's "Not verifiable
+        # here", and a live `--doctor` run is what settles it. Stated here as
+        # the inference it is, because the doc hedging while the code asserts is
+        # how an inference becomes a fact between two readings.
         "sandbox_approval": True,
-        # The other two are set true for the same reason `ask` exists: every
-        # category app-server is willing to route to the client should reach
-        # the operator rather than being settled somewhere this worker cannot
-        # see. Whatever the worker cannot put to a human it declines, so the
-        # direction is also the closed one.
+        # The other two carry the same inferred polarity, set for the same
+        # reason `ask` exists: every category app-server is willing to route to
+        # the client should reach the operator rather than being settled
+        # somewhere this worker cannot see. Whatever the worker cannot put to a
+        # human it declines, so on the assumed polarity the direction is also
+        # the closed one.
         "mcp_elicitations": True,
         "rules": True,
         # OPTIONAL, and sent explicitly at their schema defaults rather than

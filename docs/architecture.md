@@ -231,9 +231,11 @@ up would have to be kept true to software we do not control.
 
 **Both levels are sent.** `thread/start` takes `sandbox` (a `SandboxMode` enum)
 and `turn/start` takes `sandboxPolicy` (an object with `writableRoots`). Sending
-only the turn-level one confines nothing — measured on 2026-09-17, see
-[findings.md](findings.md). The doctor had that bug and reported it as a total
-absence of confinement, which was its own defect and not Codex's.
+only the turn-level one confines nothing — measured on 2026-09-17, recorded in
+[findings.md](findings.md#incident-the-confinement-measurement-that-motivated-the-three-mode-redesign-was-taken-against-a-thread-with-no-sandbox-2026-09-17).
+The doctor had that bug and reported it as a total absence of confinement, which
+was its own defect and not Codex's — read the entry before citing the run for
+anything else, because it bounds what that measurement can support.
 
 ### Approvals in `ask` mode go to a terminal, never to the bus
 

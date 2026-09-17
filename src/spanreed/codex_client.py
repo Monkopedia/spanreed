@@ -799,15 +799,23 @@ class CodexClient:
         for name, why in PROHIBITED_THREAD_START_PARAMS.items():
             if name in params:
                 raise ValueError(why)
-        # `cwd` is the worker's whole security boundary and the doc gives it no
-        # default — not $HOME, not the process cwd, not whatever config.toml
-        # marks trusted. Inheriting one on the machine this was validated on
-        # would have scoped a worker to the entire home directory, so the
-        # omission is refused here too rather than only at the layer above.
+        # `cwd` anchors the sandbox's writable roots and every path check
+        # decide() makes, and the doc gives it no default — not $HOME, not the
+        # process cwd, not whatever config.toml marks trusted. Inheriting one on
+        # the machine this was validated on would have anchored a worker at the
+        # entire home directory, so the omission is refused here too rather than
+        # only at the layer above.
+        #
+        # It is NOT "the worker's whole security boundary", which is what this
+        # comment and the message below used to say. An approved shell command
+        # is a process, and no path check bounds what a process does; `cwd`
+        # bounds what the policy CHECKS. See architecture.md, "What spanreed
+        # does NOT claim".
         if not params.get("cwd"):
             raise ValueError(
-                "thread_start requires an explicit cwd: it bounds everything the worker may "
-                "touch, and app-server's default would be inherited from the environment"
+                "thread_start requires an explicit cwd: it anchors the sandbox's writable "
+                "roots and every path check the approval policy makes, and app-server's "
+                "default would be inherited from the environment"
             )
         return self.request("thread/start", params)
 
