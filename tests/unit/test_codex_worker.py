@@ -1462,3 +1462,24 @@ def test_every_cross_document_anchor_resolves() -> None:
             )
     # A link checker that found no links passes everything.
     assert checked >= 2, f"only {checked} cross-document anchors found; the regex is not matching"
+
+
+def test_the_mode_help_points_at_the_renamed_flags(capsys: pytest.CaptureFixture[str]) -> None:
+    """0.3.0 removes `--mode workspace|danger`; argparse just says "invalid choice".
+
+    A breaking rename on a documented CLI surface whose error names the new
+    values but never the old ones leaves the operator to guess which new mode
+    their script meant. The mapping is not one an error message can infer, so
+    the help text carries it.
+    """
+    parser = cli.build_parser()
+    # `spanreed codex --help`, because the mapping lives on the subcommand --
+    # reading the top-level help instead is how the first version of this test
+    # failed for the wrong reason.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["codex", "--help"])
+    help_text = capsys.readouterr().out
+    for old_name, new_name in (("workspace", "auto"), ("danger", "full")):
+        assert old_name in help_text, f"the help does not mention the removed --mode {old_name}"
+        assert new_name in help_text
+    assert "0.3.0" in help_text

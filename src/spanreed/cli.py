@@ -891,7 +891,9 @@ def build_parser() -> argparse.ArgumentParser:
         "every approval is put to you on this terminal, where it waits indefinitely (so it "
         "refuses to start without a TTY). auto (default): workspace-write, and the worker "
         "answers approvals itself from --cwd, logging every one. full: no sandbox and "
-        "nothing is asked of anyone, warned at startup and on every turn.",
+        "nothing is asked of anyone, warned at startup and on every turn. "
+        "RENAMED in 0.3.0: the old --mode workspace is now auto, and --mode danger is now "
+        "full. argparse rejects the old names, and it cannot say why on its own.",
     )
     p_codex.add_argument(
         "--instructions",
