@@ -1,8 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 ### Codex worker: `--mode ask | auto | full`
+
+**Upgrading:** if any script or unit file passes `--mode workspace` or `--mode
+danger`, it will stop starting — argparse refuses the removed names rather than
+mapping them. `workspace` is now `auto` (the default, so dropping the flag
+entirely also works) and `danger` is now `full`.
 
 **`--mode workspace` and `--mode danger` are gone.** The modes now mirror
 Codex's own three permission modes, because the thing being configured is
