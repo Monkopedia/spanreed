@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -80,6 +81,21 @@ class Step:
     answers: str = ""
 
     def ok(self, detail: str) -> None:
+        """Record a success -- but never erase a qualification already made.
+
+        Step 4 in ``ask`` mode warns, at the top of the step, that the run does
+        not exercise the operator prompt; it then runs the escape probe, whose
+        success called ``ok`` and reset the verdict to PASS. The qualification
+        was written before the verdict that overwrote it, so a clean ``--doctor
+        --mode ask`` printed "Everything passed" over the one path it does not
+        take. The ordering is the trap, so the fix is not to reorder the two
+        calls: a WARN is an observation about this step, and a later success in
+        some other sub-check of the same step does not un-observe it. FAIL still
+        overrides -- a failure outranks a qualification.
+        """
+        if self.verdict == "WARN":
+            self.detail = f"{self.detail} (the rest of the step: {detail})"
+            return
         self.verdict, self.detail = "PASS", detail
 
     def no(self, detail: str) -> None:
@@ -316,10 +332,22 @@ def run_doctor(
     timeout: float = 240.0,
     turn_timeout: float = 300.0,
     out: TextIO | None = None,
+    make_client: Callable[..., Any] = CodexClient,
 ) -> int:
     """Exercise the whole worker path against a real Codex and report.
 
     Returns 0 only if every step that ran passed.
+
+    ``make_client`` exists so the step bodies can be executed. Round 2 of #61
+    measured the consequence of their being unreachable: step 4's ``ask``
+    qualification was overwritten by the verdict meant to qualify it, the bug
+    survived a round of review, and the test shipped to prove it fixed asserted
+    the mechanism (a bare ``Step``, warned and rendered) instead of the
+    behaviour, so it passed with the bug in place. A stub server is a lie about
+    Codex -- which is why step 4 says so in its own output, and why the escape
+    probe's verdicts are still only trustworthy against a live server -- but it
+    is not a lie about this module's control flow, and the control flow is what
+    was broken. Production passes nothing and gets ``CodexClient``.
     """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     log_path = log_path or (Path.cwd() / f"spanreed-codex-doctor-{stamp}.log")
@@ -482,6 +510,7 @@ def run_doctor(
         turn_timeout,
         sandbox,
         (s1, s2, s3, s4),
+        make_client,
     )
 
 
@@ -573,6 +602,7 @@ def _run_protocol_steps(
     turn_timeout: float,
     sandbox: dict[str, Any],
     steps: tuple[Step, Step, Step, Step],
+    make_client: Callable[..., Any],
 ) -> int:
     s1, s2, s3, s4 = steps
     # (method, params, approved, value_sent). The decision is recorded because
@@ -610,7 +640,7 @@ def _run_protocol_steps(
         seen_notifications.append(method)
         rep.say(f"    <- {method}  {json.dumps(params)[:130]}")
 
-    client = CodexClient(
+    client = make_client(
         timeout=timeout,
         turn_timeout=turn_timeout,
         on_server_request=on_request,

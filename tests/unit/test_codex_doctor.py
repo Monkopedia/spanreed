@@ -17,15 +17,21 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import tempfile
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from spanreed.codex_approvals import MODES
+from spanreed.codex_client import TurnResult
 from spanreed.codex_doctor import (
+    ESCAPE_MARKER,
     MARKER,
+    SCHEMA_CODEX_VERSION,
     Report,
     Step,
     redacted_auth,
@@ -634,3 +640,225 @@ class TestTheDoctorQualifiesWhatItDidNotRun:
         assert SCHEMA_CODEX_VERSION in readme, (
             "codex_doctor.SCHEMA_CODEX_VERSION disagrees with the vendored schema README"
         )
+
+
+# --------------------------------------------------------------------------
+# Driving the step bodies. Round 2 of #61: steps 1-4 were unreachable from the
+# entire suite, and the consequence was measured rather than hypothesised --
+# step 4's `ask` qualification was overwritten by the verdict meant to qualify
+# it, shipped, survived a round of review, and the test written to prove it
+# fixed asserted a bare Step warned-and-rendered instead of the run, so it
+# passed with the bug in place.
+
+
+@dataclass
+class Doctored:
+    """The fake machine a doctor run happens on."""
+
+    home: Path
+    work: Path
+    tmp: Path
+
+
+class FakeAppServer:
+    """A stand-in for CodexClient covering exactly what run_doctor calls.
+
+    This is NOT a claim about Codex, and step 4 says as much in its own output
+    ("the step that cannot be tested against a stub"): whether a live server
+    accepts our decision enum, and whether either sandbox level confines
+    anything, are questions only a real app-server answers. What a stub can
+    answer is this module's control flow -- which verdict survives, which
+    banner prints, what the exit code is -- and that is what was broken.
+    """
+
+    def __init__(
+        self,
+        *,
+        on_server_request: Callable[[str, dict[str, Any]], dict[str, Any] | None],
+        on_notification: Callable[[str, dict[str, Any]], None],
+        cwd: Path,
+        probe: Path,
+        escape_lands: bool = False,
+        **_: Any,
+    ) -> None:
+        self.on_server_request = on_server_request
+        self.on_notification = on_notification
+        self.cwd = cwd
+        self.probe = probe
+        self.escape_lands = escape_lands
+        self.socket_path = "/tmp/fake-app-server.sock"
+        self.turns: list[tuple[str, dict[str, Any]]] = []
+        self.thread_params: dict[str, Any] = {}
+
+    def connect(self) -> dict[str, Any]:
+        return {"userAgent": "fake-app-server/0"}
+
+    def thread_start(self, **params: Any) -> dict[str, Any]:
+        self.thread_params = params
+        return {"threadId": "th-fake"}
+
+    def turn_start(self, thread_id: str, text: str, **params: Any) -> None:
+        self.turns.append((text, params))
+        if ESCAPE_MARKER in text:
+            # The escape turn: the server asks before running a command, the
+            # way a real one does under an approval policy. cwd is inside the
+            # doctor's --cwd, so decide() approves and wire_decision maps it --
+            # the shape that reaches step 4's PASS branch.
+            self.on_server_request(
+                "execCommandApproval",
+                {"command": ["sh", "-c", "echo hi"], "cwd": str(self.cwd)},
+            )
+            if self.escape_lands:
+                self.probe.write_text(ESCAPE_MARKER + "\n")
+
+    def wait_for_turn(self, **_: Any) -> TurnResult:
+        text = self.turns[-1][0]
+        said = MARKER if MARKER in text and ESCAPE_MARKER not in text else "done"
+        return TurnResult(
+            completed=True,
+            terminal="turn/completed",
+            events=[("item/completed", {"item": {"type": "agentMessage", "text": said}})],
+        )
+
+    def server_log(self) -> str:
+        return "(fake app-server: no log)"
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def doctored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Doctored]:
+    """A machine run_doctor can get all the way through step 4 on.
+
+    HOME is redirected so the escape probe cannot touch the operator's real
+    home, and --cwd is elsewhere so the probe is outside every writable root
+    the run sends -- otherwise step 4 SKIPs and the thing under test never runs.
+
+    The fake home is a dedicated directory under the REAL home rather than
+    under ``tmp_path``, and that is not arbitrary: the probe path must be
+    outside every writable root, and those roots include ``/tmp`` and
+    ``$TMPDIR`` (``excludeSlashTmp`` and ``excludeTmpdirEnvVar`` both default
+    to false). ``tmp_path`` is under ``/tmp``, so a fake home there is inside a
+    writable root and step 4 correctly SKIPs -- which is how the first draft of
+    these tests "passed" step 4 without running it.
+    """
+    real_home = Path(os.path.expanduser("~"))
+    if not os.access(real_home, os.W_OK):
+        pytest.skip(f"{real_home} is not writable; the escape probe needs a home outside /tmp")
+    home = real_home / f".spanreed-doctor-test-{os.getpid()}-{abs(hash(tmp_path)) % 10**6}"
+    work = tmp_path / "work"
+    bin_dir = tmp_path / "bin"
+    for d in (home, work, bin_dir):
+        d.mkdir()
+    stub = bin_dir / "codex"
+    # The real version, so the schema-mismatch finding does not fire: a finding
+    # forces rc 1 and its own banner, which would mask what these tests read.
+    stub.write_text(f"#!/bin/sh\necho 'codex-cli {SCHEMA_CODEX_VERSION}'\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("SPANREED_STATE_ROOT", str(tmp_path / "state"))
+
+    def _home(cls: type[Path]) -> Path:
+        return home
+
+    monkeypatch.setattr(Path, "home", classmethod(_home))
+    try:
+        yield Doctored(home=home, work=work, tmp=tmp_path)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def _run(
+    doctored: Doctored, mode: str, *, escape_lands: bool = False
+) -> tuple[int, str, FakeAppServer]:
+    out = io.StringIO()
+    made: list[FakeAppServer] = []
+    probe = doctored.home / f".spanreed-doctor-escape-{os.getpid()}.txt"
+
+    def make_client(**kw: Any) -> FakeAppServer:
+        client = FakeAppServer(cwd=doctored.work, probe=probe, escape_lands=escape_lands, **kw)
+        made.append(client)
+        return client
+
+    rc = run_doctor(
+        cwd=doctored.work,
+        mode=mode,
+        log_path=doctored.tmp / f"doctor-{mode}.log",
+        out=out,
+        make_client=make_client,
+    )
+    return rc, out.getvalue(), made[0]
+
+
+def test_step_4_actually_runs_and_passes_in_auto_mode(doctored: Doctored) -> None:
+    """The control. Without this, the ask test below proves nothing.
+
+    If step 4 never reached a PASS, the `ask` assertion would hold for the
+    uninteresting reason -- the step warned and nothing overwrote it because
+    nothing ran at all. This pins that the same run, one mode over, does reach
+    the unqualified banner.
+    """
+    rc, text, fake = _run(doctored, "auto")
+    assert "4. [PASS" in text, text
+    assert "Everything passed. A Codex worker can run on this machine." in text
+    assert rc == 0
+    # The probe turn really was driven, and the approval really was answered.
+    assert any(ESCAPE_MARKER in t for t, _ in fake.turns), fake.turns
+    assert "execCommandApproval->'approved'" in text
+
+
+def test_ask_mode_keeps_its_qualification_through_a_passing_step_4(doctored: Doctored) -> None:
+    """F4, round 2. The bug: the WARN was written before the verdict.
+
+    Step 4 warns at the top that the run does not exercise the operator prompt,
+    then runs the escape probe, whose success called ``Step.ok``. The
+    qualification vanished and a clean ``--doctor --mode ask`` printed
+    "Everything passed" over the one path that defines the mode.
+    """
+    rc, text, fake = _run(doctored, "ask")
+    # The step did run and did succeed -- same probe, same approval as auto.
+    assert any(ESCAPE_MARKER in t for t, _ in fake.turns), fake.turns
+    assert "execCommandApproval->'approved'" in text
+    # ...and the qualification survived it.
+    assert "4. [WARN" in text, text
+    assert "Everything passed" not in text
+    assert "did not pass" in text
+    assert "was not exercised" in text
+    # The successful probe's own detail is not lost, just demoted.
+    assert "the rest of the step:" in text
+    assert rc == 0  # a WARN is not a failure and not a finding
+
+
+def test_full_mode_skips_step_4_rather_than_failing_the_documented_behaviour(
+    doctored: Doctored,
+) -> None:
+    rc, text, fake = _run(doctored, "full")
+    assert "4. [SKIP" in text, text
+    assert "Everything passed" not in text
+    assert not any(ESCAPE_MARKER in t for t, _ in fake.turns), fake.turns
+    # A SKIP is not a failure: the mode is behaving as documented, and the
+    # banner at the top of the run is where `full` is called dangerous.
+    assert rc == 0
+    assert "MODE=full" in text and "NO SANDBOX" in text
+
+
+def test_a_landed_escape_is_a_finding_and_sets_the_exit_code(doctored: Doctored) -> None:
+    """The alarming path, end to end: finding, banner, rc -- not just a verdict."""
+    rc, text, _ = _run(doctored, "auto", escape_lands=True)
+    assert "FINDING(S)" in text
+    assert "The sandbox did not prevent it." in text
+    assert "Everything passed. A Codex worker can run" not in text
+    assert rc == 1
+
+
+def test_ok_does_not_erase_a_warn_but_fail_still_overrides() -> None:
+    """The invariant behind F4's fix, stated once at the unit level."""
+    s = Step(n=1, question="q")
+    s.warn("qualified")
+    s.ok("succeeded")
+    assert s.verdict == "WARN"
+    assert "qualified" in s.detail and "succeeded" in s.detail
+    s.no("broke")
+    assert s.verdict == "FAIL" and s.detail == "broke"
