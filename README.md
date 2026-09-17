@@ -4,7 +4,9 @@ An inter-agent message bus for local Claude Code sessions. Run one Claude sessio
 
 > ## ⚠️ Read this first: Claude Code does most of this natively now
 >
-> Since **Claude Code v2.1.224**, sessions can message each other with no plugin,
+> Since **Claude Code v2.1.224** (v2.1.234 on native Windows; v2.1.248 for
+> same-machine messaging on Bedrock / Agent Platform / Foundry or with
+> feature-flag fetching off), sessions can message each other with no plugin,
 > no MCP server, and no registry: `ListAgents` finds your other sessions and
 > `SendMessage` delivers text to one by name, over a per-session socket. An idle
 > session is woken with the message; a busy one reads it between tool calls.
@@ -23,9 +25,11 @@ An inter-agent message bus for local Claude Code sessions. Run one Claude sessio
 >
 > **That is spanreed's core — discovery, delivery, and waking an idle peer — and
 > it was the hardest part to build.** If that is all you came here for, use the
-> native feature. It costs no context tokens, has no registry to go stale, and
-> ships with inbound controls (`crossSessionInbound`), per-sender rate limiting,
-> and loop protection that this project does not have.
+> native feature. It needs no install and no MCP tool surface, and it ships with
+> inbound controls (`crossSessionInbound`), per-sender rate limiting, and loop
+> protection that this project does not have. (It is not free: `ListAgents` and
+> `SendMessage` are always-on built-ins, and a delivered message counts toward
+> usage like a prompt you typed.)
 >
 > **What it does not do**, and why this repo still exists:
 >
@@ -35,12 +39,23 @@ An inter-agent message bus for local Claude Code sessions. Run one Claude sessio
 > - **Threading.** Native messages are plain text with no correlation id. Spanreed
 >   carries `msg_id` / `in_reply_to` and a blocking `wait_for_reply`, which is
 >   what request/response between agents is built on.
-> - **Durable mail.** Native delivery needs a live peer bound to a socket. Spanreed
->   inboxes are files, so mail waits for a session that is not running yet.
+> - **Durable mail.** Native same-machine delivery needs a live peer bound to a
+>   socket, so nothing holds mail for a session that does not exist yet. (A
+>   cross-machine message to a peer listed `offline` *is* queued until its machine
+>   reconnects.) Spanreed inboxes are files, so mail waits either way.
 > - **Fleet state.** `focus`, `status`, and the [activity log](docs/architecture.md#activity-log-presence-history)
 >   — a pull-based read on what every agent is doing and a history of it. Native's
 >   closest primitive is a one-shot idle notice.
 > - **Cross-host on a managed account**, per the paragraph above.
+>
+> **One migration hazard worth knowing before you try it.** With no
+> `crossSessionInbound` value set, Claude Code decides per message from the two
+> sessions' permission modes: a session that bypasses permission prompts **holds**
+> every message from a sender that does not also bypass, behind an approval dialog
+> that expires after five minutes by default (`dialogExpiry`). A fleet running in
+> bypass mode can therefore look silently one-directional. Setting
+> `crossSessionInbound: accept` is the fix, and it is worth setting deliberately
+> rather than discovering.
 >
 > **Not yet measured here:** whether native messaging holds up under this project's
 > own traffic pattern — bursts of multi-kilobyte review reports between ~20 agents —
