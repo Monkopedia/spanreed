@@ -609,8 +609,11 @@ class TestBusAndFilesystem:
 
 
 class TestCwdBoundary:
-    """`--cwd` is the worker's entire security boundary. None of these weaken
-    it; they ask what happens when the directory itself misbehaves."""
+    """`--cwd` anchors the sandbox's writable roots and every path check the
+    approval policy makes. It is NOT the worker's entire security boundary --
+    an approved command is a process, and no path check bounds what a process
+    does. None of these weaken the anchor; they ask what happens when the
+    directory itself misbehaves."""
 
     def test_a_symlinked_cwd_is_resolved_once_and_bounds_both_ways(
         self, make_worker: MakeWorker, store: StateStore, tmp_path: Path

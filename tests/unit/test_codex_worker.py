@@ -34,6 +34,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -59,6 +60,7 @@ from spanreed.codex_worker import (
 )
 from spanreed.protocol import Message
 from spanreed.store import StateStore
+from tests.unit.retracted_claims import FORBIDDEN_IN_EMITTED_STRINGS, RETRACTED_IN_PROSE
 from tests.unit.test_codex_client import Handler, StubServer
 
 SENDER = "agent-sender"
@@ -1207,9 +1209,9 @@ class TestNoBoundaryClaimInAnyEmittedString:
     substring blacklist (see FORBIDDEN), so a newly-worded sentence making the same
     claim passes. The review of #56 demonstrated exactly that: a fresh sentence
     in the DEFAULT mode's preamble, green across the whole suite. It also
-    demonstrated the one-word hole: "the only bound on what THE worker may
-    touch" is blacklisted and "...what THIS worker may touch" was not, and
-    shipped in cli.py.
+    demonstrated the one-word hole: the blacklisted phrasing named THE worker,
+    the sentence that shipped in cli.py named THIS worker, and one word was the
+    whole difference.
 
     The docstring above argues completeness at length and all of it is about
     which *sites* are scanned. That is the half that was fixed. The predicate is
@@ -1217,17 +1219,10 @@ class TestNoBoundaryClaimInAnyEmittedString:
     docs/open-questions.md rather than half-built here.
     """
 
-    FORBIDDEN = (
-        "declined outside it",
-        "granted inside it",
-        # Both articles: "the" was blacklisted, "this" shipped in cli.py.
-        "only bound on what the worker may touch",
-        "only bound on what this worker may touch",
-        "whole blast radius",
-        "declines approvals for paths outside",
-        "declines every approval",
-        "buys you nothing",
-    )
+    # Defined in `retracted_claims.py`, with the prose blacklist, because the
+    # repo-wide guard has to scan this file too and a blacklist is made of the
+    # strings it forbids.
+    FORBIDDEN = FORBIDDEN_IN_EMITTED_STRINGS
 
     @staticmethod
     def _emitted_strings(path: Path) -> list[str]:
@@ -1346,36 +1341,77 @@ def test_no_prose_states_the_size_of_the_blacklist() -> None:
         )
 
 
-RETRACTED_IN_PROSE = (
-    "entire blast radius",
-    "the only bound on what",
-    "declines approvals for paths outside",
-    "declines every approval",
-    # The #61 round-1 instance, in its own words.
-    "every category app-server will route to a client should reach the operator",
-    # Round 2: this survived in `codex_client.py`'s ValueError and in
-    # `open-questions.md`, both outside the population the guard then read.
-    "bounds everything the worker may touch",
-    "security boundary",
-)
+def _claim_bearing_files() -> list[Path]:
+    """Every file in the repo that can carry a claim in prose, from `git ls-files`.
 
+    Not a glob over the directories the last review named. Round 2 read
+    `README.md` and `docs/architecture.md`, two of eight, and the retracted
+    claim survived in `docs/open-questions.md`. Round 3 read `docs/*.md` plus
+    two named files, eight of twelve -- and the claim survived in
+    `tests/unit/test_codex_worker_faults.py`, in a class docstring, in a file
+    the very commit titled "retract the boundary claim where it is still
+    asserted" had edited fifty lines below. Twice the guard was widened to the
+    population the last instance was found in, and twice the next instance was
+    outside it.
 
-def _prose_files() -> list[Path]:
-    """Every prose file in the repo, found rather than listed.
-
-    Round 2 of #61: the guard read `README.md` and `docs/architecture.md` --
-    the two files the previous review named -- out of a population of eight,
-    and the retracted claim survived in one of the six it skipped
-    (`docs/open-questions.md`, in the sentence pointing at this very design).
-    Naming the files the last reviewer found is how a guard stays exactly one
-    instance behind. A glob does not.
+    So the population is the repo. `.py` is included alongside `.md` because
+    the src-side guard deliberately excludes docstrings and comments (it scans
+    emitted strings), which is the exact gap the class docstring sat in, and
+    because nothing scanned `tests/` at all.
     """
     root = Path(__file__).parents[2]
-    return sorted([*root.glob("docs/*.md"), root / "README.md", root / "CHANGELOG.md"])
+    listed = subprocess.run(
+        ["git", "ls-files", "*.md", "*.py"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    # The blacklist's own file, and only it: see retracted_claims.__doc__.
+    blacklist_file = Path(__file__).with_name("retracted_claims.py")
+    return sorted(root / name for name in listed if (root / name) != blacklist_file)
+
+
+# A phrase may legitimately appear where it is being DENIED -- the retraction in
+# `codex_client.py` quotes the claim in order to reject it, and `codex_worker.py`
+# quotes it followed by "was false". So both sides are checked: a denial can
+# precede the phrase ("it is NOT the worker's...") or follow it ("...was false").
+# The trailing window is deliberately much shorter, because a denial two
+# sentences later is about something else.
+_DENIAL = re.compile(
+    r"\b(not|never|no longer|false|untrue|wrong|retract\w*|stop\w* (?:claim|describ)\w*)\b",
+    re.I,
+)
+_DENIAL_BEFORE = 90
+_DENIAL_AFTER = 40
 
 
 def _hits(text: str) -> list[str]:
-    return [p for p in RETRACTED_IN_PROSE if p in text]
+    """Case-insensitive, and blind to a phrase that is being retracted.
+
+    Case-insensitive because "Security boundary" at the start of a sentence is
+    the same claim; morphology ("boundaries") still slips, which is the same
+    open half the src-side guard's docstring concedes.
+    """
+    found: list[str] = []
+    low = text.lower()
+    for phrase in RETRACTED_IN_PROSE:
+        for i in _offsets(low, phrase.lower()):
+            end = i + len(phrase)
+            near = text[max(0, i - _DENIAL_BEFORE) : i] + " || " + text[end : end + _DENIAL_AFTER]
+            if not _DENIAL.search(near):
+                found.append(phrase)
+                break
+    return found
+
+
+def _offsets(haystack: str, needle: str) -> list[int]:
+    out: list[int] = []
+    i = haystack.find(needle)
+    while i != -1:
+        out.append(i)
+        i = haystack.find(needle, i + 1)
+    return out
 
 
 def test_the_design_docs_make_no_retracted_boundary_claim() -> None:
@@ -1386,14 +1422,15 @@ def test_the_design_docs_make_no_retracted_boundary_claim() -> None:
     `mcp_elicitations`, which are declined in every mode -- a newly-worded
     false claim in the document the PR existed to correct.
 
-    The docs are where the claims that matter actually live, so they get the
-    same blacklist the emitted strings do.
+    The claims that matter live in prose, so prose gets the same blacklist the
+    emitted strings do.
     """
-    files = _prose_files()
-    assert len(files) >= 6, f"the glob found only {len(files)} prose files: {files}"
+    files = _claim_bearing_files()
+    assert len(files) >= 35, f"the listing found only {len(files)} files"
+    root = Path(__file__).parents[2]
     for doc in files:
-        hits = _hits(doc.read_text())
-        assert not hits, f"{doc.relative_to(Path(__file__).parents[2])}: {hits}"
+        hits = _hits(doc.read_text(encoding="utf-8", errors="replace"))
+        assert not hits, f"{doc.relative_to(root)}: {hits}"
 
 
 def test_that_docs_guard_can_actually_fail() -> None:
@@ -1407,6 +1444,8 @@ def test_that_docs_guard_can_actually_fail() -> None:
     # Every phrase is individually detectable, so none is a typo that can never fire.
     for phrase in RETRACTED_IN_PROSE:
         assert _hits(f"prelude {phrase} coda") == [phrase], phrase
+        # ...including capitalised, which a case-sensitive `in` missed.
+        assert _hits(f"Prelude. {phrase.capitalize()} coda") == [phrase], phrase
     # ...and a clean document is clean, so the predicate is not matching everything.
     assert _hits("`--cwd` anchors the sandbox's writable roots. Nothing here is forbidden.") == []
     # The files really do load, which is the old control, kept.
@@ -1414,6 +1453,29 @@ def test_that_docs_guard_can_actually_fail() -> None:
     arch = (root / "docs" / "architecture.md").read_text()
     assert len(arch) > 5000, "architecture.md did not load; the guard above reads nothing"
     assert "--cwd" in arch, "the guard is reading a file that does not discuss the boundary"
+
+
+def test_a_retracted_claim_is_exempt_only_where_it_is_being_denied() -> None:
+    """The denial exemption is the guard's soft spot, so it gets its own control.
+
+    Without it the guard flags its own retractions -- `codex_client.py` quotes
+    the claim in order to reject it, and `codex_worker.py` quotes it followed by
+    "was false". With it too loose, an assertion near an unrelated "not" walks
+    free. Both directions are pinned here.
+
+    Every case is built from `RETRACTED_IN_PROSE` rather than from a literal:
+    the first draft wrote a phrase out in full, and the repo-wide guard --
+    which reads this file -- flagged this test as an assertion of the claim.
+    """
+    for phrase in RETRACTED_IN_PROSE:
+        # Denied before, and denied after: exempt.
+        assert _hits(f"This is NOT the case: {phrase}.") == [], phrase
+        assert _hits(f"Saying {phrase} was false.") == [], phrase
+        # Asserted flatly: caught.
+        assert _hits(f"The design says {phrase} and relies on it.") == [phrase], phrase
+        # A denial two sentences later does not reach back and exempt it.
+        far = f"The design says {phrase}. " + "Filler. " * 12 + "Elsewhere that is not so."
+        assert _hits(far) == [phrase], phrase
 
 
 def _slug(heading: str) -> str:
@@ -1444,7 +1506,11 @@ def test_every_cross_document_anchor_resolves() -> None:
     reason the original survived review twice is that no test read the links.
     """
     root = Path(__file__).parents[2]
-    files = {p.name: p for p in [*root.glob("docs/*.md"), root / "README.md"]}
+    # CHANGELOG.md was in neither the source nor the target set, and it cites
+    # findings.md.
+    files = {
+        p.name: p for p in [*root.glob("docs/*.md"), root / "README.md", root / "CHANGELOG.md"]
+    }
     headings = {
         name: {_slug(m) for m in re.findall(r"^#{1,6}\s+(.+)$", p.read_text(), re.M)}
         for name, p in files.items()
@@ -1463,9 +1529,20 @@ def test_every_cross_document_anchor_resolves() -> None:
     # A link checker that found no links passes everything.
     assert checked >= 2, f"only {checked} cross-document anchors found; the regex is not matching"
 
+    # Bare links carry no anchor to resolve, but the file has to exist -- and
+    # they are the majority, so leaving them unchecked leaves most of the
+    # linking unguarded.
+    bare = 0
+    for name, path in files.items():
+        for target in re.findall(r"\]\(([\w./-]*\.md)\)", path.read_text()):
+            resolved = (path.parent / target).resolve()
+            bare += 1
+            assert resolved.is_file(), f"{name} links to {target}, which does not exist"
+    assert bare >= 5, f"only {bare} bare document links found; the regex is not matching"
+
 
 def test_the_mode_help_points_at_the_renamed_flags(capsys: pytest.CaptureFixture[str]) -> None:
-    """0.3.0 removes `--mode workspace|danger`; argparse just says "invalid choice".
+    """This branch removes `--mode workspace|danger`; argparse says "invalid choice".
 
     A breaking rename on a documented CLI surface whose error names the new
     values but never the old ones leaves the operator to guess which new mode
@@ -1482,4 +1559,8 @@ def test_the_mode_help_points_at_the_renamed_flags(capsys: pytest.CaptureFixture
     for old_name, new_name in (("workspace", "auto"), ("danger", "full")):
         assert old_name in help_text, f"the help does not mention the removed --mode {old_name}"
         assert new_name in help_text
-    assert "0.3.0" in help_text
+    # NOT a version number. `pyproject.toml` is bumped in a dedicated release
+    # commit, so any version named here ahead of that is a prediction -- and an
+    # `assert "0.3.0" in help_text` passes whether or not the release lands as
+    # 0.3.0, which is asserting the prediction rather than deriving the fact.
+    assert "CHANGELOG" in help_text

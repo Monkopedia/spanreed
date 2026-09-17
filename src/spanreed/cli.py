@@ -892,8 +892,12 @@ def build_parser() -> argparse.ArgumentParser:
         "refuses to start without a TTY). auto (default): workspace-write, and the worker "
         "answers approvals itself from --cwd, logging every one. full: no sandbox and "
         "nothing is asked of anyone, warned at startup and on every turn. "
-        "RENAMED in 0.3.0: the old --mode workspace is now auto, and --mode danger is now "
-        "full. argparse rejects the old names, and it cannot say why on its own.",
+        "RENAMED: the old --mode workspace is now auto, and --mode danger is now full. "
+        "argparse rejects the old names, and it cannot say why on its own. The release "
+        "that renamed them is the one named in CHANGELOG.md -- not stated here, because "
+        "this string cannot check it: the version is bumped in a release commit, so a "
+        "number written here before the release is a prediction, and a test pinning the "
+        "prediction passes whatever ships.",
     )
     p_codex.add_argument(
         "--instructions",
