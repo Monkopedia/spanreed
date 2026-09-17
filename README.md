@@ -106,12 +106,33 @@ spanreed codex --name reviewer --cwd ~/some/project
 ```
 
 `--cwd` is **required and has no default**. It is what the worker checks
-approvals against and what it asks Codex to sandbox: approvals are
-auto-approved inside it, any registered agent may wake the worker, and the bus
-does not authenticate senders. What the sandbox then enforces depends on
-`--mode` — under `danger` there is no sandbox at all. `--mode` picks the
-confinement — `workspace` (default, writes confined to `--cwd`) or `danger` (no
-sandbox at all, which warns on startup and on every turn).
+approvals against and what it sends to Codex as `writableRoots`: in the default
+mode an approval inside it is granted without asking anybody, any registered
+agent may wake the worker, and the bus does not authenticate senders.
+
+`--mode` mirrors Codex's own three permission modes rather than inventing a
+fourth vocabulary:
+
+| `--mode` | sandbox | approvals | answered by |
+|---|---|---|---|
+| `ask` | `workspace-write`, writes scoped to `--cwd` | granular | **you**, at the worker's terminal |
+| `auto` (default) | `workspace-write`, writes scoped to `--cwd` | `on-request` | the worker, every decision logged |
+| `full` | none (`danger-full-access`) | `never` | nobody; warns at startup and on every turn |
+
+```bash
+spanreed codex --name reviewer --cwd ~/some/project --mode ask
+```
+
+`ask` prompts on the worker's own terminal — never on the bus — and **waits
+there indefinitely**: nothing is declined on your behalf, and until you answer,
+that turn and every message queued behind it are stopped. Because of that it
+**refuses to start when stdin is not a terminal**, since a worker with nobody
+to ask would block on its first approval forever while still looking healthy.
+
+**spanreed does not confine Codex.** It selects Codex's own sandbox and approval
+settings, answers the approvals it is asked to answer, and logs every one.
+Whether a selected sandbox actually holds is a property of `codex-cli`; that is
+what `--doctor` is for.
 
 **Experimental, and specifically so.** The protocol work is verified against
 Codex's own schemas, and the failure paths are covered by fault-injection tests,

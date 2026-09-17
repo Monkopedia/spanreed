@@ -8,12 +8,19 @@ failure four other clients shipped (see
 ``experiments/codex-app-server-spike/README.md``). Every request must therefore
 produce a :class:`Decision`, including ones this module does not recognise.
 
-The policy the owner decided (``docs/architecture.md``, "Codex workers"):
-**auto-approve within ``--cwd``, decline outside it**, and *any* registered
-agent may wake a worker. Sender identity on this bus is caller-asserted and
-verified against nothing, so an unauthenticated inbox write becomes code
-execution and ``--cwd`` is the only thing bounding it. That is what makes
-:func:`contains` security-critical rather than a convenience.
+The policy the owner decided (``docs/architecture.md``, "Codex workers"): in
+``--mode auto`` — the default — **auto-approve within ``--cwd``, decline outside
+it**, and *any* registered agent may wake a worker. In ``--mode ask`` the
+operator answers instead, at the worker's terminal; this module still renders
+the request and supplies the worker's own view of it, but the verdict is not its
+own. ``--mode full`` asks nobody anything, so nothing here runs at all.
+
+Sender identity on this bus is caller-asserted and verified against nothing, so
+an unauthenticated inbox write becomes code execution. ``--cwd`` is the scope of
+the checks in this module — not a bound on what an approved command then does,
+and not something this project claims Codex enforces (``architecture.md``, "What
+spanreed does NOT claim"). That is what makes :func:`contains` worth getting
+right, and also what keeps it from being a boundary on its own.
 
 **The honest limitation: a path check cannot contain a shell command.**
 ``execCommandApproval`` hands us a command string and a cwd. The cwd is
@@ -316,8 +323,8 @@ def _decide_patch(root: Path, params: object, method: str = APPLY_PATCH_APPROVAL
 
     So v2-without-grantRoot is approved *on the sandbox's authority, not this
     module's*, and says so in its reason. The alternative — declining — makes a
-    workspace-mode worker unable to write anything, which is safe and useless
-    and looks exactly like a deliberate policy rather than a missing field.
+    confined-mode worker unable to write anything, which is safe and useless and
+    looks exactly like a deliberate policy rather than a missing field.
     """
     fields = _as_mapping(params)
     if fields is None:
@@ -491,19 +498,55 @@ def _render_elicitation(params: object) -> str:
     return message if isinstance(message, str) and message.strip() else "(elicitation)"
 
 
-MODES = ("workspace", "danger")
-CONFINED_MODES = tuple(m for m in MODES if m != "danger")
-"""The modes that ask Codex for *some* confinement.
+MODES = ("ask", "auto", "full")
+"""``--mode``, mirroring Codex's own three permission modes.
 
-Named here rather than written out in a test, because the guard that keeps
-mode-specific prose honest has to cover every confined mode including ones that
-do not exist yet. The review of #56 added a fourth mode with a freshly-worded
-false sentence and the guards passed: they iterated a literal list, so the new
-mode was simply not looked at. A hardcoded mode list inside the guard against
-mode drift is the thing the guard was supposed to replace."""
+Codex's vocabulary rather than one of ours, deliberately (``architecture.md``,
+"Modes"): the thing being configured belongs to Codex, and a name invented here
+would have to be kept true to software this project does not control. The
+previous pair — ``workspace``/``danger`` — was exactly that invention.
+
+- ``ask``  — workspace-write, granular approvals, answered by the operator at
+  the worker's terminal.
+- ``auto`` — workspace-write, ``on-request`` approvals answered by
+  :func:`decide`. The default.
+- ``full`` — ``danger-full-access``, ``never``: nobody is asked anything.
+"""
+
+SANDBOX_MODES = {
+    # thread/start takes `sandbox`, which is a *SandboxMode enum*, while
+    # turn/start takes `sandboxPolicy`, which is the *SandboxPolicy object*
+    # sandbox_policy() builds. Different parameter, different type, same
+    # concept -- read out of ClientRequest.json rather than guessed, because
+    # sending the object under the enum's name is exactly the kind of mistake
+    # app-server accepts and ignores.
+    #
+    # It lives HERE, next to the policy object, rather than in codex_worker,
+    # because the worker is no longer the only caller: --doctor sends both
+    # levels too, and a doctor holding its own copy of this table is how the
+    # doctor came to send no `sandbox` at all while reporting that it used
+    # "the worker's real params".
+    "ask": "workspace-write",
+    "auto": "workspace-write",
+    "full": "danger-full-access",
+}
+"""``--mode`` → ``SandboxMode``, the enum ``thread/start`` accepts."""
 
 
-def sandbox_policy(root: Path, mode: str = "workspace") -> dict[str, object]:
+def sandbox_mode(mode: str = "auto") -> str:
+    """The ``sandbox`` enum member ``thread/start`` takes for ``mode``.
+
+    Both sandbox levels have to be sent, and they are different parameters with
+    different types: this one is the enum on ``thread/start``,
+    :func:`sandbox_policy` is the object on ``turn/start``. A run on 2026-09-17
+    measured the turn-level object *alone* confining nothing.
+    """
+    if mode not in SANDBOX_MODES:
+        raise ValueError(f"mode must be one of {MODES}; got {mode!r}")
+    return SANDBOX_MODES[mode]
+
+
+def sandbox_policy(root: Path, mode: str = "auto") -> dict[str, object]:
     """The ``sandboxPolicy`` a worker sends. Shapes verified against the schema.
 
     Taken from ``SandboxPolicy`` in ``ClientRequest.json``, produced by ``codex
@@ -521,13 +564,15 @@ def sandbox_policy(root: Path, mode: str = "workspace") -> dict[str, object]:
 
     ``networkAccess`` is left at its schema default of ``False`` for the two
     confined modes: a worker driven by unauthenticated bus mail should not get
-    the network thrown in unasked.
+    the network thrown in unasked. It is a *boolean* on ``workspaceWrite`` and
+    ``readOnly`` and a ``NetworkAccess`` enum on ``externalSandbox`` only —
+    checked, because the two spellings are one field name apart.
     """
     if not root.is_absolute():
         raise ValueError(f"root must be absolute; got {root!r}")
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}; got {mode!r}")
-    if mode == "danger":
+    if mode == "full":
         # No confinement at all. The worker is responsible for warning loudly;
         # this function will not silently downgrade the caller's request.
         return {"type": "dangerFullAccess"}
@@ -538,19 +583,92 @@ def sandbox_policy(root: Path, mode: str = "workspace") -> dict[str, object]:
     }
 
 
-def approval_policy(mode: str = "workspace") -> str:
+GRANULAR_ASK: dict[str, object] = {
+    "granular": {
+        # Every member of GranularAskForApproval, spelled as the schema spells
+        # them (snake_case here, unlike its camelCase siblings -- read out of
+        # ClientRequest.json, not inferred from the neighbours).
+        #
+        # `mcp_elicitations`, `rules` and `sandbox_approval` are REQUIRED. An
+        # object missing one is not a policy app-server can be relied on to
+        # apply, and a policy it ignores leaves the worker on whatever default
+        # it had -- the silent-failure shape this project keeps paying for.
+        #
+        # `sandbox_approval` is the one the design names, and `True` is INFERRED
+        # to mean "ask about this category" from the field's name alone.
+        # ClientRequest.json types all five as bare booleans with no
+        # description, so the polarity is not readable from the schema. If
+        # `True` in fact means "grant this category without asking", every
+        # value in this object is backwards and `ask` is the most permissive
+        # confined mode rather than the least. This is the highest-risk unknown
+        # in the design; it is item 1 of architecture.md's "Not verifiable
+        # here", and a live `--doctor` run is what settles it. Stated here as
+        # the inference it is, because the doc hedging while the code asserts is
+        # how an inference becomes a fact between two readings.
+        "sandbox_approval": True,
+        # The other two carry the same inferred polarity, set for the same
+        # reason `ask` exists: every category app-server is willing to route to
+        # the client should reach the operator rather than being settled
+        # somewhere this worker cannot see. Whatever the worker cannot put to a
+        # human it declines, so on the assumed polarity the direction is also
+        # the closed one.
+        "mcp_elicitations": True,
+        "rules": True,
+        # OPTIONAL, and sent explicitly at their schema defaults rather than
+        # left out: what a default is today is a property of a version of
+        # codex-cli, and this object is the one place the worker states what it
+        # asked for. Both are false because neither is a question this worker
+        # can put usefully -- a permission widening and a skill grant outlive
+        # the single turn the operator is looking at.
+        "request_permissions": False,
+        "skill_approval": False,
+    }
+}
+"""The ``granular`` ``AskForApproval`` variant ``ask`` mode sends.
+
+Shape and field names from ``GranularAskForApproval`` in ``ClientRequest.json``.
+Kept as data so a test can compare it against the vendored schema's own required
+list instead of against a copy of it."""
+
+
+def approval_policy(mode: str = "auto") -> str | dict[str, object]:
     """The ``approvalPolicy`` for a mode. Values from ``AskForApproval``.
 
-    The schema permits ``"untrusted"``, ``"on-request"``, ``"never"``, or a
-    ``granular`` object.
+    The schema permits the strings ``"untrusted"``, ``"on-request"`` and
+    ``"never"``, or a ``granular`` *object* — so this returns either, and a
+    caller that assumed a string would have silently dropped ``ask``.
 
-    ``on-request`` is deliberate for the two confined modes even though the
-    worker auto-approves: it is what makes app-server *ask*, which is what makes
-    every decision loggable. ``never`` would be less code and would auto-approve
-    just the same, but nothing would be written down, and rule 7 wants the owner
-    to see what a Codex agent did on their behalf. Confinement comes from the
-    sandbox either way, so the choice costs nothing but a round trip.
+    ``on-request`` is deliberate for ``auto`` even though the worker
+    auto-approves: it is what makes app-server *ask*, which is what makes every
+    decision loggable. ``never`` would be less code and would auto-approve just
+    the same, but nothing would be written down, and rule 7 wants the owner to
+    see what a Codex agent did on their behalf.
+
+    ``ask`` sends the granular object instead, because the operator is the one
+    answering and the point is to be asked about as much as app-server will ask
+    about. ``full`` sends ``never``: nobody is asked anything.
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}; got {mode!r}")
-    return "never" if mode == "danger" else "on-request"
+    if mode == "full":
+        return "never"
+    if mode == "ask":
+        return GRANULAR_ASK
+    return "on-request"
+
+
+CONFINED_MODES = tuple(
+    m for m in MODES if sandbox_policy(Path("/"), m).get("type") != "dangerFullAccess"
+)
+"""The modes that ask Codex for *some* confinement.
+
+Derived from the policy each mode actually sends, and named here rather than
+written out in a test, because the guard that keeps mode-specific prose honest
+has to cover every confined mode including ones that do not exist yet. The
+review of #56 added a fourth mode with a freshly-worded false sentence and the
+guards passed: they iterated a literal list, so the new mode was simply not
+looked at. A hardcoded mode list inside the guard against mode drift is the
+thing the guard was supposed to replace — and a list spelled ``!= "danger"``
+became wrong the moment the mode was renamed, which is the second way a literal
+here has failed. ``Path("/")`` is a placeholder: only the policy's ``type`` is
+read, and ``writableRoots`` does not decide whether a mode confines anything."""

@@ -40,14 +40,23 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, TextIO, cast
 
-from .codex_approvals import approval_policy, sandbox_policy, wire_decision
+from .codex_approvals import approval_policy, sandbox_mode, sandbox_policy, wire_decision
 from .codex_client import CodexClient, TurnResult
 from .store import default_state_root
+
+SCHEMA_CODEX_VERSION = "0.154.0"
+"""The codex-cli the vendored schemas were generated from.
+
+Recorded so a mismatch is detectable rather than silent. It is the version every
+parameter name, enum member and sandbox variant in this project was read from;
+if the server answering is a different one, those were read from the wrong
+source and the run says so."""
 
 MARKER = "SPANREED_DOCTOR_OK"
 """What the model is asked to reply in step 3. Specific enough that it cannot
@@ -61,6 +70,13 @@ Existence alone would not distinguish this turn's write from something
 coincidental at the same path; the content does."""
 
 
+# Severity, so a verdict cannot be silently raised by a later call. "DID NOT
+# RUN" is 0 because it is the initial state and anything must be able to
+# replace it; PASS and SKIP are level because neither is a reservation about
+# the step; WARN outranks both because it IS one; FAIL outranks everything.
+_VERDICT_RANK = {"DID NOT RUN": 0, "PASS": 1, "SKIP": 1, "WARN": 2, "FAIL": 3}
+
+
 @dataclass
 class Step:
     """One question, its verdict, and why -- printed even when it cannot run."""
@@ -71,17 +87,48 @@ class Step:
     detail: str = "an earlier step did not get far enough"
     answers: str = ""
 
+    def _record(self, verdict: str, detail: str) -> None:
+        """Apply ``verdict`` unless it would RAISE the step above what it has.
+
+        A step accumulates observations, and a later call reporting on some
+        other sub-check must not erase an earlier reservation about this one.
+        Step 4 in ``ask`` mode warns, at the top, that the run does not
+        exercise the operator prompt; it then runs the escape probe, whose
+        success called ``ok`` and reset the verdict to PASS, so a clean
+        ``--doctor --mode ask`` printed "Everything passed" over the one path
+        it does not take. The ordering is the trap, so reordering those two
+        calls is not the fix.
+
+        It is centralised here because the first fix was not: it special-cased
+        ``ok`` after ``warn``, which is one of four transitions, and left
+        ``skip`` after ``warn`` open -- reachable, and reached, by an `ask` run
+        whose ``--cwd`` contains the home directory, where the probe is inside
+        a writable root and the SKIP erased the qualification naming the
+        un-exercised prompt. It also left ``ok`` after ``no`` silently
+        resetting FAIL to PASS, latent only because every ``no`` in this module
+        happens to return or sit in an exclusive chain. A principle stated
+        generally and encoded in one transition is a principle that will be
+        re-broken at the next one.
+
+        The demoted call's detail is kept, not dropped: the successful probe
+        still reports what it found, under the verdict that outranks it.
+        """
+        if _VERDICT_RANK[verdict] < _VERDICT_RANK[self.verdict]:
+            self.detail = f"{self.detail} (the rest of the step: {detail})"
+            return
+        self.verdict, self.detail = verdict, detail
+
     def ok(self, detail: str) -> None:
-        self.verdict, self.detail = "PASS", detail
+        self._record("PASS", detail)
 
     def no(self, detail: str) -> None:
-        self.verdict, self.detail = "FAIL", detail
+        self._record("FAIL", detail)
 
     def warn(self, detail: str) -> None:
-        self.verdict, self.detail = "WARN", detail
+        self._record("WARN", detail)
 
     def skip(self, detail: str) -> None:
-        self.verdict, self.detail = "SKIP", detail
+        self._record("SKIP", detail)
 
 
 @dataclass
@@ -301,17 +348,29 @@ def _live_codex_processes() -> list[str]:
 def run_doctor(
     *,
     cwd: Path,
-    mode: str = "workspace",
+    mode: str = "auto",
     model: str | None = None,
     effort: str | None = None,
     log_path: Path | None = None,
     timeout: float = 240.0,
     turn_timeout: float = 300.0,
     out: TextIO | None = None,
+    make_client: Callable[..., Any] = CodexClient,
 ) -> int:
     """Exercise the whole worker path against a real Codex and report.
 
     Returns 0 only if every step that ran passed.
+
+    ``make_client`` exists so the step bodies can be executed. Round 2 of #61
+    measured the consequence of their being unreachable: step 4's ``ask``
+    qualification was overwritten by the verdict meant to qualify it, the bug
+    survived a round of review, and the test shipped to prove it fixed asserted
+    the mechanism (a bare ``Step``, warned and rendered) instead of the
+    behaviour, so it passed with the bug in place. A stub server is a lie about
+    Codex -- which is why step 4 says so in its own output, and why the escape
+    probe's verdicts are still only trustworthy against a live server -- but it
+    is not a lie about this module's control flow, and the control flow is what
+    was broken. Production passes nothing and gets ``CodexClient``.
     """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     log_path = log_path or (Path.cwd() / f"spanreed-codex-doctor-{stamp}.log")
@@ -348,16 +407,30 @@ def run_doctor(
     rep.say("  did not execute is never reported as one that passed.")
 
     # Printed before ANY check that can return early. A test caught this in the
-    # opposite order: with codex missing, step 0 bailed and --mode danger warned
+    # opposite order: with codex missing, step 0 bailed and --mode full warned
     # about nothing. A safety banner conditional on the environment being
     # healthy is a banner that is absent exactly when something is already wrong.
-    if mode == "danger":
+    if mode == "full":
         rep.say("")
         rep.say("  " + "!" * 70)
-        rep.say("  !!  MODE=danger: NO SANDBOX. Any registered agent may wake this worker,")
-        rep.say("  !!  and the bus does not authenticate senders. Full machine access.")
+        rep.say("  !!  MODE=full: NO SANDBOX, and approvalPolicy is never, so nothing is")
+        rep.say("  !!  asked of anyone. Any registered agent may wake this worker, and the")
+        rep.say("  !!  bus does not authenticate senders. Full machine access.")
         rep.say("  " + "!" * 70)
-        rep.fact("MODE=danger - worker runs with dangerFullAccess and no confinement")
+        rep.fact("MODE=full - worker runs with dangerFullAccess and no confinement")
+    if mode == "ask":
+        # Said before any check that can return early, for the same reason the
+        # full-mode banner is: a reader must not take this run as evidence
+        # about a path it did not exercise. The doctor answers approvals from
+        # decide(), the way an `auto` worker does; the worker in `ask` mode puts
+        # every one of them to a human on its terminal instead. Everything else
+        # in this run -- both sandbox levels, the granular approvalPolicy, the
+        # decision enum -- is what an `ask` worker sends.
+        rep.fact(
+            "MODE=ask - this doctor answers approvals itself, from decide(). A real `ask` "
+            "worker prompts the operator on its terminal and blocks there with no timeout, "
+            "and THIS RUN DOES NOT EXERCISE THAT PROMPT."
+        )
 
     # ---- step 0 -------------------------------------------------------------
     rep.rule("Step 0 - environment")
@@ -385,7 +458,21 @@ def run_doctor(
         return finish(rep, fh, log_path)
     try:
         ver = subprocess.run([codex, "--version"], capture_output=True, text=True, timeout=30)
-        rep.fact(f"codex version: {(ver.stdout or ver.stderr).strip() or '(no output)'}")
+        version = (ver.stdout or ver.stderr).strip() or "(no output)"
+        rep.fact(f"codex version: {version}")
+        # Every wire shape in this project was read from schemas generated by
+        # ONE codex-cli version. A different one is not an error, but it means
+        # the enums, the granular field names and the sandbox variants were read
+        # from a version that is not the one answering -- which is exactly the
+        # "it could stop holding silently" this tool exists to make loud.
+        if SCHEMA_CODEX_VERSION not in version:
+            rep.finding(
+                f"this codex is {version}, and every wire shape spanreed sends was read from "
+                f"schemas generated by {SCHEMA_CODEX_VERSION} "
+                f"(experiments/codex-app-server-spike/schema/). Re-dump with "
+                f"`codex app-server generate-json-schema` and diff before trusting the "
+                f"parameter names or enum members in this run."
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         rep.fact(f"codex --version failed: {exc}")
 
@@ -412,8 +499,13 @@ def run_doctor(
 
     sandbox = sandbox_policy(cwd, mode)
     approvals = approval_policy(mode)
-    rep.fact(f"approvalPolicy we will send: {approvals!r}")
-    rep.fact(f"sandboxPolicy we will send: {json.dumps(sandbox)}")
+    # All three, named by the parameter each rides on. A run on 2026-09-17
+    # measured the turn-level object ALONE confining nothing, and this doctor
+    # was sending only the turn-level one while printing this inventory as if
+    # it were the whole story.
+    rep.fact(f"approvalPolicy we will send: {json.dumps(approvals)}")
+    rep.fact(f"sandbox (thread/start) we will send: {json.dumps(sandbox_mode(mode))}")
+    rep.fact(f"sandboxPolicy (every turn/start) we will send: {json.dumps(sandbox)}")
     if not cwd.is_dir():
         s0.no(f"--cwd {cwd} is not a directory")
         return finish(rep, fh, log_path)
@@ -440,8 +532,8 @@ def run_doctor(
         timeout,
         turn_timeout,
         sandbox,
-        approvals,
         (s1, s2, s3, s4),
+        make_client,
     )
 
 
@@ -523,7 +615,7 @@ def _run_protocol_steps(
     log_path: Path,
     cwd: Path,
     # Back after being removed as dead in the previous round: step 4 must
-    # skip under danger, where approvalPolicy is 'never' and the sandbox is
+    # skip under full, where approvalPolicy is 'never' and the sandbox is
     # dangerFullAccess, so the probe would report the mode behaving exactly
     # as documented as a FAIL.
     mode: str,
@@ -532,8 +624,8 @@ def _run_protocol_steps(
     timeout: float,
     turn_timeout: float,
     sandbox: dict[str, Any],
-    approvals: str,
     steps: tuple[Step, Step, Step, Step],
+    make_client: Callable[..., Any],
 ) -> int:
     s1, s2, s3, s4 = steps
     # (method, params, approved, value_sent). The decision is recorded because
@@ -571,7 +663,7 @@ def _run_protocol_steps(
         seen_notifications.append(method)
         rep.say(f"    <- {method}  {json.dumps(params)[:130]}")
 
-    client = CodexClient(
+    client = make_client(
         timeout=timeout,
         turn_timeout=turn_timeout,
         on_server_request=on_request,
@@ -596,9 +688,7 @@ def _run_protocol_steps(
             return finish(rep, fh, log_path)
 
         rep.rule("Step 2 - create our own thread, with the worker's real params")
-        start_params: dict[str, Any] = {"cwd": str(cwd), "approvalPolicy": approvals}
-        if model:
-            start_params["model"] = model
+        start_params = thread_start_params(cwd, mode, model)
         rep.say(f"  thread/start {json.dumps(start_params)}")
         try:
             thread = client.thread_start(**start_params)
@@ -652,18 +742,30 @@ def _run_protocol_steps(
         )
 
         rep.rule("Step 4 - a REAL approval round-trip")
-        if mode == "danger":
-            # danger sends dangerFullAccess and approvalPolicy "never": no
+        if mode == "ask":
+            # A fact in the Key-facts block was not enough: the one line a reader
+            # quotes is the verdict, and an unqualified PASS for `ask` is a
+            # confident answer about the path that defines the mode -- the
+            # operator prompt -- which this run never executes. The doctor
+            # answers from decide(); an `ask` worker asks a human.
+            s4.warn(
+                "the approval round-trip below was answered by decide(), not by an operator. "
+                "Everything else this run sends is what an `ask` worker sends, but the prompt "
+                "that defines the mode was not exercised. Re-run with --mode auto for an "
+                "unqualified answer about the round trip itself."
+            )
+        if mode == "full":
+            # full sends dangerFullAccess and approvalPolicy "never": no
             # request can arrive and any write lands. That is the documented,
             # requested behaviour of the mode, already banner-warned at the top
             # of this report -- so running the probe here pins step 4 to the
             # "nothing confines anything" cell and reports the mode working as
             # designed as a FAIL.
             s4.skip(
-                "mode is danger: approvalPolicy is 'never' and the sandbox is "
+                "mode is full: approvalPolicy is 'never' and the sandbox is "
                 "dangerFullAccess, so no approval can be requested and any write lands. "
                 "That is the mode behaving as documented, not a finding. Re-run with "
-                "--mode workspace to exercise the approval path."
+                "--mode auto to exercise the approval path."
             )
         else:
             rep.say("  This is the step that cannot be tested against a stub: it asks a live")
@@ -889,6 +991,34 @@ def run_escape_probe(
         s4.no(
             f"escape turn did not reach a terminal state; events {sorted(set(seen_notifications))}"
         )
+
+
+def thread_start_params(cwd: Path, mode: str, model: str | None = None) -> dict[str, Any]:
+    """The ``thread/start`` params, exactly as a worker sends them.
+
+    A function rather than a literal at the call site because this step reports
+    itself as using "the worker's real params" and did not: it sent ``cwd`` and
+    ``approvalPolicy`` and **no ``sandbox`` at all**, so every run measured a
+    thread that had been given no thread-level sandbox and reported the
+    resulting absence of confinement as Codex's. A diagnostic that cannot
+    reproduce the thing it is diagnosing is this file's founding complaint,
+    committed by this file.
+
+    ``sandbox`` here is the ``SandboxMode`` **enum**; the ``SandboxPolicy``
+    **object** goes on every ``turn/start``. Both levels, because the
+    turn-level object alone was measured confining nothing on 2026-09-17.
+
+    ``developerInstructions`` is deliberately not sent: it is the worker's
+    persona, not a confinement parameter, and the doctor drives its own prompts.
+    """
+    params: dict[str, Any] = {
+        "cwd": str(cwd),
+        "approvalPolicy": approval_policy(mode),
+        "sandbox": sandbox_mode(mode),
+    }
+    if model:
+        params["model"] = model
+    return params
 
 
 def _thread_id(thread: object) -> str:

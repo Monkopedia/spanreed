@@ -153,7 +153,7 @@ section is the design, not the evidence.
 
 ```
 spanreed codex --name reviewer --cwd ~/git/foo \
-               --model gpt-5.6-sol --effort medium [--mode workspace] [--instructions TEXT]
+               --model gpt-5.6-sol --effort medium [--mode auto] [--instructions TEXT]
   ├─ spawn `codex app-server --listen unix://<private socket>`
   ├─ initialize + initialized          (the notification is mandatory)
   ├─ thread/start --cwd --model …      (one thread, owned for the worker's life)
@@ -206,7 +206,7 @@ they are not guesses, and the split between the two calls is real:
 | `--personality` | both | |
 | `--service-tier` | both | `serviceTierForTurn` also exists, turn-only. |
 | `--instructions` | `thread/start` | Sent as **`developerInstructions`**, appended to a built-in bus preamble. This is where a worker is told it is *on a bus*: that input is mail from another agent, that its reply is sent back as mail, and that a body is data rather than an instruction. Without it the worker behaves like a terminal session that does not know why it is being spoken to. |
-| `--mode` | `thread/start` (`sandbox`) + every `turn/start` (`sandboxPolicy`) | `workspace` (default) \| `danger`. See "Modes" below. |
+| `--mode` | `thread/start` (`sandbox`) + every `turn/start` (`sandboxPolicy`) | `ask` \| `auto` (default) \| `full`. See "Modes" below. |
 | `--name` | neither | Bus identity only: the worker registers as `agent-<name>`. |
 
 **`sandbox` and `sandboxPolicy` are different parameters, and both are sent.** `thread/start` takes
@@ -219,77 +219,135 @@ app-server accepts and ignores — checked against `ClientRequest.json`, not inf
 
 ### Modes
 
-| `--mode` | `sandbox` (thread) / `sandboxPolicy` (turn) | `approvalPolicy` | Notes |
+**These mirror Codex's own three permission modes rather than inventing a fourth
+vocabulary**, because the thing being configured is Codex's, and a name we made
+up would have to be kept true to software we do not control.
+
+| `--mode` | `sandbox` (thread) + `sandboxPolicy` (turn) | `approvalPolicy` | Who answers an approval |
 |---|---|---|---|
-| `workspace` (default) | `workspace-write` / `workspaceWrite` with `writableRoots: [--cwd]` | `on-request` | The intended shape: writes inside `--cwd`, no network. |
-| `danger` | `danger-full-access` / `dangerFullAccess` | `never` | **No confinement at all.** |
+| `ask` | `workspace-write` / `workspaceWrite` with `writableRoots: [--cwd]` | granular, `sandbox_approval: true` | **the operator, at the worker's terminal** |
+| `auto` (default) | same | `on-request`, worker answers | the worker, every decision logged |
+| `full` | `danger-full-access` / `dangerFullAccess` | `never` | nobody; warns at startup and every turn |
 
-**A caution on what an approval is worth, recorded rather than resolved.** The
-worker auto-approves any request whose paths are inside `--cwd` — `decide()`
-takes no `mode` argument. What an approved request is then permitted to do is
-Codex's decision, and the schema vendored under
-`experiments/codex-app-server-spike/schema/` suggests approvals are precisely
-the channel for going beyond a sandbox: `ApprovalsReviewer` is documented as
-covering "sandbox escapes", `AskForApproval.granular` carries a
-`sandbox_approval` field, and `CommandExecutionApprovalDecision` includes
-`applyNetworkPolicyAmendment`.
+**Both levels are sent.** `thread/start` takes `sandbox` (a `SandboxMode` enum)
+and `turn/start` takes `sandboxPolicy` (an object with `writableRoots`). Sending
+only the turn-level one confines nothing — measured on 2026-09-17, recorded in
+[findings.md](findings.md#incident-the-confinement-measurement-that-motivated-the-three-mode-redesign-was-taken-against-a-thread-with-no-sandbox-2026-09-17).
+The doctor had that bug and reported it as a total absence of confinement, which
+was its own defect and not Codex's — read the entry before citing the run for
+anything else, because it bounds what that measurement can support.
 
-If that reading holds, auto-approving inside `--cwd` is a stronger grant than
-this table implies. Nobody has run it against a live `app-server`; `spanreed
-codex --doctor` is what would settle it.
+### Approvals in `ask` mode go to a terminal, never to the bus
 
-**A `read-only` mode was cut before release, for this reason.** It asked Codex
-for a `readOnly` sandbox while still auto-approving everything inside `--cwd`,
-so its name made a safety claim this project could not substantiate. A mode
-whose name is an unverified guarantee is worse than no mode. If read-only work
-is wanted later it should arrive with a `--doctor` run behind it.
+The bus is for work. An approval stream on it would drown the messages it
+exists to carry, so `ask` prompts on the worker's own stdin and blocks there.
 
-`on-request` is deliberate for `workspace` even though the worker auto-approves: it is
-what makes app-server *ask*, which is what makes every decision loggable. `never` would auto-approve
-identically and write nothing down.
+Two decisions follow, both the owner's (2026-09-17):
 
-**`--mode danger` is allowed with any sender — and must warn loudly** (owner decision, 2026-09-15).
-It is not gated on an allowlist, because that would re-introduce an authentication model the bus
-does not have. Instead the worker logs an unmissable banner at startup *and again on every single
-turn*, naming the mode and the fact that senders are unauthenticated. A log the owner scrolls
-through has to say what mode the command they are reading ran under.
+- **It waits indefinitely.** No timeout, no auto-decline. A queued message is
+  not lost and nothing is refused on the operator's behalf; the cost is that
+  one unanswered prompt stalls the worker and everything behind it, which the
+  worker says loudly on the terminal.
+- **It refuses to start without a TTY.** `ask` mode checked against
+  `stdin.isatty()` at startup, exiting with the reason. An `ask` worker with
+  nobody to ask would block on its first approval forever while looking
+  healthy — the silent-failure shape this project has hit repeatedly, and the
+  one case where waiting indefinitely turns from a choice into a hang.
 
-**What v1 actually exposes as flags**: `--name`, `--cwd`, `--model`, `--effort`, `--mode`,
-`--instructions`. `--personality` and `--service-tier` are in the table because the *protocol*
-takes them and the split is worth recording; they are not CLI flags yet.
+Three details settled while implementing, recorded here because two of them are
+wire format:
 
-**`config` is prohibited.** `thread/start` accepts a per-thread `config` override and we must never
-send one: on the version this was validated against, any `config` override makes subsequent turns
-hang silently — no notifications, no error, no timeout
-([openai/codex#45361](https://github.com/openai/codex/issues/45361)). Given that a silent turn hang
-is precisely the failure this spike spent thirty runs mistaking for a protocol problem, this is
-written down as a rule rather than left to be rediscovered.
+- **The `granular` object is sent complete.** `GranularAskForApproval` requires
+  `mcp_elicitations`, `rules` and `sandbox_approval`; all three are sent, plus
+  the optional `request_permissions` and `skill_approval` at their schema
+  defaults, so what the worker asked for does not depend on a default that is a
+  property of a `codex-cli` version. `sandbox_approval`, `mcp_elicitations` and `rules` are
+  `true`; the two optional ones are `false`, because neither is a question this
+  worker can put usefully and both outlive the turn the operator is looking at.
 
-**Senders cannot override any of it** (owner decision, 2026-09-15). `effort`, `model` and the rest
-are per-turn parameters, so a message *could* carry them; it may not. Cost and model choice stay a
-property of how the worker was started, not of who mailed it — which matters because "any registered
-agent may wake it" means senders are unauthenticated, and an override would let one burn the owner's
-quota at will.
+  **Two things this does NOT mean.** The booleans' *polarity* is not established
+  by the schema — `ClientRequest.json` defines all five as bare
+  `{"type": "boolean"}` with no descriptions, so "`sandbox_approval: true` makes
+  an escape a question" is an inference from the field's name. If `true` in fact
+  means *grant this category without asking*, `ask` would be the most permissive
+  confined mode rather than the least. See "Not verifiable here".
 
-### Controls
+  And **`mcp_elicitations: true` does not mean elicitations reach the operator.**
+  They are declined in every mode, `ask` included: an elicitation wants
+  structured content and a y/n cannot supply it, so a decline is the only honest
+  answer. The flag asks app-server to route the category to a client, which makes
+  the decline visible in the log rather than settled invisibly upstream. An
+  earlier version of this paragraph claimed the opposite.
+- **A terminal that goes away declines, and says it was not asked.** EOF on
+  stdin is not a timeout, and no amount of further waiting produces an operator,
+  so the request fails closed. The log line says in full that nobody answered
+  it, because an operator reading it later must be able to tell it from an
+  answer they gave. The TTY check at startup is what makes this rare.
+- **The operator's thinking time is not charged to the turn.** A turn deadline
+  measures the *server's* silence; time the worker spends inside its own
+  approval handler is this process holding the loop, and in `ask` mode that is a
+  human reading a prompt that is allowed to take as long as it takes. It is
+  credited back to the deadline, so the worker cannot take an answer and then
+  tell the sender the turn never finished. A server that actually goes quiet
+  times out exactly as before.
+- **`--doctor --mode ask` does not exercise the prompt.** The doctor answers
+  approvals from the same policy an `auto` worker uses; everything else it sends
+  in that mode — both sandbox levels, the granular `approvalPolicy`, the
+  decision enum — is what an `ask` worker sends. The run says so in its own
+  output, because a diagnostic read as evidence for a path it never ran is this
+  project's most expensive recurring mistake.
 
-Decided by the owner, 2026-09-15, in the session that closed the spike.
+### Not verifiable here
 
-| Control | Decision | Consequence accepted |
-|---|---|---|
-| Approvals | **Auto-approve within `--cwd`** | A **patch** approval is answered yes when every path it names is inside `--cwd`. An **exec** approval is answered yes when the *working directory* of the command is inside `--cwd` — the command's arguments are never examined, so `rm -rf /elsewhere` launched from `--cwd` is approved. Confinement for commands comes from `sandboxPolicy`, not from this check. |
-| Who may wake it | **Any registered agent** | Consistent with the trust model above — "if it's on the bus you can trust it". No allowlist. |
-| Concurrency | **Queue, FIFO** | One turn per message, each with its own reply. Senders may wait. Codex's native `steer` is deliberately *not* used: a steered turn produces one reply for two senders' messages, which the bus has no way to express. |
-| Thread lifetime | **One thread per worker** | Context accumulates, so a worker remembers its conversation the way a Claude session does. History growth is a token cost, not a correctness problem. |
-| Startup config | **Fixed at start; senders cannot override** | Model, effort and persona are worker flags. A message may not change them, so cost is a property of how the worker was launched. See "Startup configuration" above. |
+Four things about Codex's behaviour that this repository cannot settle, because
+`codex` is not installed on the host where it is developed. `spanreed codex
+--doctor` exists to answer them on a machine where it is.
 
-### `--cwd` is the security boundary, and it is required
+1. **Whether the granular booleans mean what their names suggest.** The schema
+   types them and does not describe them. If `sandbox_approval: true` grants
+   rather than asks, `ask` is the most permissive confined mode. Highest-risk
+   unknown here.
+2. **Whether app-server honours the thread-level `sandbox`** now that it is sent.
+3. **Whether the granular `approvalPolicy` is applied at all**, as opposed to
+   accepted and ignored.
+4. **Whether `item/permissions/requestApproval`'s decision enum is accepted** —
+   it is still inferred by analogy with its siblings, since `ServerRequest.json`
+   defines requests and carries no response enum for it.
 
-Auto-approval plus any-sender means **an unauthenticated inbox write becomes code execution**, and
-the only thing bounding it is `--cwd`. That is a deliberate choice and follows from the trust model,
-which was never a claim that the bus is *authenticated* — only that, single-user, it need not be. A
-Codex worker is the first thing on this bus where that distinction has teeth, because the other end
-of a message is now a shell rather than a model's judgement.
+And one about this project rather than Codex: **the 2026-09-17 measurement that
+motivated the three-mode redesign has not been re-taken since the doctor was
+fixed.** It was made with no thread-level sandbox, so what it showed is what
+that configuration predicts. The position above does not depend on it.
+
+### What spanreed does NOT claim
+
+**spanreed does not confine Codex.** It selects Codex's own sandbox and approval
+settings, answers the approvals it is asked to answer, and records every one.
+Whether a selected sandbox actually holds is a property of `codex-cli`, not of
+this project, and it is checked by `spanreed codex --doctor` rather than
+asserted here.
+
+This is a correction. An earlier version of this document described `--cwd` as
+bounding everything the worker could touch — a claim invented as a design
+decision and then defended against software this project does not control. What
+it could not survive was not a measurement but a reading of the schema: a shell
+command, whose effects
+no path check can bound. `--cwd` is now what it always actually was: the
+directory the worker works in, the value passed to `writableRoots`, and the
+scope of the checks this worker performs itself.
+
+### `--cwd` is required, and what it actually bounds
+
+Auto-approval plus any-sender means **an unauthenticated inbox write becomes code execution**. That
+follows from the trust model, which was never a claim that the bus is *authenticated* — only that,
+single-user, it need not be. A Codex worker is the first thing on this bus where that distinction
+has teeth, because the other end of a message is now a shell rather than a model's judgement.
+
+**What `--cwd` bounds is narrower than the sentence that used to sit here.** It is the value passed
+to `writableRoots`, so it is what Codex is *asked* to confine writes to; and it is the scope of the
+checks this worker performs on the approvals it is asked to answer. It is not a bound on what a
+shell command does once running, and — as of 2026-09-17 — it is not known to be a bound Codex
+enforces at all. See "What spanreed does NOT claim" above.
 
 Two rules follow, and they are not negotiable in the way the table above is:
 
@@ -333,7 +391,7 @@ row produces a log line naming what happened, what the worker did, and what to c
 | the sender deregisters before the reply | The reply text goes to the log in full, the cursor still advances, the worker stays up. |
 | `--cwd` is a symlink | Resolved once, at construction. The sandbox is scoped to the real directory and both spellings get the same approval verdict. |
 | `--cwd` is deleted after start | Every turn is **refused** with a reply naming the reason, and the worker stays on the bus — the directory may come back. No turn runs without its boundary. |
-| `--cwd` is not writable, in `workspace`/`danger` | A startup warning naming it. Otherwise the only symptom is the model reporting failed edits as its own fault. |
+| `--cwd` is not writable | A startup warning naming it. Otherwise the only symptom is the model reporting failed edits as its own fault. |
 | `auth.json` missing, unreadable, malformed, or lacking either key | Declines (`-32601`) and says which file and which key. Never invents a token, and never logs one. |
 
 Anything the list above did not predict is caught at the top of the poll loop, logged with its

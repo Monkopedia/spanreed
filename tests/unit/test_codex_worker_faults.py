@@ -609,8 +609,11 @@ class TestBusAndFilesystem:
 
 
 class TestCwdBoundary:
-    """`--cwd` is the worker's entire security boundary. None of these weaken
-    it; they ask what happens when the directory itself misbehaves."""
+    """`--cwd` anchors the sandbox's writable roots and every path check the
+    approval policy makes. It is NOT the worker's entire security boundary --
+    an approved command is a process, and no path check bounds what a process
+    does. None of these weaken the anchor; they ask what happens when the
+    directory itself misbehaves."""
 
     def test_a_symlinked_cwd_is_resolved_once_and_bounds_both_ways(
         self, make_worker: MakeWorker, store: StateStore, tmp_path: Path
@@ -668,12 +671,12 @@ class TestCwdBoundary:
     def test_a_cwd_that_cannot_be_written_warns_at_startup_in_write_modes(
         self, make_worker: MakeWorker, worker_cwd: Path
     ) -> None:
-        """Workspace mode tells Codex it may write there. If it cannot, every
-        edit fails inside the sandbox where the only visible symptom is the
-        model reporting its own failure — so the reason is named once, up top."""
+        """Every mode tells Codex it may write there. If it cannot, every edit
+        fails inside the sandbox where the only visible symptom is the model
+        reporting its own failure — so the reason is named once, up top."""
         worker_cwd.chmod(0o500)
         try:
-            _stub, worker = make_worker(mode="workspace", name="writer")
+            _stub, worker = make_worker(mode="auto", name="writer")
         finally:
             worker_cwd.chmod(0o700)
         log = log_of(worker)

@@ -12,8 +12,11 @@ wrong:
 
 - ``--cwd`` missing → refuse. It is the only bound on an unauthenticated
   sender's ability to run commands.
-- ``--mode danger`` → warn at startup **and on every turn**. The owner allowed
+- ``--mode full`` → warn at startup **and on every turn**. The owner allowed
   the mode on condition the warning is impossible to miss.
+- ``--mode ask`` → refuse to start without a TTY, then prompt on the terminal
+  and block there. A worker with nobody to ask blocks forever while looking
+  healthy in the registry.
 - approvals → both outcomes in the log file. An auto-approved command that
   appears nowhere is the one that cannot be reviewed.
 - ``effort`` → on ``turn/start``, never on ``thread/start``, which accepts it
@@ -27,8 +30,12 @@ wrong:
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
+import re
+import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -36,20 +43,24 @@ from typing import Any
 import pytest
 
 from spanreed import cli
-from spanreed.codex_approvals import CONFINED_MODES, MODES
+from spanreed.codex_approvals import CONFINED_MODES, MODES, SANDBOX_MODES
 from spanreed.codex_worker import (
     AGENT_MESSAGE_DELTA,
+    ANSWERED_BY,
+    ASK_BLOCKED_NOTICE,
     AUTH_TOKENS_REFRESH,
     BOUNDARY_BY_MODE,
-    DANGER_BANNER,
+    FULL_ACCESS_BANNER,
     RATE_LIMITS_UPDATED,
-    SANDBOX_MODES,
     THREAD_STATUS_CHANGED,
     CodexWorker,
+    NoTerminalForAskMode,
     WorkerConfig,
+    no_terminal_for_ask,
 )
 from spanreed.protocol import Message
 from spanreed.store import StateStore
+from tests.unit.retracted_claims import FORBIDDEN_IN_EMITTED_STRINGS, RETRACTED_IN_PROSE
 from tests.unit.test_codex_client import Handler, StubServer
 
 SENDER = "agent-sender"
@@ -92,6 +103,51 @@ def app_server(turn: TurnStream | None = None) -> Handler:
             stub.reply(msg["id"], {"ok": method})
 
     return handler
+
+
+class FakeTerminal(io.StringIO):
+    """A stdin that claims to be a terminal and answers a scripted queue.
+
+    ``ask`` mode reads from stdin and blocks there forever, so a test cannot use
+    the real one: a wrong answer here is a hung suite rather than a failure.
+    Exhausting the queue is EOF, which is also the "the operator's terminal went
+    away" case the worker has to survive — one object covers both because they
+    are the same event.
+    """
+
+    def __init__(self, *answers: str) -> None:
+        super().__init__("".join(f"{answer}\n" for answer in answers))
+
+    def isatty(self) -> bool:
+        return True
+
+
+class CapturingTerminal(io.StringIO):
+    """A stream that captures what is written AND reports itself a terminal.
+
+    The guard requires BOTH stdin and the prompt stream to be TTYs, because the
+    prompt travels on stderr and the answer on stdin -- checking only stdin left
+    the wedge one stream over. A plain StringIO used as prompt_out is therefore
+    correctly refused, which is why these tests need this rather than StringIO.
+    """
+
+    def isatty(self) -> bool:
+        return True
+
+
+GRANULAR: dict[str, Any] = {
+    # The granular AskForApproval object `ask` sends, written out here rather
+    # than imported from the code it checks: a test that asserts a constant
+    # equals itself cannot fail. The schema-conformance test below is the other
+    # half -- this pins what is SENT, that one pins that it is LEGAL.
+    "granular": {
+        "sandbox_approval": True,
+        "mcp_elicitations": True,
+        "rules": True,
+        "request_permissions": False,
+        "skill_approval": False,
+    }
+}
 
 
 def frames(stub: StubServer, method: str) -> list[dict[str, Any]]:
@@ -165,6 +221,18 @@ class TestCwdIsRequired:
         with pytest.raises(ValueError, match="--mode"):
             WorkerConfig(name="reviewer", cwd=worker_cwd, mode="yolo")
 
+    def test_the_retired_mode_names_are_refused_rather_than_silently_accepted(
+        self, worker_cwd: Path
+    ) -> None:
+        """`workspace` and `danger` were the names until the modes were made to
+        mirror Codex's own. A stale invocation must fail loudly rather than fall
+        through to a default -- `danger` silently becoming `auto` would confine a
+        worker its operator believes is unconfined, and `workspace` silently
+        becoming `auto` is the harmless direction of the same defect."""
+        for retired in ("workspace", "danger"):
+            with pytest.raises(ValueError, match="--mode"):
+                WorkerConfig(name="reviewer", cwd=worker_cwd, mode=retired)
+
 
 # ------------------------------------------------------------------ startup
 
@@ -185,18 +253,37 @@ class TestStartup:
         assert params["cwd"] == str(_worker.config.cwd)
 
     @pytest.mark.parametrize(
-        ("mode", "sandbox", "policy"),
+        ("mode", "sandbox", "policy", "sandbox_policy_type"),
         [
-            ("workspace", "workspace-write", "on-request"),
-            ("danger", "danger-full-access", "never"),
+            ("ask", "workspace-write", GRANULAR, "workspaceWrite"),
+            ("auto", "workspace-write", "on-request", "workspaceWrite"),
+            ("full", "danger-full-access", "never", "dangerFullAccess"),
         ],
     )
-    def test_mode_maps_to_the_schema_values(
-        self, make_worker: MakeWorker, mode: str, sandbox: str, policy: str
+    def test_mode_maps_to_the_schema_values_at_BOTH_levels(
+        self,
+        make_worker: MakeWorker,
+        store: StateStore,
+        mode: str,
+        sandbox: str,
+        policy: Any,
+        sandbox_policy_type: str,
     ) -> None:
-        stub, _worker = make_worker(mode=mode)
+        """Both sandbox levels, per mode, in one place.
+
+        `sandbox` (the SandboxMode enum on thread/start) and `sandboxPolicy`
+        (the SandboxPolicy object on turn/start) are different parameters, and a
+        run on 2026-09-17 measured the turn-level object ALONE confining
+        nothing. A test that checked only the thread level would have passed
+        against a worker that sent no policy at all, and vice versa.
+        """
+        stub, worker = make_worker(mode=mode)
         params = params_of(stub, "thread/start")
         assert (params["sandbox"], params["approvalPolicy"]) == (sandbox, policy)
+        register_sender(store)
+        mail(store, worker, "one")
+        worker.run(max_polls=1)
+        assert params_of(stub, "turn/start")["sandboxPolicy"]["type"] == sandbox_policy_type
 
     def test_instructions_are_additive_developer_instructions(
         self, make_worker: MakeWorker
@@ -231,28 +318,301 @@ class TestStartup:
         assert len(frames(stub, "thread/start")) == 1
 
 
-class TestDangerMode:
-    """`--mode danger` is allowed with any sender, but must warn loudly — at
-    startup *and* on every turn. That was the owner's explicit choice."""
+class TestFullMode:
+    """`--mode full` is allowed with any sender, but must warn loudly — at
+    startup *and* on every turn. That was the owner's explicit choice, and it
+    survived the rename from `danger`: the mode is Codex's, the warning is
+    this project's."""
 
     def test_warns_at_startup(self, make_worker: MakeWorker) -> None:
-        _stub, worker = make_worker(mode="danger")
-        assert DANGER_BANNER in log_of(worker)
-        assert "DANGER MODE" in log_of(worker)
+        _stub, worker = make_worker(mode="full")
+        assert FULL_ACCESS_BANNER in log_of(worker)
+        assert "MODE=full: sandbox=danger-full-access, approvalPolicy=never" in log_of(worker)
 
     def test_warns_again_on_every_turn(self, make_worker: MakeWorker, store: StateStore) -> None:
-        _stub, worker = make_worker(mode="danger")
+        _stub, worker = make_worker(mode="full")
         register_sender(store)
         mail(store, worker, "first")
         mail(store, worker, "second")
         worker.run(max_polls=1)
         # Once at startup, once per turn: a log the owner scrolls through must
         # say what mode the command they are reading ran under.
-        assert log_of(worker).count(DANGER_BANNER) == 3
+        assert log_of(worker).count(FULL_ACCESS_BANNER) == 3
 
     def test_confined_modes_do_not_warn(self, make_worker: MakeWorker) -> None:
-        _stub, worker = make_worker(mode="workspace")
-        assert "DANGER MODE" not in log_of(worker)
+        for mode in CONFINED_MODES:
+            _stub, worker = make_worker(mode=mode)
+            assert "MODE=full" not in log_of(worker), mode
+
+
+class TestAskModeNeedsATerminal:
+    """`ask` refuses to start where there is nobody to ask (owner, 2026-09-17).
+
+    The failure it prevents is the one this project keeps paying for: the worker
+    would register, report `idle`, accept mail, and then block on its first
+    approval forever — with no timeout, because not-auto-declining is the other
+    half of the same decision. Healthy in the registry, wedged in fact.
+    """
+
+    def test_the_predicate_answers_per_mode(self) -> None:
+        # Only `ask` needs one: `auto` answers approvals itself and `full` is
+        # never asked, so both are legitimately headless — which is the normal
+        # way a worker runs.
+        tty = FakeTerminal()
+        assert no_terminal_for_ask("ask", io.StringIO(), tty) is not None
+        assert no_terminal_for_ask("ask", tty, tty) is None
+        # BOTH streams, not just stdin. A TTY stdin with a redirected prompt is
+        # the `2> worker.log` invocation, and it must be refused too.
+        assert no_terminal_for_ask("ask", tty, io.StringIO()) is not None
+        for headless in ("auto", "full"):
+            assert no_terminal_for_ask(headless, io.StringIO(), io.StringIO()) is None, headless
+
+    def test_the_refusal_names_the_stream_that_actually_failed(self) -> None:
+        """`is not None` does not check WHICH stream the message blames.
+
+        The message is built by filling a `{stream}` field in ASK_NO_TTY. The
+        earlier form substituted a phrase with `str.replace`, which silently
+        no-ops if the sentence is reworded -- and the failure mode is a `2>
+        worker.log` worker told its *stdin* is the problem, sending the
+        operator to fix the one stream that was fine.
+        """
+        tty = FakeTerminal()
+        piped_stdin = no_terminal_for_ask("ask", io.StringIO(), tty)
+        redirected_prompt = no_terminal_for_ask("ask", tty, io.StringIO())
+        assert piped_stdin is not None and redirected_prompt is not None
+        assert "stdin is not a TTY" in piped_stdin
+        assert "the prompt stream is not a TTY" in redirected_prompt
+        # Distinct messages, and neither still carries the unfilled field.
+        assert piped_stdin != redirected_prompt
+        assert "{stream}" not in piped_stdin + redirected_prompt
+        # stdin is checked first, so a run with neither stream on a terminal
+        # reports stdin rather than silently blaming whichever came last.
+        both_bad = no_terminal_for_ask("ask", io.StringIO(), io.StringIO())
+        assert both_bad is not None and "stdin is not a TTY" in both_bad
+
+    def test_a_closed_stdin_is_not_a_terminal(self) -> None:
+        # A detached or closed stream raises from isatty() rather than
+        # answering False. Letting that escape would turn a refusal into a
+        # traceback on the one machine whose only channel back is a paste.
+        closed = io.StringIO()
+        closed.close()
+        assert no_terminal_for_ask("ask", closed, FakeTerminal()) is not None
+
+    def test_the_worker_refuses_to_start_and_leaves_no_registry_row(
+        self, make_worker: MakeWorker, store: StateStore
+    ) -> None:
+        _stub, worker = make_worker(mode="ask", prompt_in=io.StringIO(), start=False)
+        with pytest.raises(NoTerminalForAskMode):
+            worker.start()
+        assert all(a.agent_id != worker.config.agent_id for a in store.list_agents())
+        assert "REFUSING TO START" in log_of(worker)
+
+    def test_serve_exits_non_zero_with_the_reason_and_no_app_server_dump(
+        self, make_worker: MakeWorker, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Exit 1 and a sentence. NOT through the FAILED TO START arm: nothing
+        was spawned, so that arm's page of empty app-server capture would bury a
+        one-line configuration error under evidence about a process that does
+        not exist."""
+        _stub, worker = make_worker(mode="ask", prompt_in=io.StringIO(), start=False)
+        assert worker.serve() == 1
+        err = capsys.readouterr().err
+        assert "--mode ask needs a terminal to ask at" in err
+        assert "block on its first approval forever while still looking healthy" in err
+        assert "FAILED TO START" not in log_of(worker)
+
+    def test_the_cli_refuses_before_anything_is_spawned(
+        self, worker_cwd: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr("sys.stdin", io.StringIO())
+        assert cli.main(["codex", "--name", "r", "--cwd", str(worker_cwd), "--mode", "ask"]) == 2
+        err = capsys.readouterr().err
+        assert "--mode ask needs a terminal to ask at" in err
+
+    def test_the_cli_runs_ask_when_stdin_is_a_terminal(
+        self, worker_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half: a guard that refuses everything is not a guard. With a
+        terminal present the command gets all the way to connecting to an
+        app-server, and fails there instead — on a connect that is stubbed out,
+        so no `codex` is spawned on a machine that happens to have one."""
+        # Both streams, since the guard now checks both: the CLI constructs the
+        # worker with no explicit prompt stream, so it falls back to sys.stderr.
+        monkeypatch.setattr("sys.stdin", FakeTerminal())
+        monkeypatch.setattr("sys.stderr", CapturingTerminal())
+
+        def no_server(self: Any) -> dict[str, Any]:
+            raise RuntimeError("stubbed: this test does not spawn a real app-server")
+
+        monkeypatch.setattr("spanreed.codex_client.CodexClient.connect", no_server)
+        assert cli.main(["codex", "--name", "r", "--cwd", str(worker_cwd), "--mode", "ask"]) == 1
+        log = (worker_cwd.parent / "spanreed-state" / "codex" / "r.log").read_text()
+        assert "FAILED TO START" in log, "it did not get as far as the app-server"
+        assert "this test does not spawn a real app-server" in log
+
+
+class TestAskModePromptsTheOperator:
+    """Every approval goes to the terminal, and the operator's answer is the
+    verdict — not a confirmation of the worker's own."""
+
+    def test_a_yes_approves_a_request_the_worker_would_have_declined(
+        self, make_worker: MakeWorker, store: StateStore, worker_cwd: Path, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        out = CapturingTerminal()
+        stub, worker = make_worker(
+            app_server(_approval_turn(str(worker_cwd), str(outside))),
+            mode="ask",
+            prompt_in=FakeTerminal("y", "y"),
+            prompt_out=out,
+        )
+        register_sender(store)
+        mail(store, worker, "do the thing")
+        worker.run(max_polls=1)
+
+        # Both approved, including the one decide() would have refused for
+        # being outside --cwd: in this mode the operator decides.
+        assert [r["result"]["decision"] for r in stub.client_replies] == ["approved", "approved"]
+        assert "APPROVE execCommandApproval" in log_of(worker)
+        assert "APPROVED BY THE OPERATOR at the worker's terminal" in log_of(worker)
+        # And the operator saw what they were approving.
+        printed = out.getvalue()
+        assert "rm -rf junk" in printed
+        assert "execCommandApproval" in printed
+        assert str(outside) in printed
+
+    def test_a_no_declines_a_request_the_worker_would_have_approved(
+        self, make_worker: MakeWorker, store: StateStore, worker_cwd: Path, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        stub, worker = make_worker(
+            app_server(_approval_turn(str(worker_cwd), str(outside))),
+            mode="ask",
+            prompt_in=FakeTerminal("n", "n"),
+        )
+        register_sender(store)
+        mail(store, worker, "do the thing")
+        worker.run(max_polls=1)
+        assert [r["result"]["decision"] for r in stub.client_replies] == ["abort", "abort"]
+        assert "DECLINED BY THE OPERATOR at the worker's terminal" in log_of(worker)
+
+    def test_the_prompt_says_the_worker_and_its_queue_are_blocked(
+        self, make_worker: MakeWorker, store: StateStore, worker_cwd: Path
+    ) -> None:
+        """Rule 7, and the owner's decision that this waits indefinitely: the
+        cost of the choice is printed rather than discovered."""
+        out = CapturingTerminal()
+        _stub, worker = make_worker(
+            app_server(_approval_turn(str(worker_cwd), str(worker_cwd))),
+            mode="ask",
+            prompt_in=FakeTerminal("y", "y"),
+            prompt_out=out,
+        )
+        register_sender(store)
+        mail(store, worker, "go")
+        worker.run(max_polls=1)
+        printed = out.getvalue()
+        assert ASK_BLOCKED_NOTICE in printed
+        assert "THE WORKER IS BLOCKED AND WILL WAIT HERE INDEFINITELY" in printed
+        assert "every message queued behind it waits too" in printed
+        assert "Approve this? [y/n]: " in printed
+
+    def test_an_unreadable_answer_is_re_asked_rather_than_guessed_at(
+        self, make_worker: MakeWorker, worker_cwd: Path
+    ) -> None:
+        """A stray newline in a terminal the operator is also typing into must
+        not become an approval."""
+        out = CapturingTerminal()
+        _stub, worker = make_worker(
+            mode="ask", prompt_in=FakeTerminal("", "maybe", "Y"), prompt_out=out
+        )
+        reply = worker.handle_server_request(
+            "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)}
+        )
+        assert reply == {"decision": "approved"}
+        assert out.getvalue().count("Approve this? [y/n]: ") == 3
+        assert "'maybe' is not an answer" in out.getvalue()
+
+    def test_a_terminal_that_goes_away_declines_and_says_it_was_not_asked(
+        self, make_worker: MakeWorker, worker_cwd: Path
+    ) -> None:
+        """EOF is not a timeout and not an answer. There is no longer anybody to
+        ask, and no amount of waiting produces one, so the request fails closed —
+        and the log says, in full, that nobody answered it."""
+        out = CapturingTerminal()
+        _stub, worker = make_worker(mode="ask", prompt_in=FakeTerminal(), prompt_out=out)
+        reply = worker.handle_server_request(
+            "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)}
+        )
+        assert reply == {"decision": "abort"}
+        log = log_of(worker)
+        assert "DECLINED WITHOUT BEING ASKED" in log
+        assert "This is not a timeout and not the operator's answer" in log
+        assert "DECLINE execCommandApproval" in log
+
+    def test_every_prompt_and_answer_reaches_the_approval_log(
+        self, make_worker: MakeWorker, worker_cwd: Path
+    ) -> None:
+        """ "Every prompt and answer goes to the approval log like any other
+        decision" — so the file shows the question as well as the verdict."""
+        _stub, worker = make_worker(mode="ask", prompt_in=FakeTerminal("y"))
+        worker.handle_server_request(
+            "execCommandApproval", {"command": ["git", "push"], "cwd": str(worker_cwd)}
+        )
+        log = log_of(worker)
+        assert "PUTTING execCommandApproval TO THE OPERATOR and blocking until" in log
+        assert "the operator answered APPROVED" in log
+        assert "[codex-approval] APPROVE execCommandApproval subject=git push" in log
+
+    def test_a_slow_operator_does_not_lose_the_turn(
+        self, make_worker: MakeWorker, store: StateStore, worker_cwd: Path
+    ) -> None:
+        """The prompt waits indefinitely, so the turn's deadline must not be
+        running while it waits.
+
+        The deadline measures the SERVER's silence. Time spent inside this
+        worker's own approval handler is not silence, and without crediting it
+        back an ask-mode worker would take the operator's answer and then tell
+        the sender the turn never finished — turning "waits indefinitely" into
+        "waits indefinitely and then throws the turn away".
+        """
+
+        class SlowOperator(FakeTerminal):
+            def readline(self, size: int = -1) -> str:  # type: ignore[override]
+                time.sleep(0.5)
+                return super().readline(size)
+
+        def ask_then_answer(stub: StubServer, msg: dict[str, Any]) -> None:
+            stub.ask("slow-1", "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)})
+            stub.wait_for(lambda: bool(stub.client_replies))
+            stub.notify(AGENT_MESSAGE_DELTA, {"delta": "done"})
+            stub.notify("turn/completed", {})
+
+        _stub, worker = make_worker(
+            app_server(ask_then_answer), mode="ask", prompt_in=SlowOperator("y")
+        )
+        # Shorter than the operator takes, so the turn can only complete if that
+        # time is not charged against it.
+        worker.client.turn_timeout = 0.3
+        register_sender(store)
+        mail(store, worker, "go")
+        worker.run(max_polls=1)
+        (reply,) = replies(store)
+        assert "did not finish" not in reply.body
+        assert reply.body == "done", "the turn was abandoned while the operator read the prompt"
+
+    def test_the_other_modes_do_not_prompt(self, make_worker: MakeWorker, worker_cwd: Path) -> None:
+        """A prompt in `auto` would block a worker whose whole point is that it
+        does not need anybody, and `full` is never asked at all."""
+        for mode in ("auto", "full"):
+            out = CapturingTerminal()
+            _stub, worker = make_worker(mode=mode, prompt_out=out, prompt_in=FakeTerminal("y"))
+            worker.handle_server_request(
+                "execCommandApproval", {"command": ["ls"], "cwd": str(worker_cwd)}
+            )
+            assert out.getvalue() == "", mode
 
 
 # ---------------------------------------------------------------- approvals
@@ -703,17 +1063,17 @@ class TestBoundaryInstructionMatchesTheMode:
     "declined by the worker before they reach you". That is false in EVERY mode,
     the default included: _decide_exec reads params["cwd"] and never what the
     command targets, so `rm -rf /elsewhere` launched from --cwd is approved. It
-    is false a second way in danger, where approval_policy() is "never" and
+    is false a second way in `full`, where approval_policy() is "never" and
     nothing is asked at all.
 
     An earlier version of this docstring said the claim was "true in workspace
-    mode", which is the belief that produced rounds three and four of the review
-    of #56 -- the defect kept reappearing in whichever branch nobody had
-    executed. Nothing here is true in workspace mode.
+    mode" (the mode now called `auto`), which is the belief that produced rounds
+    three and four of the review of #56 -- the defect kept reappearing in
+    whichever branch nobody had executed. Nothing here is true in `auto` either.
     """
 
-    def test_danger_does_not_promise_a_boundary_it_does_not_have(self) -> None:
-        text = BOUNDARY_BY_MODE["danger"].format(cwd="/w")
+    def test_full_does_not_promise_a_boundary_it_does_not_have(self) -> None:
+        text = BOUNDARY_BY_MODE["full"].format(cwd="/w")
         assert "NO SANDBOX" in text
         assert "declined by the worker" not in text
         # A phrase that does not span the wrap. "nothing constrains you" broke
@@ -721,10 +1081,20 @@ class TestBoundaryInstructionMatchesTheMode:
         # time that has happened in this repo, hence the note.
         assert "no mechanism will stop you" in text
 
-    def test_workspace_describes_the_sandbox_that_actually_confines_it(self) -> None:
-        text = BOUNDARY_BY_MODE["workspace"].format(cwd="/w")
-        assert "workspaceWrite" in text
-        assert "/w" in text
+    def test_confined_modes_describe_the_sandbox_that_is_asked_for(self) -> None:
+        for mode in CONFINED_MODES:
+            text = BOUNDARY_BY_MODE[mode].format(cwd="/w")
+            assert "workspaceWrite" in text, mode
+            assert "/w" in text, mode
+
+    def test_ask_tells_the_model_an_approval_costs_a_human(self) -> None:
+        """The model is the only party that can keep the prompt count sane, and
+        it cannot do that without being told what a prompt costs: in ask mode
+        every approval stops the turn and the whole queue behind it until a
+        person answers."""
+        text = BOUNDARY_BY_MODE["ask"].format(cwd="/w")
+        assert "put to a HUMAN at the worker's own terminal" in text
+        assert "waits for an answer with no timeout" in text
 
     # ---------------------------------------------------------------- claims
     # Three review rounds found three false sentences here, each in a branch the
@@ -777,6 +1147,13 @@ class TestBoundaryInstructionMatchesTheMode:
         # A mode added without one would fall back to a KeyError at start(),
         # which is loud -- but this makes the omission visible at test time.
         assert set(BOUNDARY_BY_MODE) == set(MODES)
+
+    def test_every_mode_says_who_answers_its_approvals(self) -> None:
+        # The startup line names the answerer in words (rule 7): "the operator,
+        # on this terminal", "the worker itself", "NOBODY". It is a third table
+        # keyed by mode, and a mode missing from it is a KeyError at start() --
+        # visible here instead.
+        assert set(ANSWERED_BY) == set(MODES)
 
     def test_every_mode_has_a_sandbox_mode(self) -> None:
         # SANDBOX_MODES is indexed with the same KeyError-at-start shape as
@@ -832,9 +1209,9 @@ class TestNoBoundaryClaimInAnyEmittedString:
     substring blacklist (see FORBIDDEN), so a newly-worded sentence making the same
     claim passes. The review of #56 demonstrated exactly that: a fresh sentence
     in the DEFAULT mode's preamble, green across the whole suite. It also
-    demonstrated the one-word hole: "the only bound on what THE worker may
-    touch" is blacklisted and "...what THIS worker may touch" was not, and
-    shipped in cli.py.
+    demonstrated the one-word hole: the blacklisted phrasing named THE worker,
+    the sentence that shipped in cli.py named THIS worker, and one word was the
+    whole difference.
 
     The docstring above argues completeness at length and all of it is about
     which *sites* are scanned. That is the half that was fixed. The predicate is
@@ -842,17 +1219,10 @@ class TestNoBoundaryClaimInAnyEmittedString:
     docs/open-questions.md rather than half-built here.
     """
 
-    FORBIDDEN = (
-        "declined outside it",
-        "granted inside it",
-        # Both articles: "the" was blacklisted, "this" shipped in cli.py.
-        "only bound on what the worker may touch",
-        "only bound on what this worker may touch",
-        "whole blast radius",
-        "declines approvals for paths outside",
-        "declines every approval",
-        "buys you nothing",
-    )
+    # Defined in `retracted_claims.py`, with the prose blacklist, because the
+    # repo-wide guard has to scan this file too and a blacklist is made of the
+    # strings it forbids.
+    FORBIDDEN = FORBIDDEN_IN_EMITTED_STRINGS
 
     @staticmethod
     def _emitted_strings(path: Path) -> list[str]:
@@ -969,3 +1339,228 @@ def test_no_prose_states_the_size_of_the_blacklist() -> None:
             f"FORBIDDEN has {len(TestNoBoundaryClaimInAnyEmittedString.FORBIDDEN)} "
             f"entries and can be counted"
         )
+
+
+def _claim_bearing_files() -> list[Path]:
+    """Every file in the repo that can carry a claim in prose, from `git ls-files`.
+
+    Not a glob over the directories the last review named. Round 2 read
+    `README.md` and `docs/architecture.md`, two of eight, and the retracted
+    claim survived in `docs/open-questions.md`. Round 3 read `docs/*.md` plus
+    two named files, eight of twelve -- and the claim survived in
+    `tests/unit/test_codex_worker_faults.py`, in a class docstring, in a file
+    the very commit titled "retract the boundary claim where it is still
+    asserted" had edited fifty lines below. Twice the guard was widened to the
+    population the last instance was found in, and twice the next instance was
+    outside it.
+
+    So the population is the repo. `.py` is included alongside `.md` because
+    the src-side guard deliberately excludes docstrings and comments (it scans
+    emitted strings), which is the exact gap the class docstring sat in, and
+    because nothing scanned `tests/` at all.
+    """
+    root = Path(__file__).parents[2]
+    listed = subprocess.run(
+        ["git", "ls-files", "*.md", "*.py"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    # The blacklist's own file, and only it: see retracted_claims.__doc__.
+    blacklist_file = Path(__file__).with_name("retracted_claims.py")
+    return sorted(root / name for name in listed if (root / name) != blacklist_file)
+
+
+# A phrase may legitimately appear where it is being DENIED -- the retraction in
+# `codex_client.py` quotes the claim in order to reject it, and `codex_worker.py`
+# quotes it followed by "was false". So both sides are checked: a denial can
+# precede the phrase ("it is NOT the worker's...") or follow it ("...was false").
+# The trailing window is deliberately much shorter, because a denial two
+# sentences later is about something else.
+_DENIAL = re.compile(
+    r"\b(not|never|no longer|false|untrue|wrong|retract\w*|stop\w* (?:claim|describ)\w*)\b",
+    re.I,
+)
+_DENIAL_BEFORE = 90
+_DENIAL_AFTER = 40
+
+
+def _hits(text: str) -> list[str]:
+    """Case-insensitive, and blind to a phrase that is being retracted.
+
+    Case-insensitive because "Security boundary" at the start of a sentence is
+    the same claim; morphology ("boundaries") still slips, which is the same
+    open half the src-side guard's docstring concedes.
+    """
+    found: list[str] = []
+    low = text.lower()
+    for phrase in RETRACTED_IN_PROSE:
+        for i in _offsets(low, phrase.lower()):
+            end = i + len(phrase)
+            near = text[max(0, i - _DENIAL_BEFORE) : i] + " || " + text[end : end + _DENIAL_AFTER]
+            if not _DENIAL.search(near):
+                found.append(phrase)
+                break
+    return found
+
+
+def _offsets(haystack: str, needle: str) -> list[int]:
+    out: list[int] = []
+    i = haystack.find(needle)
+    while i != -1:
+        out.append(i)
+        i = haystack.find(needle, i + 1)
+    return out
+
+
+def test_the_design_docs_make_no_retracted_boundary_claim() -> None:
+    """A false claim in prose is invisible to the `src/spanreed/*.py` guard.
+
+    That is exactly where the review of #61 found one: a sentence saying every
+    category routed to a client "should reach the operator", about
+    `mcp_elicitations`, which are declined in every mode -- a newly-worded
+    false claim in the document the PR existed to correct.
+
+    The claims that matter live in prose, so prose gets the same blacklist the
+    emitted strings do.
+    """
+    files = _claim_bearing_files()
+    assert len(files) >= 35, f"the listing found only {len(files)} files"
+    root = Path(__file__).parents[2]
+    for doc in files:
+        hits = _hits(doc.read_text(encoding="utf-8", errors="replace"))
+        assert not hits, f"{doc.relative_to(root)}: {hits}"
+
+
+def test_that_docs_guard_can_actually_fail() -> None:
+    """A control for the PREDICATE, not just for the files loading.
+
+    The previous version asserted that `architecture.md` was non-empty and
+    mentioned `--cwd`. That proves the guard reads something; it does not prove
+    any phrase in the blacklist is detectable, and a blacklist whose entries
+    match nothing passes identically to a working one.
+    """
+    # Every phrase is individually detectable, so none is a typo that can never fire.
+    for phrase in RETRACTED_IN_PROSE:
+        assert _hits(f"prelude {phrase} coda") == [phrase], phrase
+        # ...including capitalised, which a case-sensitive `in` missed.
+        assert _hits(f"Prelude. {phrase.capitalize()} coda") == [phrase], phrase
+    # ...and a clean document is clean, so the predicate is not matching everything.
+    assert _hits("`--cwd` anchors the sandbox's writable roots. Nothing here is forbidden.") == []
+    # The files really do load, which is the old control, kept.
+    root = Path(__file__).parents[2]
+    arch = (root / "docs" / "architecture.md").read_text()
+    assert len(arch) > 5000, "architecture.md did not load; the guard above reads nothing"
+    assert "--cwd" in arch, "the guard is reading a file that does not discuss the boundary"
+
+
+def test_a_retracted_claim_is_exempt_only_where_it_is_being_denied() -> None:
+    """The denial exemption is the guard's soft spot, so it gets its own control.
+
+    Without it the guard flags its own retractions -- `codex_client.py` quotes
+    the claim in order to reject it, and `codex_worker.py` quotes it followed by
+    "was false". With it too loose, an assertion near an unrelated "not" walks
+    free. Both directions are pinned here.
+
+    Every case is built from `RETRACTED_IN_PROSE` rather than from a literal:
+    the first draft wrote a phrase out in full, and the repo-wide guard --
+    which reads this file -- flagged this test as an assertion of the claim.
+    """
+    for phrase in RETRACTED_IN_PROSE:
+        # Denied before, and denied after: exempt.
+        assert _hits(f"This is NOT the case: {phrase}.") == [], phrase
+        assert _hits(f"Saying {phrase} was false.") == [], phrase
+        # Asserted flatly: caught.
+        assert _hits(f"The design says {phrase} and relies on it.") == [phrase], phrase
+        # A denial two sentences later does not reach back and exempt it.
+        far = f"The design says {phrase}. " + "Filler. " * 12 + "Elsewhere that is not so."
+        assert _hits(far) == [phrase], phrase
+
+
+def _slug(heading: str) -> str:
+    """GitHub's anchor slug: lowercase, drop punctuation, EACH space to a hyphen.
+
+    Each, not each run: GitHub does not collapse whitespace, so a heading whose
+    punctuation sat between two spaces (`` `peers/<host>.json` — peer records ``)
+    slugs with a double hyphen. Collapsing here made this checker's first run
+    report a link in architecture.md as broken when the link was correct and the
+    rule was wrong -- a link checker that is wrong about slugs is worse than
+    none, because it teaches you to edit working links.
+    """
+    text = re.sub(r"`|\*|_", "", heading.strip())
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    return re.sub(r"\s", "-", text.strip()).lower()
+
+
+def test_every_cross_document_anchor_resolves() -> None:
+    """#61's F2: `architecture.md` cited a `findings.md` entry that did not exist.
+
+    It was a bare link with no anchor, so nothing could notice — the file
+    existed, and the run it pointed at was recorded nowhere. A reader following
+    the citation for a measurement under a breaking change landed on a document
+    that does not mention the date.
+
+    This checks the whole docs tree rather than that one link: a citation to a
+    heading that is not there is the same defect wherever it appears, and the
+    reason the original survived review twice is that no test read the links.
+    """
+    root = Path(__file__).parents[2]
+    # CHANGELOG.md was in neither the source nor the target set, and it cites
+    # findings.md.
+    files = {
+        p.name: p for p in [*root.glob("docs/*.md"), root / "README.md", root / "CHANGELOG.md"]
+    }
+    headings = {
+        name: {_slug(m) for m in re.findall(r"^#{1,6}\s+(.+)$", p.read_text(), re.M)}
+        for name, p in files.items()
+    }
+    checked = 0
+    for name, path in files.items():
+        for target, anchor in re.findall(r"\]\(([\w./-]*\.md)#([\w-]+)\)", path.read_text()):
+            target_name = Path(target).name
+            if target_name not in headings:
+                continue  # a link out of the checked tree
+            checked += 1
+            assert anchor in headings[target_name], (
+                f"{name} links to {target_name}#{anchor}, which has no such heading. "
+                f"Headings there: {sorted(headings[target_name])}"
+            )
+    # A link checker that found no links passes everything.
+    assert checked >= 2, f"only {checked} cross-document anchors found; the regex is not matching"
+
+    # Bare links carry no anchor to resolve, but the file has to exist -- and
+    # they are the majority, so leaving them unchecked leaves most of the
+    # linking unguarded.
+    bare = 0
+    for name, path in files.items():
+        for target in re.findall(r"\]\(([\w./-]*\.md)\)", path.read_text()):
+            resolved = (path.parent / target).resolve()
+            bare += 1
+            assert resolved.is_file(), f"{name} links to {target}, which does not exist"
+    assert bare >= 5, f"only {bare} bare document links found; the regex is not matching"
+
+
+def test_the_mode_help_points_at_the_renamed_flags(capsys: pytest.CaptureFixture[str]) -> None:
+    """This branch removes `--mode workspace|danger`; argparse says "invalid choice".
+
+    A breaking rename on a documented CLI surface whose error names the new
+    values but never the old ones leaves the operator to guess which new mode
+    their script meant. The mapping is not one an error message can infer, so
+    the help text carries it.
+    """
+    parser = cli.build_parser()
+    # `spanreed codex --help`, because the mapping lives on the subcommand --
+    # reading the top-level help instead is how the first version of this test
+    # failed for the wrong reason.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["codex", "--help"])
+    help_text = capsys.readouterr().out
+    for old_name, new_name in (("workspace", "auto"), ("danger", "full")):
+        assert old_name in help_text, f"the help does not mention the removed --mode {old_name}"
+        assert new_name in help_text
+    # NOT a version number. `pyproject.toml` is bumped in a dedicated release
+    # commit, so any version named here ahead of that is a prediction -- and an
+    # `assert "0.3.0" in help_text` passes whether or not the release lands as
+    # 0.3.0, which is asserting the prediction rather than deriving the fact.
+    assert "CHANGELOG" in help_text

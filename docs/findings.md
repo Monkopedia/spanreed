@@ -222,3 +222,44 @@ Recorded because it bounds what the fix for issue #55 can honestly claim.
 3. A peer whose own agents all failed *its* liveness check advertised an empty list, and `sync_remote_agents` replaced the mirror with nothing. On the receiving end that is indistinguishable from never having synced.
 
 **The lesson, and it is the one the fix is built on.** Every one of those is a *silent* path, and the reporter spent three days inside the ambiguity they create. Making sync bidirectional-by-construction (push *and* pull) closes (1); catching per-frame errors closes (2); sending the counts behind the agent list closes (3) — but the load-bearing change is that all three now write a peer record a human can read from `spanreed list` on either host. A fault that can be named in one pasted terminal buffer costs minutes; the same fault with nothing printed cost three days.
+
+## Incident: the confinement measurement that motivated the three-mode redesign was taken against a thread with no sandbox (2026-09-17)
+
+Recorded because a design document cited this run and this file had no record of
+it — a reader following the link landed on a file that did not mention the date.
+Written up as an incident rather than a test because what it establishes is a
+defect in the instrument, not a fact about Codex.
+
+**What was run.** `spanreed codex --doctor --cwd <dir>` against `codex-cli
+0.154.0`, on the version of `codex_doctor.py` current that morning.
+
+**What was observed.** Two things, reported at the time as two independent
+results:
+
+1. A write landed outside every path in the `writableRoots` the run sent. Nothing
+   confined it.
+2. No approval was requested before that write. The approval channel never fired.
+
+**Why that is one observation and not two.** `thread_start_params` sent `cwd` and
+`approvalPolicy` and **no `sandbox` at all**, so the thread had been given no
+thread-level `SandboxMode`; only the turn-level `sandboxPolicy` object went out.
+With nothing confining the write, there was no sandbox boundary to cross — and an
+approval request is what a *crossing* produces. Observation 2 is what
+observation 1's configuration predicts. Presenting them as mutual corroboration
+was the error, and it was mine, not the reviewer's to catch twice.
+
+**What this run therefore establishes:** that the doctor was not sending what a
+worker sends. It does **not** establish that Codex ignores a thread-level
+`sandbox`, that the granular `approvalPolicy` is unapplied, or that the approval
+channel cannot be relied on. Those remain open — see architecture.md, "Not
+verifiable here".
+
+**Not re-taken.** `thread_start_params` now sends `sandbox`, and step 4 of the
+doctor exercises the escape probe against it, but no corrected run existed when
+the three-mode design landed. The design does not rest on this measurement: it
+rests on a reading of the schema — an approved shell command is a process, and no
+path check bounds what a process does — which is independent of any run.
+
+**The lesson.** A diagnostic that cannot reproduce the configuration it is
+diagnosing measures itself. That is this project's founding complaint about the
+thirty spike runs above, committed by the tool written in response to them.
