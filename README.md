@@ -50,12 +50,18 @@ An inter-agent message bus for local Claude Code sessions. Run one Claude sessio
 >
 > **One migration hazard worth knowing before you try it.** With no
 > `crossSessionInbound` value set, Claude Code decides per message from the two
-> sessions' permission modes: a session that bypasses permission prompts **holds**
-> every message from a sender that does not also bypass, behind an approval dialog
-> that expires after five minutes by default (`dialogExpiry`). A fleet running in
-> bypass mode can therefore look silently one-directional. Setting
-> `crossSessionInbound: accept` is the fix, and it is worth setting deliberately
-> rather than discovering.
+> sessions' permission modes, sorting every session into one of two classes:
+> bypassing permission prompts, or prompting — where `auto`, `acceptEdits`, and
+> `dontAsk` all count as *prompting*. A message is **held** behind an approval
+> dialog exactly when the two classes differ, in *both* directions, and the
+> dialog drops the message after five minutes by default (`dialogExpiry`). A
+> fleet that is uniformly one class is fine; a **mixed** fleet stops talking to
+> whichever sessions are the odd one out. The sending Claude is told when a
+> same-machine message is held — though a `claude -p` sender needs v2.1.271 or
+> later to get that notice, and a `-p` receiver can't show the dialog at all, so
+> it holds for the deadline and then drops. Setting `crossSessionInbound:
+> accept` is the fix, and it is worth setting deliberately rather than
+> discovering.
 >
 > **Not yet measured here:** whether native messaging holds up under this project's
 > own traffic pattern — bursts of multi-kilobyte review reports between ~20 agents —
