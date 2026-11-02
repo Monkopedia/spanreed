@@ -735,7 +735,10 @@ class StateStore:
 
     def set_cursor(self, session_id: str, msg_id: str) -> None:
         path = self._cursor_path(session_id)
-        tmp = path.with_suffix(".tmp")
+        # Appended, not `with_suffix`: that replaces everything after the LAST
+        # dot, so every bridge key (`.bridge.<inbox>`) mapped to one shared
+        # `.bridge.tmp`, and two conjoin processes raced on it (#47).
+        tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(msg_id)
         tmp.replace(path)
 
