@@ -224,7 +224,7 @@ Agents are addressed by `agent_id`. An id is **minted** from the directory a ses
 ### Minting (`session-start`, `register`)
 
 - Default: `agent_id = "agent-" + sha256(absolute_cwd)[:8]`. Display name = basename of cwd.
-- Override: `SPANREED_AGENT_NAME` env var → `agent_id = "agent-<name>"`, display name = `<name>`.
+- Override: `SPANREED_AGENT_NAME` env var → `agent_id = "agent-<name>"`, display name = `<name>`. The resulting id must be legal (see **Agent id syntax** below); an override containing `@`, `/`, or a space is refused at derivation rather than producing an id that later misroutes.
 
 v1 limitation: two Claude Code sessions started in the same cwd share an agent — fine for the typical one-session-per-repo workflow.
 
@@ -339,7 +339,15 @@ The SSH bus-bridge (design rationale in [`architecture.md`](architecture.md)) co
 
 ### Host-qualified agent ids
 
-Global identity is `agent-X@homehost`. On its **home** host the agent keeps its bare `agent-X` id (unchanged — local traffic and the existing tools are untouched). On a **foreign** host it appears as `agent-X@home`. The `@` separator is not otherwise legal in a generated `agent_id` (those are `agent-<hex>`), so it unambiguously marks "remote, routed via the bridge." `@` is filesystem-safe, so `inboxes/agent-X@home.jsonl` is a normal inbox file.
+Global identity is `agent-X@homehost`. On its **home** host the agent keeps its bare `agent-X` id (unchanged — local traffic and the existing tools are untouched). On a **foreign** host it appears as `agent-X@home`. `@` unambiguously marks "remote, routed via the bridge" because it is **refused** in every locally minted or registered id — enforced, not assumed. (This sentence used to say `@` was "not otherwise legal in a generated `agent_id` (those are `agent-<hex>`)", which was false: `SPANREED_AGENT_NAME` mints `agent-<name>` for any name, so `worker@adolin` produced a *local* agent that the bridge treated as remote and a peer's sync then deleted. #12.) `@` is filesystem-safe, so `inboxes/agent-X@home.jsonl` is a normal inbox file.
+
+**Agent id syntax.** An id is one part, or a local part and a host joined by exactly one `@`. Each part is a leading ASCII letter or digit followed by letters, digits, `.`, `_`, or `-`; the whole id is at most 200 characters. Where it is checked:
+
+- **Where an id is minted or registered** — the `SPANREED_AGENT_NAME` derivation, `register_agent`, and a Codex worker's `--name` — only a *local* id is legal: `@` is refused.
+- **Where a peer's ids arrive** — a `registry` frame — each advertised id must be a bare local id; the bridge adds the `@<host>` itself.
+- **Where an id becomes a path** — every inbox read or write, and the CLI's `inbox-path` / `inbox-watch` — local or qualified ids are legal, and anything else raises.
+
+The charset is what makes the path safe: with no `/` and a leading letter or digit, no id can name a file outside `inboxes/`.
 
 ### Mirrored registry entries
 
@@ -400,7 +408,7 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
 {"kind": "ping"}
 ```
 
-- `msg` — a forwarded bus message. The receiving bridge appends `message` verbatim to `inboxes/<message.to_agent>.jsonl`.
+- `msg` — a forwarded bus message. The receiving bridge appends `message` verbatim to `inboxes/<message.to_agent>.jsonl`, **provided `message.to_agent` is a legal id** (see Agent id syntax). A frame whose `to_agent` is not — e.g. `../../x` — is refused and logged, and the reader carries on with the next frame; before #12 it was written wherever the path pointed, including outside the state root.
 - `registry` — the sender's current set of live local agents (bare ids, home = sender). The receiver mirrors them per "Mirrored registry entries" above. Sent immediately after the handshake, on every sync tick, and on demand in answer to a `registry-request`.
 
   `local_rows` and `stale_local_rows` are the counts **behind** the list: how many bare local rows the sender's registry held, and how many of those it judged stale and therefore withheld. Without them an empty `agents` list is indistinguishable on the receiving end from a peer that never answered, and those two faults have different remedies (fix the peer's agents vs. fix the bridge). Both are **optional** — a peer predating them omits them, and the receiver records `null`, which means "cannot tell" rather than zero.

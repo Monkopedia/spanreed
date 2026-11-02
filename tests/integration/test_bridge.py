@@ -843,3 +843,48 @@ class TestReaderSurvivesABadFrame:
             assert link.note is not None
             assert "not a JSON bus frame" in link.note
             assert "Welcome to Ubuntu" in link.note
+
+
+def test_a_peer_frame_addressed_outside_the_state_root_writes_nothing(tmp_path: Path) -> None:
+    """#12's end-to-end reproduction: a `msg` frame to `../../escaped`.
+
+    Before validation this created `<state_root>/../escaped.jsonl`. The frame
+    must be refused, and the reader must survive it -- a frame that kills the
+    reader is the #55 failure, so a later valid frame still has to land.
+    """
+    store = StateStore(root=tmp_path / "local")
+    _register_live(store, "agent-local", "local")
+
+    def frame(msg_id: str, to_agent: str) -> bytes:
+        msg = {
+            "msg_id": msg_id,
+            "from_agent": "agent-peer@adolin",
+            "to_agent": to_agent,
+            "body": "x",
+            "ts": "2026-01-01T00:00:00Z",
+            "in_reply_to": None,
+        }
+        return (json.dumps({"kind": "msg", "message": msg}) + "\n").encode()
+
+    peer_r, peer_w = os.pipe()
+    conn = Bridge(
+        os.fdopen(peer_r, "rb"),
+        io.BytesIO(),
+        "kaladin",
+        store,
+        poll_interval=0.05,
+        sync_interval=10,
+        recv_timeout=60,
+    )
+    thread = threading.Thread(target=conn.run, daemon=True)
+    thread.start()
+    with os.fdopen(peer_w, "wb") as peer:
+        peer.write((json.dumps({"kind": "hello", "host": "adolin"}) + "\n").encode())
+        peer.write(frame("evil", "../../escaped"))
+        peer.write(frame("good", "agent-local"))
+        peer.flush()
+        _wait(lambda: any(m.msg_id == "good" for m in store.recv_messages("agent-local")))
+    thread.join(timeout=5.0)
+
+    assert list(tmp_path.rglob("escaped*")) == [], "a peer frame wrote outside the state root"
+    assert [m.msg_id for m in store.recv_messages("agent-local")] == ["good"]

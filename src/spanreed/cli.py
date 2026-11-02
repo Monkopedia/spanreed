@@ -25,7 +25,7 @@ from pathlib import Path
 
 from spanreed.codex_approvals import MODES
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
-from spanreed.protocol import Agent
+from spanreed.protocol import Agent, validate_agent_id
 from spanreed.store import (
     StateStore,
     default_state_root,
@@ -60,7 +60,7 @@ def _cmd_agent_id(_args: argparse.Namespace) -> int:
 
 def _cmd_inbox_path(args: argparse.Namespace) -> int:
     agent_id: str = args.agent_id
-    print(default_state_root() / "inboxes" / f"{agent_id}.jsonl")
+    print(default_state_root() / "inboxes" / f"{validate_agent_id(agent_id)}.jsonl")
     return 0
 
 
@@ -365,7 +365,7 @@ def _cmd_inbox_watch(_args: argparse.Namespace) -> int:
     # The Monitor's description tells agents to read the disposition policy file;
     # ensure it exists before we exec into tail and never return.
     _write_disposition_policy()
-    inbox = default_state_root() / "inboxes" / f"{agent_id}.jsonl"
+    inbox = default_state_root() / "inboxes" / f"{validate_agent_id(agent_id)}.jsonl"
     inbox.parent.mkdir(parents=True, exist_ok=True)
     inbox.touch(exist_ok=True)
     os.execvp("tail", ["tail", "-n", "0", "-F", str(inbox)])

@@ -17,6 +17,8 @@ import hashlib
 import os
 from pathlib import Path
 
+from spanreed.protocol import validate_agent_id
+
 
 def derive_agent_identity(working_dir: Path | None = None) -> tuple[str, str]:
     """Compute ``(agent_id, name)`` for a session.
@@ -32,7 +34,7 @@ def derive_agent_identity(working_dir: Path | None = None) -> tuple[str, str]:
     """
     override = os.environ.get("SPANREED_AGENT_NAME")
     if override:
-        return f"agent-{override}", override
+        return validate_agent_id(f"agent-{override}", qualified_ok=False), override
     wd = (working_dir or Path.cwd()).resolve()
     name = wd.name or "unknown"
     digest = hashlib.sha256(str(wd).encode()).hexdigest()[:8]
@@ -81,7 +83,7 @@ def session_agent_identity(
     """
     override = os.environ.get("SPANREED_AGENT_NAME")
     if override:
-        return f"agent-{override}", override, None
+        return validate_agent_id(f"agent-{override}", qualified_ok=False), override, None
 
     derived_id, derived_name = derive_agent_identity(working_dir)
 
