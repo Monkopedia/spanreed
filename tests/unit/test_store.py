@@ -504,6 +504,33 @@ class TestCursors:
         store.set_cursor("session-1", "msg-def")
         assert store.get_cursor("session-1") == "msg-def"
 
+    def test_dotted_cursor_keys_round_trip_independently(self, store: StateStore) -> None:
+        # The bridge's keys are `.bridge.<inbox>` -- every one has dots, and the
+        # undotted keys above could not see that they all shared a temp file.
+        a, b = ".bridge.agent-x@adolin", ".bridge.agent-y@mac"
+        store.set_cursor(a, "msg-a")
+        store.set_cursor(b, "msg-b")
+        assert store.get_cursor(a) == "msg-a"
+        assert store.get_cursor(b) == "msg-b"
+
+    def test_dotted_cursor_keys_do_not_share_a_temp_path(
+        self, store: StateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Two conjoin processes on one state root write cursors concurrently, so
+        # a shared temp path is a race: one `replace` raises FileNotFoundError and
+        # the other cursor ends up holding a foreign msg_id (#47).
+        written: list[str] = []
+        real_write_text = Path.write_text
+
+        def spy(self: Path, data: str, *args: object, **kwargs: object) -> int:
+            written.append(self.name)
+            return real_write_text(self, data)
+
+        monkeypatch.setattr(Path, "write_text", spy)
+        store.set_cursor(".bridge.agent-x@adolin", "msg-a")
+        store.set_cursor(".bridge.agent-y@mac", "msg-b")
+        assert len(set(written)) == 2, written
+
 
 # ----------------------------------------------------------------- wait_for_reply
 
