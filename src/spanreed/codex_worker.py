@@ -84,7 +84,7 @@ from spanreed.codex_client import (
     ServerRequestHandler,
     TurnResult,
 )
-from spanreed.protocol import Message, Status
+from spanreed.protocol import Message, Status, validate_agent_id
 from spanreed.store import StateStore, default_state_root
 
 AUTH_TOKENS_REFRESH = "account/chatgptAuthTokens/refresh"
@@ -297,6 +297,9 @@ class WorkerConfig:
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("--name is required and must not be empty")
+        # Here, not only at registration: the name also names the worker's log
+        # file, which is opened before the worker registers.
+        validate_agent_id(f"agent-{self.name}", qualified_ok=False)
         if self.mode not in MODES:
             raise ValueError(f"--mode must be one of {', '.join(MODES)}; got {self.mode!r}")
         resolved = self.cwd.expanduser().resolve()

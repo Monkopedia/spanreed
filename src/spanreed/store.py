@@ -28,7 +28,14 @@ from typing import Literal, cast
 
 from pydantic import BaseModel
 
-from spanreed.protocol import ActivityRecord, Agent, Message, PeerLink, Status
+from spanreed.protocol import (
+    ActivityRecord,
+    Agent,
+    Message,
+    PeerLink,
+    Status,
+    validate_agent_id,
+)
 
 
 class _RegistryDoc(BaseModel):
@@ -227,6 +234,8 @@ class StateStore:
         rather than carried. If ``agent_id`` is omitted, a fresh random one is
         generated and a new entry is added.
         """
+        if agent_id is not None:
+            validate_agent_id(agent_id, qualified_ok=False)
         new_entry = Agent(
             agent_id=agent_id if agent_id is not None else _new_id("agent"),
             name=name,
@@ -346,6 +355,11 @@ class StateStore:
         """
         suffix = f"@{home_host}"
         now = datetime.now(UTC)
+        # A peer's ids arrive off the wire. Each must be a bare local id: one
+        # already carrying `@` would be double-qualified, and one with `/` would
+        # later become an inbox path outside the state root.
+        for a in remote_agents:
+            validate_agent_id(a.agent_id, qualified_ok=False)
         mirrored = [
             Agent(
                 agent_id=f"{a.agent_id}{suffix}",
@@ -417,7 +431,10 @@ class StateStore:
     # ------------------------------------------------------------------ inboxes
 
     def _inbox_path(self, agent_id: str) -> Path:
-        return self._inboxes_dir / f"{agent_id}.jsonl"
+        # Every inbox read and write goes through here, including the bridge
+        # delivering a peer's frame verbatim, so this is the one place a
+        # traversal in `to_agent` can be stopped (#12).
+        return self._inboxes_dir / f"{validate_agent_id(agent_id)}.jsonl"
 
     def _resolve_recipient(self, to_agent: str) -> str:
         """Resolve ``to_agent`` to a registered ``agent_id``, or raise.

@@ -6,6 +6,7 @@ See docs/protocol.md for the spec these types implement.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Literal
 
@@ -23,6 +24,44 @@ The "needs a human" set is ``{needs_input, blocked}`` — a peer or dashboard
 partitions on that. ``idle`` is best-effort: an agent stops running exactly when
 it goes idle, so it can't always report the transition (there's no Stop hook).
 """
+
+
+_ID_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_ID_MAX_LEN = 200
+
+
+def validate_agent_id(agent_id: str, *, qualified_ok: bool = True) -> str:
+    """Return ``agent_id`` unchanged if it is a legal id, else raise ``ValueError``.
+
+    An id becomes a filename (``inboxes/<id>.jsonl``), so a ``/`` in it escapes
+    the state root, and ``@`` is how a bridge-qualified id (``<id>@<host>``)
+    says "remote". Neither was checked anywhere, and both were reachable: a
+    ``SPANREED_AGENT_NAME`` containing ``@`` made a *local* agent look remote,
+    so a peer's routine sync deleted it; a peer's ``msg`` frame addressed to
+    ``../../x`` wrote outside the state root (#12).
+
+    A local id is one part: a leading letter or digit, then letters, digits,
+    ``.``, ``_``, ``-``. A qualified id is ``<local>@<host>`` with the host in
+    the same charset — the shape the bridge already requires of a peer's label.
+    Pass ``qualified_ok=False`` where only a local id is legitimate (registering
+    a session, minting an id from a name), so ``@`` cannot be self-assigned.
+    """
+    if len(agent_id) > _ID_MAX_LEN:
+        raise ValueError(f"agent_id is longer than {_ID_MAX_LEN} characters: {agent_id[:40]!r}...")
+    local, sep, host = agent_id.partition("@")
+    if sep and not qualified_ok:
+        raise ValueError(
+            f"agent_id {agent_id!r} contains '@', which is reserved for bridge-qualified "
+            f"ids (<id>@<host>); a local agent cannot use it"
+        )
+    parts = [local, host] if sep else [local]
+    if not all(_ID_PART_RE.fullmatch(part) for part in parts):
+        raise ValueError(
+            f"agent_id {agent_id!r} is not legal: use letters, digits, '.', '_' or '-', "
+            f"starting with a letter or digit"
+            + (", with at most one '@' separating it from a host" if qualified_ok else "")
+        )
+    return agent_id
 
 
 class Agent(BaseModel):
