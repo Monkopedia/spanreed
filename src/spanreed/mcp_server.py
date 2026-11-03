@@ -55,8 +55,13 @@ def register_agent(
 ) -> dict[str, object]:
     """Register this session as an agent on the bus and return the assigned record.
 
-    If ``agent_id`` is provided and already present, the existing entry is
-    replaced (upsert) — same semantics as the underlying store.
+    If ``agent_id`` is provided and already present, the entry is refreshed in
+    place, not rewritten: ``pid``, ``pid_start`` and ``last_seen`` are updated,
+    ``status`` is reset to null, and ``name``, ``working_dir`` and ``focus`` are
+    KEPT from the existing entry. So this does not rename a registered agent —
+    a new ``name`` passed here is ignored. To rename, call ``set_name``; to
+    change focus, ``set_focus``. (Keeping them is deliberate: it is what lets a
+    rename or focus survive the SessionStart hook re-registering every session.)
     """
     return (
         StateStore()

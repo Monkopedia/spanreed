@@ -309,7 +309,7 @@ A redirection (`spanreed session-start 2>/dev/null`) forks **only under bash**; 
 
 The *ours* guard is deliberately on the **anchor** and not on the resolver's answer. Asking "does this differ from the id I resolve to?" conflates *not mine* with *differs from the cwd answer*, and gets both directions wrong once an entry is corrupt: it refuses a session's own repair (#29's victim, whose entry holds a dead pid) while allowing a drifted `register` with no `--agent-id` to mint a fresh id under the live pid. An **empty** anchor — no live entry claims our pid — is positive evidence that nothing live is being taken over, which is what makes first registration and repair safe.
 
-**`register_agent` upsert semantics**: when called with an already-registered `agent_id`, only `pid`, `pid_start`, and `last_seen` are updated; `name`, `working_dir`, and `focus` are preserved. This is what makes in-session customizations (set_name, set_focus) sticky across the SessionStart hook firing on every restart.
+**`register_agent` upsert semantics**: when called with an already-registered `agent_id`, `pid`, `pid_start`, and `last_seen` are updated, `status` is reset to `null` (see Status above — a fresh session isn't `blocked` because the last one was), and `name`, `working_dir`, and `focus` are preserved. A `name` passed on re-registration is therefore ignored; renaming is `set_name`'s job. This is what makes in-session customizations (set_name, set_focus) sticky across the SessionStart hook firing on every restart.
 
 ## CLI surface
 
