@@ -63,6 +63,8 @@ def test_register_with_explicit_id_upserts(mcp_env: None) -> None:
         pid=os.getpid(),
         agent_id="agent-fixed",
     )
+    StateStore().set_focus("agent-fixed", "my focus")
+    StateStore().set_status("agent-fixed", "blocked")
     second = register_agent(
         name="alice-new",
         working_dir="/tmp/y",
@@ -72,9 +74,32 @@ def test_register_with_explicit_id_upserts(mcp_env: None) -> None:
     assert second["agent_id"] == first["agent_id"]
     matching = [a for a in list_agents() if a["agent_id"] == "agent-fixed"]
     assert len(matching) == 1
-    # Re-register preserves name/working_dir; only pid + last_seen refresh.
+    # Kept: name, working_dir, focus -- so passing a new name does NOT rename
+    # (#44). Reset: status (#19 -- the old comment here said "only pid +
+    # last_seen refresh", the same false "only" protocol.md carried).
     assert matching[0]["name"] == "alice-old"
     assert matching[0]["working_dir"] == "/tmp/x"
+    assert matching[0]["focus"] == "my focus"
+    assert matching[0]["status"] is None
+
+
+async def test_register_agent_description_does_not_claim_replacement() -> None:
+    """#44. The published description said an upsert "replaced" the entry,
+    "same semantics as the underlying store" -- false, and phrased so a reader
+    would not go and check. An agent renaming itself through register_agent got
+    a silent no-op.
+
+    Same shape as the #42 guard: absence of the specific false claim, with
+    phrases long enough that a truthful description cannot contain them, plus
+    presence of the two facts an agent needs. The behaviour test above is the
+    durable one.
+    """
+    tool = next(t for t in await mcp_app.list_tools() if t.name == "register_agent")
+    description = " ".join((tool.description or "").lower().split())
+    for lie in ("the existing entry is replaced", "same semantics as the underlying store"):
+        assert lie not in description, f"register_agent's description still says {lie!r}"
+    assert "set_name" in description, "description must point a would-be renamer at set_name"
+    assert "status`` is reset" in description or "status is reset" in description
 
 
 def test_deregister_returns_ok(mcp_env: None) -> None:
