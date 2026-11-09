@@ -45,6 +45,29 @@ from typing import IO, Literal, cast
 from spanreed.protocol import Agent, Message, PeerLink
 from spanreed.store import StateStore, is_stale, pid_start_time
 
+
+def _status(text: str) -> None:
+    """One timestamped line on stderr for the human watching `conjoin`.
+
+    `conjoin` runs in the foreground and the owner watches its terminal, so
+    every connect, disconnect and retry is printed rather than left for
+    `spanreed list` to reveal later. stderr, because on the serve end stdout IS
+    the pipe -- though only the connect end calls this, since ssh forwards the
+    serve end's stderr to the same terminal and every event would print twice.
+    """
+    stamp = datetime.now().astimezone().strftime("%H:%M:%S")
+    print(f"[{stamp}] spanreed conjoin: {text}", file=sys.stderr, flush=True)
+
+
+def _duration(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
 _HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 """A plausible host label: alphanumeric ends, dots/hyphens/underscores inside.
 
@@ -91,6 +114,7 @@ class Bridge:
         poll_interval: float = 0.5,
         sync_interval: float = 3.0,
         recv_timeout: float | None = None,
+        hello_timeout: float = 15.0,
     ) -> None:
         self._read = read
         self._write = write
@@ -102,6 +126,9 @@ class Bridge:
         # Watchdog: if no frame (incl. the peer's pings) arrives within this
         # window, treat the pipe as dead even if it hasn't surfaced EOF.
         self.recv_timeout = recv_timeout if recv_timeout is not None else sync_interval * 5
+        # How long run() waits for the peer's hello. A parameter so the
+        # no-handshake path can be tested without a 15-second test.
+        self.hello_timeout = hello_timeout
         self.peer_host: str | None = None
         self._stop = threading.Event()
         self._hello = threading.Event()
@@ -124,6 +151,10 @@ class Bridge:
         self._registry_requested = threading.Event()
         # A diagnosis observed before there was a peer record to write it to.
         self._deferred_note: str | None = None
+        # Why the link ended, for the disconnect line. First writer wins: the
+        # watchdog and an external stop() name the cause, and the reader's EOF
+        # that usually follows them must not overwrite it.
+        self._end_reason: str | None = None
 
     # --- framing (only the main thread writes, so no lock needed) ---
 
@@ -139,7 +170,12 @@ class Bridge:
 
     def stop(self) -> None:
         """Signal the bridge to shut down (cleared on the next loop turn)."""
+        self._end("shutting down")
         self._stop.set()
+
+    def _end(self, reason: str) -> None:
+        if self._end_reason is None:
+            self._end_reason = reason
 
     def _cursor_key(self, inbox_id: str) -> str:
         return f".bridge.{inbox_id}"
@@ -219,6 +255,7 @@ class Bridge:
                     "A version skew between the two hosts' spanreed is the usual cause "
                     "— upgrade both ends to the same release."
                 )
+        self._end("the pipe closed")
         self._stop.set()  # EOF: peer/pipe gone.
 
     def _handle_frame(self, kind: object, frame: dict[str, object]) -> bool:
@@ -241,6 +278,7 @@ class Bridge:
                     "(spanreed#27).",
                     file=sys.stderr,
                 )
+                self._end(f"refused the peer's invalid host label {host!r}")
                 self._stop.set()
                 self._hello.set()  # unblock run()'s wait so it exits promptly
                 return True
@@ -382,8 +420,13 @@ class Bridge:
         self._send({"kind": "hello", "host": self.self_host})
         reader = threading.Thread(target=self._reader, daemon=True)
         reader.start()
-        if not self._hello.wait(timeout=15.0):
+        if not self._hello.wait(timeout=self.hello_timeout):
             self._stop.set()
+            if self.role == "connect":
+                _status(
+                    f"could not connect: the peer sent no handshake within {self.hello_timeout:.0f}s "
+                    "(is spanreed installed on the far side?)"
+                )
             return time.monotonic() - started
         try:
             if self.peer_host is None:
@@ -411,6 +454,8 @@ class Bridge:
                 # advertises the registry. Neither is wrong; they are different.
                 return time.monotonic() - started
             self._last_recv = time.monotonic()
+            if self.role == "connect":
+                _status(f"connected to {self.peer_host}")
             self._send_registry()
             # Push and pull in the same breath. The push alone is what shipped
             # before #55, and it is only half a handshake: it tells the peer
@@ -440,6 +485,7 @@ class Bridge:
                     self._update_link(last_frame_at=self._recv_wallclock())
                     last_sync = now
                 if now - self._last_recv > self.recv_timeout:
+                    self._end(f"no frame from the peer for {self.recv_timeout:.0f}s")
                     self._stop.set()  # watchdog: peer went silent
                     self._note(
                         f"the peer went silent: no frame of any kind arrived within "
@@ -451,6 +497,12 @@ class Bridge:
                     break
                 self._stop.wait(timeout=self.poll_interval)
         finally:
+            if self.role == "connect":
+                who = self.peer_host or "the peer"
+                why = self._end_reason or "the bridge stopped"
+                _status(
+                    f"disconnected from {who} after {_duration(time.monotonic() - started)}: {why}"
+                )
             if self.peer_host is not None:
                 self.store.clear_remote_agents(self.peer_host)
                 # The record is updated, never deleted: "a bridge to this host
@@ -517,7 +569,7 @@ def connect(
             f"{shlex.quote(remote)} conjoin --serve",
         ]
     store = StateStore()
-    return reconnect_loop(argv, label, store, max_reconnects=max_reconnects)
+    return reconnect_loop(argv, label, store, max_reconnects=max_reconnects, peer=host)
 
 
 _BASE_BACKOFF = 1.0
@@ -562,8 +614,11 @@ def reconnect_loop(
     run_once: Callable[[subprocess.Popen[bytes], str, StateStore, list[Bridge | None]], float]
     | None = None,
     wait: Callable[[float], object] | None = None,
+    peer: str | None = None,
 ) -> int:
     """Spawn → bridge → (on death) backoff → respawn, until shutdown.
+
+    ``peer`` names the far side in the status lines; it is display-only.
 
     The ``spawn``/``run_once``/``wait``/``shutdown`` seams are injectable for
     testing; the defaults use real subprocesses and a shutdown-interruptible
@@ -580,16 +635,22 @@ def reconnect_loop(
 
     backoff = _BASE_BACKOFF
     attempts = 0
+    target = peer or "peer"
     while not shutdown.is_set():
+        _status(f"connecting to {target}..." if attempts == 0 else f"reconnecting to {target}...")
         proc = spawn(argv)
         uptime = run_once(proc, label, store, holder)
         if shutdown.is_set():
             break
         attempts += 1
         if max_reconnects is not None and attempts >= max_reconnects:
+            _status(f"giving up after {attempts} attempt(s) (--max-reconnects)")
             break
         backoff = _BASE_BACKOFF if uptime >= _HEALTHY_UPTIME else min(backoff * 2, _MAX_BACKOFF)
-        waiter(backoff + backoff * 0.5 * random.random())  # jittered
+        delay = backoff + backoff * 0.5 * random.random()  # jittered
+        _status(f"retrying in {delay:.0f}s")
+        waiter(delay)
+    _status("stopped")
     return 0
 
 
