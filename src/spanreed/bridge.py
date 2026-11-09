@@ -114,6 +114,7 @@ class Bridge:
         poll_interval: float = 0.5,
         sync_interval: float = 3.0,
         recv_timeout: float | None = None,
+        hello_timeout: float = 15.0,
     ) -> None:
         self._read = read
         self._write = write
@@ -125,6 +126,9 @@ class Bridge:
         # Watchdog: if no frame (incl. the peer's pings) arrives within this
         # window, treat the pipe as dead even if it hasn't surfaced EOF.
         self.recv_timeout = recv_timeout if recv_timeout is not None else sync_interval * 5
+        # How long run() waits for the peer's hello. A parameter so the
+        # no-handshake path can be tested without a 15-second test.
+        self.hello_timeout = hello_timeout
         self.peer_host: str | None = None
         self._stop = threading.Event()
         self._hello = threading.Event()
@@ -416,11 +420,11 @@ class Bridge:
         self._send({"kind": "hello", "host": self.self_host})
         reader = threading.Thread(target=self._reader, daemon=True)
         reader.start()
-        if not self._hello.wait(timeout=15.0):
+        if not self._hello.wait(timeout=self.hello_timeout):
             self._stop.set()
             if self.role == "connect":
                 _status(
-                    "could not connect: the peer sent no handshake within 15s "
+                    f"could not connect: the peer sent no handshake within {self.hello_timeout:.0f}s "
                     "(is spanreed installed on the far side?)"
                 )
             return time.monotonic() - started
