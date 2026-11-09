@@ -27,14 +27,15 @@ because the far end's stderr comes back over ssh to the same terminal. (#72)
   temp file. (#47, #68) Two conjoins to the *same* peer can still collide;
   that is tracked as #69.
 - **Agent ids are validated** wherever they enter the bus or become a path. A
-  peer could address a message to `../../x` and have it written outside the
-  state root, and a local name containing `@` was mistaken for a remote agent
+  peer could address a message to a path outside the state root and have it
+  written there, and a local name containing `@` was mistaken for a remote agent
   and deleted by the next sync. Both are now refused. (#12, #70)
 - **`register_agent`'s tool description no longer says re-registering
   "replaces" the entry.** It keeps the name, working directory and focus, so
   an agent renaming itself that way silently got its old name back; the
-  description now says so and points at `set_name`. `protocol.md` had the
-  same error. (#44, #19, #71)
+  description now says so and points at `set_name`. `protocol.md` separately
+  said re-registering changes "only" three fields; it also resets `status`.
+  (#44, #19, #71)
 
 ## 0.3.0
 
