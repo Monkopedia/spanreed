@@ -523,12 +523,56 @@ class Bridge:
         return datetime.now(UTC) - timedelta(seconds=time.monotonic() - self._last_recv)
 
 
-def serve(self_host: str | None = None) -> int:
-    """Run the ``serve`` end: the pipe is this process's stdin/stdout."""
+DEFAULT_TIMEOUT = 15.0
+"""Seconds of silence after which a link is declared dead, on both ends."""
+
+DEFAULT_HANDSHAKE_TIMEOUT = 15.0
+"""Seconds to wait for the peer's hello after the pipe opens."""
+
+_PING_INTERVAL = 3.0  # Bridge's default sync_interval: the peer pings this often
+MIN_TIMEOUT = 2 * _PING_INTERVAL
+"""Below this, one late ping is enough to tear a healthy link down."""
+
+MAX_TIMEOUT = 86400.0
+"""One day. Above roughly this, `Event.wait` raises OverflowError, and a link
+silent for longer than a day is not a slow link."""
+
+
+def serve(self_host: str | None = None, *, timeout: float | None = None) -> int:
+    """Run the ``serve`` end: the pipe is this process's stdin/stdout.
+
+    ``timeout`` is passed by the connect end when the user set ``--timeout``,
+    so both watchdogs agree: a far end still on 15s would tear the link down
+    long before a patient near end noticed anything.
+    """
     host = self_host or socket.gethostname()
     store = StateStore()
-    Bridge(sys.stdin.buffer, sys.stdout.buffer, host, store, role="serve").run()
+    Bridge(
+        sys.stdin.buffer,
+        sys.stdout.buffer,
+        host,
+        store,
+        role="serve",
+        recv_timeout=timeout if timeout is not None else DEFAULT_TIMEOUT,
+    ).run()
     return 0
+
+
+def _ssh_keepalive(timeout: float) -> list[str]:
+    """ssh keepalive options that give up after roughly ``timeout`` seconds.
+
+    ssh has its own dead-link detector, and it runs independently of the
+    bridge's watchdog: raising only the watchdog leaves ssh dropping the pipe
+    at its own ~15s, so the knob would appear to do nothing.
+    """
+    count = 3
+    interval = max(1, round(timeout / count))
+    return [
+        "-o",
+        f"ServerAliveInterval={interval}",
+        "-o",
+        f"ServerAliveCountMax={count}",
+    ]
 
 
 def connect(
@@ -538,6 +582,8 @@ def connect(
     remote_spanreed: str | None = None,
     exec_cmd: str | None = None,
     max_reconnects: int | None = None,
+    timeout: float | None = None,
+    handshake_timeout: float | None = None,
 ) -> int:
     """Run the ``connect`` end: bridge to a peer, reconnecting if the pipe dies.
 
@@ -550,26 +596,45 @@ def connect(
     without SSH). Otherwise the peer is launched over SSH; the remote
     ``spanreed`` path is given by ``remote_spanreed`` or probed via a login
     shell. ``max_reconnects`` bounds the retries (``None`` = forever).
+
+    ``timeout`` (silence before a link is declared dead) sets all three timers
+    that can end a link -- this end's watchdog, ssh's keepalive, and the far
+    end's watchdog -- so they agree. It is forwarded to the far end only when
+    set, because an older peer's ``conjoin --serve`` rejects the flag.
+    ``handshake_timeout`` bounds the wait for the peer's hello and the remote
+    path probe, both of which a slow ssh login stretches.
     """
     label = self_host or socket.gethostname()
+    silence = timeout if timeout is not None else DEFAULT_TIMEOUT
+    hello = handshake_timeout if handshake_timeout is not None else DEFAULT_HANDSHAKE_TIMEOUT
     if exec_cmd is not None:
         argv = ["sh", "-c", exec_cmd]
     else:
-        remote = remote_spanreed or _probe_remote_spanreed(host)
+        remote = remote_spanreed or _probe_remote_spanreed(host, timeout=max(20.0, hello))
+        serve_cmd = f"{shlex.quote(remote)} conjoin --serve"
+        if timeout is not None:
+            serve_cmd += f" --timeout {timeout:g}"
         argv = [
             "ssh",
             "-o",
             "BatchMode=yes",
-            # Surface a dead/half-open pipe as EOF within ~15s instead of hanging.
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=3",
+            # Surface a dead/half-open pipe as EOF instead of hanging.
+            *_ssh_keepalive(silence),
             host,
-            f"{shlex.quote(remote)} conjoin --serve",
+            serve_cmd,
         ]
     store = StateStore()
-    return reconnect_loop(argv, label, store, max_reconnects=max_reconnects, peer=host)
+
+    def run_once(
+        proc: subprocess.Popen[bytes], label: str, store: StateStore, holder: list[Bridge | None]
+    ) -> float:
+        return _run_bridge_once(
+            proc, label, store, holder, recv_timeout=silence, hello_timeout=hello
+        )
+
+    return reconnect_loop(
+        argv, label, store, max_reconnects=max_reconnects, peer=host, run_once=run_once
+    )
 
 
 _BASE_BACKOFF = 1.0
@@ -586,10 +651,21 @@ def _run_bridge_once(
     label: str,
     store: StateStore,
     holder: list[Bridge | None],
+    *,
+    recv_timeout: float = DEFAULT_TIMEOUT,
+    hello_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
 ) -> float:
     """Bridge over one spawned peer process until the pipe dies. Returns uptime."""
     assert proc.stdin is not None and proc.stdout is not None
-    bridge = Bridge(proc.stdout, proc.stdin, label, store, role="connect")
+    bridge = Bridge(
+        proc.stdout,
+        proc.stdin,
+        label,
+        store,
+        role="connect",
+        recv_timeout=recv_timeout,
+        hello_timeout=hello_timeout,
+    )
     holder[0] = bridge
     try:
         return bridge.run()
@@ -670,7 +746,7 @@ def _install_signal_handlers(shutdown: threading.Event, holder: list[Bridge | No
         pass  # not the main thread — caller drives shutdown another way
 
 
-def _probe_remote_spanreed(host: str) -> str:
+def _probe_remote_spanreed(host: str, *, timeout: float = 20.0) -> str:
     """Discover the absolute path to ``spanreed`` on a peer via a login shell.
 
     Non-interactive SSH gets a stripped PATH, so we source the interactive
@@ -680,7 +756,7 @@ def _probe_remote_spanreed(host: str) -> str:
         ["ssh", host, 'zsh -ic "command -v spanreed"'],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=timeout,
     )
     path = out.stdout.strip().splitlines()[-1].strip() if out.stdout.strip() else ""
     if not path:

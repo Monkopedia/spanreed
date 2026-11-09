@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Generator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -1073,3 +1074,183 @@ class TestConnectionStatusLines:
             ": refused the peer's invalid host label '*'"
         ), lines
         assert not any(ln.startswith("connected to") for ln in lines)
+
+
+class TestConfigurableTimeouts:
+    """`--timeout` must reach all three timers that can end a link.
+
+    The bridge's watchdog, ssh's ServerAlive keepalive, and the FAR end's
+    watchdog each tear a link down independently. A knob that changed only
+    one would look like it did nothing: ssh, or the far end, would still drop
+    the pipe at the old ~15s.
+    """
+
+    @staticmethod
+    def _capture_connect(
+        monkeypatch: pytest.MonkeyPatch, **kw: float | None
+    ) -> tuple[list[str], dict[str, float]]:
+        seen: dict[str, object] = {}
+        bridge_kwargs: dict[str, float] = {}
+
+        def fake_loop(argv: list[str], label: str, store: StateStore, **loop_kw: object) -> int:
+            seen["argv"] = argv
+            # Drive the real run_once connect() built, so its timeouts are what
+            # reach the Bridge, not what a test assumed.
+            run_once = cast("Callable[..., float]", loop_kw["run_once"])
+            run_once(_fake_proc(), label, store, [None])
+            return 0
+
+        def fake_once(*_a: object, **kwargs: float) -> float:
+            bridge_kwargs.update(kwargs)
+            return 0.0
+
+        monkeypatch.setattr(bridge, "reconnect_loop", fake_loop)
+        monkeypatch.setattr(bridge, "_run_bridge_once", fake_once)
+
+        def probe(host: str, timeout: float = 20.0) -> str:
+            return "/r/spanreed"
+
+        monkeypatch.setattr(bridge, "_probe_remote_spanreed", probe)
+        bridge.connect("adolin", self_host="kaladin", **kw)  # type: ignore[arg-type]
+        return cast("list[str]", seen["argv"]), bridge_kwargs
+
+    def test_the_default_is_unchanged_and_sends_no_flag_to_the_peer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        argv, kwargs = self._capture_connect(monkeypatch)
+        assert "ServerAliveInterval=5" in argv and "ServerAliveCountMax=3" in argv
+        # Not forwarded when unset: an older peer's `conjoin --serve` rejects it.
+        assert argv[-1] == "/r/spanreed conjoin --serve"
+        assert kwargs == {"recv_timeout": 15.0, "hello_timeout": 15.0}
+
+    def test_a_raised_timeout_reaches_watchdog_ssh_and_the_far_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        argv, kwargs = self._capture_connect(monkeypatch, timeout=60.0)
+        assert "ServerAliveInterval=20" in argv and "ServerAliveCountMax=3" in argv  # ~60s
+        assert argv[-1] == "/r/spanreed conjoin --serve --timeout 60"
+        assert kwargs["recv_timeout"] == 60.0
+
+    def test_the_handshake_timeout_reaches_the_bridge_and_the_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        probe_timeouts: list[float] = []
+
+        def probe(host: str, timeout: float = 20.0) -> str:
+            probe_timeouts.append(timeout)
+            return "/r/spanreed"
+
+        def no_loop(argv: list[str], *_args: object, **_kwargs: object) -> int:
+            return 0
+
+        monkeypatch.setattr(bridge, "_probe_remote_spanreed", probe)
+        monkeypatch.setattr(bridge, "reconnect_loop", no_loop)
+        bridge.connect("adolin", self_host="kaladin", handshake_timeout=45.0)
+        assert probe_timeouts == [45.0]
+
+        _, kwargs = self._capture_connect(monkeypatch, handshake_timeout=45.0)
+        assert kwargs["hello_timeout"] == 45.0
+
+    def test_the_serve_end_applies_the_forwarded_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        made: list[float] = []
+
+        class Recorder:
+            def __init__(self, *_a: object, recv_timeout: float, **_k: object) -> None:
+                made.append(recv_timeout)
+
+            def run(self) -> float:
+                return 0.0
+
+        monkeypatch.setattr(bridge, "Bridge", Recorder)
+        bridge.serve(self_host="adolin", timeout=60.0)
+        bridge.serve(self_host="adolin")
+        assert made == [60.0, 15.0]
+
+    @staticmethod
+    def _stub_entry_points(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, object]]]:
+        # Stubbed so a regression in the range check fails fast instead of
+        # really ssh'ing to "adolin" and hanging the suite.
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def fake_connect(host: str, **kw: object) -> int:
+            calls.append(("connect", kw))
+            return 0
+
+        def fake_serve(**kw: object) -> int:
+            calls.append(("serve", kw))
+            return 0
+
+        monkeypatch.setattr(bridge, "connect", fake_connect)
+        monkeypatch.setattr(bridge, "serve", fake_serve)
+        return calls
+
+    @pytest.mark.parametrize("flag", ["--timeout", "--handshake-timeout"])
+    @pytest.mark.parametrize("value", ["4", "nan", "inf", "-inf", "1e300"])
+    @pytest.mark.parametrize("end", [["adolin"], ["--serve"]])
+    def test_the_cli_refuses_out_of_range_and_non_finite_timeouts(
+        self,
+        flag: str,
+        value: str,
+        end: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # nan is the dangerous one: it compares false against everything, so a
+        # `value < 6` check let it through, and on the serve end a NaN watchdog
+        # never fires. inf and 1e300 crashed later in round() / Event.wait.
+        from spanreed import cli
+
+        calls = self._stub_entry_points(monkeypatch)
+        # `--flag=value`, so argparse cannot mistake `-inf` for an option and
+        # refuse it before the range check -- that form is the one that reaches it.
+        assert cli.main(["conjoin", *end, f"{flag}={value}"]) == 2
+        assert "must be between 6 and 86400 seconds" in capsys.readouterr().err
+        assert calls == [], "an invalid timeout reached connect/serve"
+
+    def test_the_cli_forwards_serve_timeout_to_serve(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The far end's half of the wiring, through cli.main. Without it the
+        # connect end forwards `--serve --timeout 60` and the far end drops it.
+        from spanreed import cli
+
+        calls = self._stub_entry_points(monkeypatch)
+        assert cli.main(["conjoin", "--serve", "--timeout", "60", "--label", "adolin"]) == 0
+        assert calls == [("serve", {"self_host": "adolin", "timeout": 60.0})]
+
+    def test_the_cli_forwards_both_timeouts_to_connect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from spanreed import cli
+
+        calls = self._stub_entry_points(monkeypatch)
+        cli.main(["conjoin", "adolin", "--timeout", "60", "--handshake-timeout", "45"])
+        assert calls[0][0] == "connect"
+        assert calls[0][1]["timeout"] == 60.0 and calls[0][1]["handshake_timeout"] == 45.0
+
+    def test_the_watchdog_really_fires_at_the_configured_silence(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # End to end through _run_bridge_once's own Bridge construction: a hello,
+        # then an OPEN but silent pipe. The configured value is what fires.
+        peer_r, peer_w = os.pipe()
+        proc = cast(
+            "subprocess.Popen[bytes]",
+            SimpleNamespace(
+                stdout=os.fdopen(peer_r, "rb"),
+                stdin=io.BytesIO(),
+                terminate=lambda: None,
+                wait=lambda timeout=None: 0,  # pyright: ignore[reportUnknownLambdaType]
+                kill=lambda: None,
+            ),
+        )
+        with os.fdopen(peer_w, "wb") as peer:
+            peer.write((json.dumps({"kind": "hello", "host": "adolin"}) + "\n").encode())
+            peer.flush()
+            started = time.monotonic()
+            bridge._run_bridge_once(  # pyright: ignore[reportPrivateUsage]
+                proc, "kaladin", StateStore(root=tmp_path), [None], recv_timeout=0.4
+            )
+            elapsed = time.monotonic() - started
+        assert 0.4 <= elapsed < 3.0, elapsed
+        assert "no frame from the peer for 0s" in capsys.readouterr().err

@@ -626,8 +626,27 @@ def _cmd_conjoin(args: argparse.Namespace) -> int:
     """Conjoin this bus to a peer's over SSH (or serve the remote end)."""
     from spanreed import bridge
 
+    for flag, value in (
+        ("--timeout", args.timeout),
+        ("--handshake-timeout", args.handshake_timeout),
+    ):
+        if value is None:
+            continue
+        # `not (lo <= value <= hi)` rather than `value < lo`: NaN compares false
+        # against everything, so `nan < 6` let it through, and on the serve end a
+        # NaN watchdog never fires -- the link could never be declared dead. inf
+        # and huge finite values crashed later, in round() and Event.wait.
+        if not (bridge.MIN_TIMEOUT <= value <= bridge.MAX_TIMEOUT):
+            print(
+                f"conjoin: {flag} must be between {bridge.MIN_TIMEOUT:g} and "
+                f"{bridge.MAX_TIMEOUT:g} seconds; got {value!r}. The peer pings every "
+                f"{bridge.MIN_TIMEOUT / 2:g}s, so a shorter limit tears down a healthy link "
+                f"on a single late ping.",
+                file=sys.stderr,
+            )
+            return 2
     if args.serve:
-        return bridge.serve(self_host=args.label)
+        return bridge.serve(self_host=args.label, timeout=args.timeout)
     if not args.host:
         print("conjoin: HOST is required (unless --serve)", file=sys.stderr)
         return 2
@@ -637,6 +656,8 @@ def _cmd_conjoin(args: argparse.Namespace) -> int:
         remote_spanreed=args.remote_spanreed,
         exec_cmd=args.exec_cmd,
         max_reconnects=args.max_reconnects,
+        timeout=args.timeout,
+        handshake_timeout=args.handshake_timeout,
     )
 
 
@@ -932,6 +953,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Give up after this many reconnect attempts (default: retry forever)",
+    )
+    p_conjoin.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="How long the link may be silent before it is treated as dead and "
+        "reconnected (default: 15). Raise it for a lossy or high-latency connection. "
+        "Sets this end's watchdog, ssh's keepalive, AND the far end's watchdog, so "
+        "the peer must run a spanreed that accepts --timeout. Range 6 to 86400.",
+    )
+    p_conjoin.add_argument(
+        "--handshake-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="How long to wait for the peer to answer after ssh connects (default: "
+        "15). Raise it if the far side's login is slow. Range 6 to 86400.",
     )
 
     return parser
