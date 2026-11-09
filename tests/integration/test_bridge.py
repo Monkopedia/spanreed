@@ -888,3 +888,108 @@ def test_a_peer_frame_addressed_outside_the_state_root_writes_nothing(tmp_path: 
 
     assert list(tmp_path.rglob("escaped*")) == [], "a peer frame wrote outside the state root"
     assert [m.msg_id for m in store.recv_messages("agent-local")] == ["good"]
+
+
+def _unhealthy_run(
+    proc: subprocess.Popen[bytes], label: str, store: StateStore, holder: list[Bridge | None]
+) -> float:
+    return 0.0
+
+
+class TestConnectionStatusLines:
+    """`conjoin` prints connect / disconnect / retry to its terminal.
+
+    The owner watches that terminal. Before this, a dropped link was visible
+    only by running `spanreed list` and finding the peer DETACHED.
+    """
+
+    @staticmethod
+    def _lines(err: str) -> list[str]:
+        return [
+            ln.split("spanreed conjoin: ", 1)[1]
+            for ln in err.splitlines()
+            if "spanreed conjoin: " in ln
+        ]
+
+    def test_the_reconnect_loop_announces_each_attempt_and_the_wait(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        reconnect_loop(
+            ["peer"],
+            "local",
+            StateStore(root=tmp_path),
+            max_reconnects=2,
+            install_signals=False,
+            spawn=lambda _argv: _fake_proc(),
+            run_once=_unhealthy_run,
+            wait=lambda _d: None,
+            peer="adolin",
+        )
+        lines = self._lines(capsys.readouterr().err)
+        assert lines[0] == "connecting to adolin..."
+        assert lines[1].startswith("retrying in ")
+        assert lines[2] == "reconnecting to adolin..."
+        assert lines[-2] == "giving up after 2 attempt(s) (--max-reconnects)"
+        assert lines[-1] == "stopped"
+
+    def test_a_bridge_says_who_it_connected_to_and_why_it_disconnected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        store = StateStore(root=tmp_path / "local")
+        peer_r, peer_w = os.pipe()
+        conn = Bridge(
+            os.fdopen(peer_r, "rb"),
+            io.BytesIO(),
+            "kaladin",
+            store,
+            role="connect",
+            poll_interval=0.05,
+            sync_interval=10,
+            recv_timeout=60,
+        )
+        thread = threading.Thread(target=conn.run, daemon=True)
+        thread.start()
+        with os.fdopen(peer_w, "wb") as peer:
+            peer.write((json.dumps({"kind": "hello", "host": "adolin"}) + "\n").encode())
+            peer.flush()
+            _wait(lambda: conn.peer_host == "adolin")
+        thread.join(timeout=5.0)  # closing the pipe is the disconnect
+
+        lines = self._lines(capsys.readouterr().err)
+        assert "connected to adolin" in lines
+        disconnect = [ln for ln in lines if ln.startswith("disconnected from adolin after ")]
+        assert len(disconnect) == 1 and disconnect[0].endswith(": the pipe closed"), lines
+
+    def test_the_first_cause_wins_over_the_eof_that_follows_it(self, tmp_path: Path) -> None:
+        # stop() names the cause; the reader's EOF lands afterwards and must not
+        # overwrite "shutting down" with "the pipe closed".
+        conn = Bridge(io.BytesIO(), io.BytesIO(), "kaladin", StateStore(root=tmp_path))
+        conn.stop()
+        conn._end("the pipe closed")  # pyright: ignore[reportPrivateUsage]
+        assert conn._end_reason == "shutting down"  # pyright: ignore[reportPrivateUsage]
+
+    def test_the_serve_end_prints_nothing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # ssh forwards the serve end's stderr to the connect terminal, so a serve
+        # line would print every event twice.
+        store = StateStore(root=tmp_path / "remote")
+        peer_r, peer_w = os.pipe()
+        conn = Bridge(
+            os.fdopen(peer_r, "rb"),
+            io.BytesIO(),
+            "adolin",
+            store,
+            role="serve",
+            poll_interval=0.05,
+            sync_interval=10,
+            recv_timeout=60,
+        )
+        thread = threading.Thread(target=conn.run, daemon=True)
+        thread.start()
+        with os.fdopen(peer_w, "wb") as peer:
+            peer.write((json.dumps({"kind": "hello", "host": "kaladin"}) + "\n").encode())
+            peer.flush()
+            _wait(lambda: conn.peer_host == "kaladin")
+        thread.join(timeout=5.0)
+        assert self._lines(capsys.readouterr().err) == []

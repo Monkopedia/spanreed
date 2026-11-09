@@ -68,6 +68,18 @@ spanreed conjoin <peer-host>
 
 It probes the peer for the `spanreed` absolute path (via an interactive-shell `command -v` over SSH — this works around the stripped non-interactive PATH), opens the SSH pipe, and starts mirroring agents in both directions.
 
+It prints a timestamped line to the terminal each time the link changes state, so you can see a dropped connection without running `spanreed list`:
+
+```
+[17:02:13] spanreed conjoin: connecting to adolin...
+[17:02:13] spanreed conjoin: connected to adolin
+[17:09:41] spanreed conjoin: disconnected from adolin after 7m28s: no frame from the peer for 15s
+[17:09:41] spanreed conjoin: retrying in 2s
+[17:09:43] spanreed conjoin: reconnecting to adolin...
+```
+
+The reason on a disconnect line is the first cause observed: `the pipe closed` (ssh exited or the far side died), `no frame from the peer for Ns` (the link went silent and the watchdog tore it down), `shutting down` (Ctrl-C), or a refused peer. Only the end you started prints these lines. The far end's stderr comes back over ssh to the same terminal, so if it printed them too, every event would appear twice.
+
 If it exits immediately, see [Troubleshooting](#troubleshooting).
 
 ## Step 4 — confirm the bridge is healthy
