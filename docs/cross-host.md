@@ -80,6 +80,20 @@ It prints a timestamped line to the terminal each time the link changes state, s
 
 The reason on a disconnect line is the first cause observed: `the pipe closed` (ssh exited or the far side died), `no frame from the peer for Ns` (the link went silent and the watchdog tore it down), `shutting down` (Ctrl-C), or a refused peer. Only the end you started prints these lines. The far end's stderr comes back over ssh to the same terminal, so if it printed them too, every event would appear twice.
 
+### Bad connections: `--timeout`
+
+By default a link that stays silent for about 15 seconds is treated as dead and reconnected. Three separate timers enforce that: this end's watchdog, ssh's keepalive, and the far end's watchdog. On a lossy or high-latency link, raise all three together:
+
+```bash
+spanreed conjoin <peer-host> --timeout 60
+```
+
+`--timeout` sets all three timers, which is why it has to exist as one flag. Raising only the local watchdog would do nothing, because ssh or the far end would still drop the pipe at around 15s. The value is passed to the far end as `conjoin --serve --timeout N`, so **the peer must run a spanreed recent enough to accept it**. An older peer refuses the flag, and you'll see `could not connect: the peer sent no handshake`. Leaving `--timeout` off sends nothing extra, so older peers keep working.
+
+`--handshake-timeout` (default 15) controls how long to wait for the peer to answer after ssh connects, including the remote-path probe. Raise it if logging in to the far side is slow.
+
+Both have a 6-second minimum. The peer pings every 3 seconds, so anything shorter would tear down a healthy link after a single late ping.
+
 If it exits immediately, see [Troubleshooting](#troubleshooting).
 
 ## Step 4 — confirm the bridge is healthy
