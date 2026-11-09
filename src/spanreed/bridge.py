@@ -533,6 +533,10 @@ _PING_INTERVAL = 3.0  # Bridge's default sync_interval: the peer pings this ofte
 MIN_TIMEOUT = 2 * _PING_INTERVAL
 """Below this, one late ping is enough to tear a healthy link down."""
 
+MAX_TIMEOUT = 86400.0
+"""One day. Above roughly this, `Event.wait` raises OverflowError, and a link
+silent for longer than a day is not a slow link."""
+
 
 def serve(self_host: str | None = None, *, timeout: float | None = None) -> int:
     """Run the ``serve`` end: the pipe is this process's stdin/stdout.

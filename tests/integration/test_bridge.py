@@ -1168,14 +1168,65 @@ class TestConfigurableTimeouts:
         bridge.serve(self_host="adolin")
         assert made == [60.0, 15.0]
 
+    @staticmethod
+    def _stub_entry_points(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, object]]]:
+        # Stubbed so a regression in the range check fails fast instead of
+        # really ssh'ing to "adolin" and hanging the suite.
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def fake_connect(host: str, **kw: object) -> int:
+            calls.append(("connect", kw))
+            return 0
+
+        def fake_serve(**kw: object) -> int:
+            calls.append(("serve", kw))
+            return 0
+
+        monkeypatch.setattr(bridge, "connect", fake_connect)
+        monkeypatch.setattr(bridge, "serve", fake_serve)
+        return calls
+
     @pytest.mark.parametrize("flag", ["--timeout", "--handshake-timeout"])
-    def test_the_cli_refuses_a_timeout_below_two_ping_intervals(
-        self, flag: str, capsys: pytest.CaptureFixture[str]
+    @pytest.mark.parametrize("value", ["4", "nan", "inf", "-inf", "1e300"])
+    @pytest.mark.parametrize("end", [["adolin"], ["--serve"]])
+    def test_the_cli_refuses_out_of_range_and_non_finite_timeouts(
+        self,
+        flag: str,
+        value: str,
+        end: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # nan is the dangerous one: it compares false against everything, so a
+        # `value < 6` check let it through, and on the serve end a NaN watchdog
+        # never fires. inf and 1e300 crashed later in round() / Event.wait.
+        from spanreed import cli
+
+        calls = self._stub_entry_points(monkeypatch)
+        # `--flag=value`, so argparse cannot mistake `-inf` for an option and
+        # refuse it before the range check -- that form is the one that reaches it.
+        assert cli.main(["conjoin", *end, f"{flag}={value}"]) == 2
+        assert "must be between 6 and 86400 seconds" in capsys.readouterr().err
+        assert calls == [], "an invalid timeout reached connect/serve"
+
+    def test_the_cli_forwards_serve_timeout_to_serve(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The far end's half of the wiring, through cli.main. Without it the
+        # connect end forwards `--serve --timeout 60` and the far end drops it.
+        from spanreed import cli
+
+        calls = self._stub_entry_points(monkeypatch)
+        assert cli.main(["conjoin", "--serve", "--timeout", "60", "--label", "adolin"]) == 0
+        assert calls == [("serve", {"self_host": "adolin", "timeout": 60.0})]
+
+    def test_the_cli_forwards_both_timeouts_to_connect(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from spanreed import cli
 
-        assert cli.main(["conjoin", "adolin", flag, "4"]) == 2
-        assert "must be at least 6s" in capsys.readouterr().err
+        calls = self._stub_entry_points(monkeypatch)
+        cli.main(["conjoin", "adolin", "--timeout", "60", "--handshake-timeout", "45"])
+        assert calls[0][0] == "connect"
+        assert calls[0][1]["timeout"] == 60.0 and calls[0][1]["handshake_timeout"] == 45.0
 
     def test_the_watchdog_really_fires_at_the_configured_silence(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
