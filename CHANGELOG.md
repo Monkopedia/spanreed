@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.1
+
+**Upgrading:** nothing to change for normal use. One edge: agent ids are now
+validated, so a `SPANREED_AGENT_NAME` (or a Codex worker `--name`) containing
+`@`, `/`, a space, or anything outside letters, digits, `.`, `_`, `-` is now
+refused at startup with a message saying why. Previously it was accepted and
+then misbehaved; see below.
+
+### `conjoin` says what it is doing
+
+`spanreed conjoin` now prints a timestamped line to its terminal whenever the
+link changes state — connecting, connected to `<peer>`, disconnected after
+`<uptime>: <reason>`, retrying in Ns, stopped. Before, a dropped bridge was
+only visible by running `spanreed list` and finding the peer `DETACHED`. The
+reason is the first cause observed (`the pipe closed`, `no frame from the peer
+for Ns`, `shutting down`, or a refused peer). Only the end you started prints,
+because the far end's stderr comes back over ssh to the same terminal. (#72)
+
+### Fixes
+
+- **Two peers on one host no longer crash `conjoin`.** Every bridge cursor was
+  written through one shared temp file, so a host conjoined to two peers could
+  race on it; the losing write raised past the reconnect loop and `conjoin`
+  exited with a traceback instead of reconnecting. Each cursor now has its own
+  temp file. (#47, #68) Two conjoins to the *same* peer can still collide;
+  that is tracked as #69.
+- **Agent ids are validated** wherever they enter the bus or become a path. A
+  peer could address a message to a path outside the state root and have it
+  written there, and a local name containing `@` was mistaken for a remote agent
+  and deleted by the next sync. Both are now refused. (#12, #70)
+- **`register_agent`'s tool description no longer says re-registering
+  "replaces" the entry.** It keeps the name, working directory and focus, so
+  an agent renaming itself that way silently got its old name back; the
+  description now says so and points at `set_name`. `protocol.md` separately
+  said re-registering changes "only" three fields; it also resets `status`.
+  (#44, #19, #71)
+
 ## 0.3.0
 
 ### Codex worker: `--mode ask | auto | full`
