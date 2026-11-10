@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.2
+
+**Upgrading:** both machines in a `conjoin` pair should be on 0.3.2 before you pass `--timeout`
+(see below). Otherwise there's nothing to do. Your existing bus files are tightened to owner-only
+automatically the next time each Claude session starts.
+
+### `conjoin --timeout` and `--handshake-timeout`, for bad connections
+
+A link silent for about 15 seconds used to be torn down and reconnected, with no way to be more
+patient. Three separate timers enforced that: this end's watchdog, ssh's keepalive, and the far
+end's watchdog. `--timeout SECONDS` sets all three, because raising only one does nothing while
+the others still drop the link at 15s. The value is passed to the far end only when you set it,
+so a peer on an older version keeps working as long as you don't use it.
+`--handshake-timeout SECONDS` waits longer for a slow login on the far side. Both accept 6 to
+86400 seconds. (#74)
+
+### Bus state is private to your user
+
+Everything spanreed writes is now created owner-only: directories `0700`, files `0600`. That
+covers the registry, inboxes, cursors, peer records, config, activity log, MCP log and Codex
+worker logs. Before, these were `0755`/`0644`, and the bus stayed private only because `$HOME` is
+`0700`. Files an older version created are tightened once, when a session starts. The process
+umask is left alone, so `codex` and anything else spanreed launches still create your project
+files normally. (#18, #75)
+
 ## 0.3.1
 
 **Upgrading:** nothing to change for normal use. One edge: agent ids are now
