@@ -3,7 +3,7 @@
 ## 0.3.2
 
 **Upgrading:** both machines in a `conjoin` pair should be on 0.3.2 before you pass `--timeout`
-(see below). Otherwise there's nothing to do. Your existing bus files are tightened to owner-only
+(see below). Otherwise there's nothing to do. Existing files are tightened to owner-only
 automatically the next time each Claude session starts.
 
 ### `conjoin --timeout` and `--handshake-timeout`, for bad connections
@@ -20,10 +20,14 @@ so a peer on an older version keeps working as long as you don't use it.
 
 Everything spanreed writes is now created owner-only: directories `0700`, files `0600`. That
 covers the registry, inboxes, cursors, peer records, config, activity log, MCP log and Codex
-worker logs. Before, these were `0755`/`0644`, and the bus stayed private only because `$HOME` is
-`0700`. Files an older version created are tightened once, when a session starts. The process
-umask is left alone, so `codex` and anything else spanreed launches still create your project
-files normally. (#18, #75)
+worker logs. Before, these were `0755`/`0644`, and the bus was private only where `$HOME` was
+`0700`. The process umask is left alone, so `codex` and anything else spanreed launches still
+create your project files normally. (#18, #75)
+
+The one-time tightening at session start applies to **everything under the state root**, not
+only files spanreed created. If another tool keeps files there, they become `0600`/`0700` too,
+and any execute bit is removed. Symlinks are left alone. If that would break something you keep
+under `~/.claude/spanreed/`, move it elsewhere before upgrading.
 
 ## 0.3.1
 
