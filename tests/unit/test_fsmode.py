@@ -131,6 +131,23 @@ class TestTightenTree:
         _fsmode.tighten_tree(root)
         assert _mode(outside) == 0o644
 
+    def test_a_symlinked_directory_is_not_descended_into(self, tmp_path: Path) -> None:
+        # Safety here rests on os.walk's followlinks=False; the file-symlink test
+        # above cannot see it, so `os.walk(root, followlinks=True)` passed the
+        # whole suite (#75 review). A symlinked dir whose target holds a 0644
+        # file must leave that target, and the file in it, untouched.
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        target.chmod(0o755)
+        (target / "theirs.txt").write_text("not ours")
+        (target / "theirs.txt").chmod(0o644)
+        root = tmp_path / "state"
+        root.mkdir()
+        (root / "linked-dir").symlink_to(target, target_is_directory=True)
+        _fsmode.tighten_tree(root)
+        assert _mode(target) == 0o755
+        assert _mode(target / "theirs.txt") == 0o644
+
     def test_a_missing_root_is_a_no_op(self, tmp_path: Path) -> None:
         assert _fsmode.tighten_tree(tmp_path / "nope") == 0
 
@@ -167,3 +184,17 @@ class TestOtherWriters:
         log.path.unlink()
         log.write("after rotation")
         assert _mode(log.path) == 0o600
+
+
+class TestExistingFilesWrittenThrough:
+    def test_a_stale_loose_tmp_cannot_publish_a_loose_registry(self, tmp_path: Path) -> None:
+        # O_CREAT's mode does nothing for a file that already exists, so a
+        # 0644 `registry.json.tmp` left by an older version would survive the
+        # truncate-and-replace and become a 0644 registry.json.
+        root = tmp_path / "state"
+        store = StateStore(root=root)
+        stale = root / "registry.json.tmp"
+        stale.write_text("old")
+        stale.chmod(0o644)
+        store.register_agent(name="a", working_dir="/a", pid=os.getpid(), agent_id="agent-a")
+        assert _mode(root / "registry.json") == 0o600

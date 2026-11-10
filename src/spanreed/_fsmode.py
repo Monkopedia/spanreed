@@ -46,7 +46,13 @@ def open_private(path: Path, mode: str = "a") -> TextIO:
     if mode not in ("a", "w"):
         raise ValueError(f"open_private supports 'a' or 'w', not {mode!r}")
     flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == "a" else os.O_TRUNC)
-    return os.fdopen(os.open(path, flags, FILE_MODE), mode)
+    fd = os.open(path, flags, FILE_MODE)
+    # The mode argument applies only when the file is CREATED. An existing file
+    # -- a stale `*.json.tmp` an older spanreed left at 0644 -- keeps its mode
+    # through O_TRUNC, and the `replace` that follows would publish it as the
+    # live registry. fchmod on the open fd closes that without a race on the path.
+    os.fchmod(fd, FILE_MODE)
+    return os.fdopen(fd, mode)
 
 
 def write_private_text(path: Path, text: str) -> None:
@@ -57,7 +63,11 @@ def write_private_text(path: Path, text: str) -> None:
 
 def touch_private(path: Path) -> None:
     """``Path.touch(exist_ok=True)``, but a newly created file is 0600."""
-    os.close(os.open(path, os.O_WRONLY | os.O_CREAT, FILE_MODE))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, FILE_MODE)
+    try:
+        os.fchmod(fd, FILE_MODE)  # an existing file keeps its mode otherwise
+    finally:
+        os.close(fd)
 
 
 def tighten_tree(root: Path) -> int:
