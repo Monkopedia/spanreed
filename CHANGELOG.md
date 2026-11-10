@@ -24,9 +24,9 @@ worker logs. Before, these were `0755`/`0644`, and the bus was private only wher
 `0700`. The process umask is left alone, so `codex` and anything else spanreed launches still
 create your project files normally. (#18, #75)
 
-The one-time tightening at session start applies to **everything under the state root**, not
-only files spanreed created. If another tool keeps files there, they become `0600`/`0700` too,
-and any execute bit is removed. Symlinks are left alone. If that would break something you keep
+The tightening runs at **every** session start and applies to **everything under the state
+root**, not only files spanreed created. If another tool keeps files there, now or later, they
+become `0600`/`0700` too at the next session start, and any execute bit is removed. Symlinks are left alone. If that would break something you keep
 under `~/.claude/spanreed/`, move it elsewhere before upgrading.
 
 ## 0.3.1
