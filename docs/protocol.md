@@ -24,6 +24,21 @@ codex/<name>.log        per-Codex-worker log: startup config, every turn, every
 line per event, and is for a human to read — nothing parses it. A Codex worker is otherwise an
 ordinary registry row: `agent-<name>`, its own pid, no new fields.
 
+### Permissions: owner-only
+
+Everything under the state root is **owner-only**: directories `0700`, files `0600`. That covers
+the root, `inboxes/`, `cursors/`, `peers/`, `logs/` and `codex/`, plus every file in them. The
+modes are set **explicitly at creation** (`os.open` with a mode, `mkdir(mode=0o700)`) rather than
+by changing the process umask. The umask is process-wide, and a Codex worker launches `codex`,
+which would inherit it and create the user's project files `0600` too.
+
+Before #18 the bus used default modes (`0755`/`0644`) and was kept private only because `$HOME`
+is `0700`, a bit spanreed neither sets nor checks. Paths an older version already created are
+tightened once per session by `spanreed session-start`. It is deliberately not done in
+`StateStore`, which is constructed on every MCP call. Symlinks under the root are skipped, not
+followed. An existing **ancestor** of the root (e.g. `~/.claude`) is never chmodded. If spanreed
+has to create a missing ancestor itself, it creates it `0700`.
+
 ### `registry.json`
 
 ```json

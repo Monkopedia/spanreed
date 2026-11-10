@@ -28,6 +28,7 @@ from typing import Literal, cast
 
 from pydantic import BaseModel
 
+from spanreed._fsmode import open_private, private_dir, touch_private, write_private_text
 from spanreed.protocol import (
     ActivityRecord,
     Agent,
@@ -177,13 +178,13 @@ class StateStore:
 
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or default_state_root()
-        self.root.mkdir(parents=True, exist_ok=True)
+        private_dir(self.root, parents=True)
         self._inboxes_dir = self.root / "inboxes"
         self._cursors_dir = self.root / "cursors"
         self._peers_dir = self.root / "peers"
-        self._inboxes_dir.mkdir(exist_ok=True)
-        self._cursors_dir.mkdir(exist_ok=True)
-        self._peers_dir.mkdir(exist_ok=True)
+        private_dir(self._inboxes_dir)
+        private_dir(self._cursors_dir)
+        private_dir(self._peers_dir)
         self._registry_path = self.root / "registry.json"
         self._registry_lock_path = self.root / "registry.lock"
         self._config_path = self.root / "config.json"
@@ -194,7 +195,7 @@ class StateStore:
     @contextlib.contextmanager
     def _registry_lock(self) -> Generator[None, None, None]:
         """Exclusive advisory lock on the registry (fcntl-based, single-host)."""
-        self._registry_lock_path.touch(exist_ok=True)
+        touch_private(self._registry_lock_path)
         fd = os.open(self._registry_lock_path, os.O_RDONLY)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -212,7 +213,7 @@ class StateStore:
 
     def _write_registry_unlocked(self, agents: list[Agent]) -> None:
         tmp = self._registry_path.with_suffix(".json.tmp")
-        tmp.write_text(_RegistryDoc(agents=agents).model_dump_json(indent=2))
+        write_private_text(tmp, _RegistryDoc(agents=agents).model_dump_json(indent=2))
         tmp.replace(self._registry_path)
 
     def register_agent(
@@ -403,7 +404,7 @@ class StateStore:
         """Persist a bridge's view of one peer (atomically). Overwrites by host."""
         path = self._peer_path(link.host)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(link.model_dump_json(indent=2))
+        write_private_text(tmp, link.model_dump_json(indent=2))
         tmp.replace(path)
 
     def list_peer_links(self) -> list[PeerLink]:
@@ -688,7 +689,7 @@ class StateStore:
             in_reply_to=in_reply_to,
         )
         inbox = self._inbox_path(to_agent)
-        with inbox.open("a") as f:
+        with open_private(inbox) as f:
             f.write(msg.model_dump_json() + "\n")
         return msg
 
@@ -707,7 +708,7 @@ class StateStore:
         if any(existing.msg_id == msg.msg_id for existing in self.recv_messages(msg.to_agent)):
             return
         inbox = self._inbox_path(msg.to_agent)
-        with inbox.open("a") as f:
+        with open_private(inbox) as f:
             f.write(msg.model_dump_json() + "\n")
 
     def recv_messages(
@@ -756,7 +757,7 @@ class StateStore:
         # dot, so every bridge key (`.bridge.<inbox>`) mapped to one shared
         # `.bridge.tmp`, and two conjoin processes raced on it (#47).
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(msg_id)
+        write_private_text(tmp, msg_id)
         tmp.replace(path)
 
     # ------------------------------------------------------------------ config
@@ -798,7 +799,7 @@ class StateStore:
         config = self._read_config()
         config[key] = value
         tmp = self._config_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(config, indent=2))
+        write_private_text(tmp, json.dumps(config, indent=2))
         tmp.replace(self._config_path)
 
     # ------------------------------------------------------------------ activity log
@@ -820,7 +821,7 @@ class StateStore:
             kind=kind,
             value=value,
         )
-        with self._activity_log_path.open("a") as f:
+        with open_private(self._activity_log_path) as f:
             f.write(record.model_dump_json() + "\n")
 
     def read_activity(

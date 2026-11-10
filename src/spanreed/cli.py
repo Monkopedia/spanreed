@@ -23,6 +23,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from spanreed._fsmode import private_dir, tighten_tree, touch_private, write_private_text
 from spanreed.codex_approvals import MODES
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.protocol import Agent, validate_agent_id
@@ -351,8 +352,8 @@ def _write_disposition_policy() -> None:
     regardless of hook ordering or a deleted file. Idempotent (constant content).
     """
     root = default_state_root()
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "disposition-policy.md").write_text(_DISPOSITION_POLICY)
+    private_dir(root, parents=True)
+    write_private_text(root / "disposition-policy.md", _DISPOSITION_POLICY)
 
 
 def _cmd_inbox_watch(_args: argparse.Namespace) -> int:
@@ -366,8 +367,8 @@ def _cmd_inbox_watch(_args: argparse.Namespace) -> int:
     # ensure it exists before we exec into tail and never return.
     _write_disposition_policy()
     inbox = default_state_root() / "inboxes" / f"{validate_agent_id(agent_id)}.jsonl"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-    inbox.touch(exist_ok=True)
+    private_dir(inbox.parent, parents=True)
+    touch_private(inbox)
     os.execvp("tail", ["tail", "-n", "0", "-F", str(inbox)])
     # execvp does not return.
 
@@ -762,6 +763,12 @@ def _cmd_session_start(_args: argparse.Namespace) -> int:
     # nothing failing. See session_pid().
     pid = session_pid()
     store = StateStore()
+    # Tighten whatever an older spanreed created at 0755/0644 (#18). New paths
+    # are already private at creation; this catches the ones that exist, which
+    # is most of the history -- inboxes of sessions that will never write again
+    # would otherwise stay world-readable forever. Here and not in StateStore,
+    # because StateStore is built on every MCP call. Best-effort: never fails.
+    tighten_tree(store.root)
     agent = store.register_agent(name=name, working_dir=str(wd), pid=pid, agent_id=agent_id)
     # Write the disposition policy to a stable path so the inbox Monitor's
     # description can be a one-liner that points here instead of re-injecting

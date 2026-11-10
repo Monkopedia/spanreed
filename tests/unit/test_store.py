@@ -520,13 +520,14 @@ class TestCursors:
         # a shared temp path is a race: one `replace` raises FileNotFoundError and
         # the other cursor ends up holding a foreign msg_id (#47).
         written: list[str] = []
-        real_write_text = Path.write_text
+        real_write = store_module.write_private_text
 
-        def spy(self: Path, data: str, *args: object, **kwargs: object) -> int:
-            written.append(self.name)
-            return real_write_text(self, data)
+        def spy(path: Path, data: str) -> None:
+            written.append(path.name)
+            real_write(path, data)
 
-        monkeypatch.setattr(Path, "write_text", spy)
+        # The write set_cursor actually goes through (owner-only since #18).
+        monkeypatch.setattr(store_module, "write_private_text", spy)
         store.set_cursor(".bridge.agent-x@adolin", "msg-a")
         store.set_cursor(".bridge.agent-y@mac", "msg-b")
         assert len(set(written)) == 2, written

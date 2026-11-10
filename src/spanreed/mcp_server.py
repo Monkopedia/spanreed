@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from anyio import to_thread
 from mcp.server.mcpserver import MCPServer
 
+from spanreed._fsmode import open_private, private_dir
 from spanreed.identity import derive_agent_identity
 from spanreed.protocol import Message, Status
 from spanreed.store import StateStore, default_state_root
@@ -32,12 +33,12 @@ def _log(event: str, **fields: object) -> None:
     """
     try:
         log_dir = default_state_root() / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        private_dir(log_dir, parents=True)
         ts = datetime.now(UTC).isoformat()
         parts = [f"{ts}", f"pid={os.getpid()}", f"event={event}"]
         parts.extend(f"{k}={v}" for k, v in fields.items())
         line = " ".join(parts) + "\n"
-        with (log_dir / "spanreed-mcp.log").open("a") as f:
+        with open_private(log_dir / "spanreed-mcp.log") as f:
             f.write(line)
     except Exception:
         pass

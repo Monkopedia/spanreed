@@ -46,6 +46,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, TextIO, cast
 
+from ._fsmode import private_dir, write_private_text
 from .codex_approvals import approval_policy, sandbox_mode, sandbox_policy, wire_decision
 from .codex_client import CodexClient, TurnResult
 from .store import default_state_root
@@ -307,9 +308,9 @@ def probe_writable(directory: Path) -> tuple[bool, str]:
     the only check that does that here is the write itself.
     """
     try:
-        directory.mkdir(parents=True, exist_ok=True)
+        private_dir(directory, parents=True)
         probe = directory / ".spanreed-doctor-write-probe"
-        probe.write_text("probe")
+        write_private_text(probe, "probe")
         probe.unlink()
     except OSError as exc:
         return False, f"{type(exc).__name__}: {exc}"

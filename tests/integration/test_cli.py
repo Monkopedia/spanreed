@@ -267,6 +267,21 @@ class TestSessionStart:
         agents = json.loads(list_out)
         assert any(a["working_dir"] == str(cli_env) for a in agents)
 
+    def test_session_start_tightens_state_an_older_spanreed_left_loose(
+        self, cli_env: Path, state_root: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # #18: an inbox written by a pre-#18 spanreed, for a session that will
+        # never write again, would otherwise stay 0644 forever.
+        old = state_root / "inboxes" / "agent-gone.jsonl"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text("history\n")
+        old.chmod(0o644)
+        state_root.chmod(0o755)
+        rc, _ = _run(capsys, ["session-start"])
+        assert rc == 0
+        assert oct(old.stat().st_mode & 0o777) == "0o600"
+        assert oct(state_root.stat().st_mode & 0o777) == "0o700"
+
     def test_session_start_context_includes_identity(
         self,
         monkeypatch: pytest.MonkeyPatch,
