@@ -62,6 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO, cast
 
+from spanreed._fsmode import open_private, private_dir, touch_private
 from spanreed.codex_approvals import (
     APPLY_PATCH_APPROVAL,
     APPLY_PATCH_APPROVAL_V2,
@@ -419,9 +420,8 @@ class WorkerLog:
         self.failures = 0
         """How many lines the file refused to take. See :meth:`write`."""
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a"):
-                pass
+            private_dir(path.parent, parents=True)
+            touch_private(path)
         except OSError as exc:
             raise WorkerLogUnwritable(
                 f"the worker's log file {path} cannot be written: {type(exc).__name__}: {exc}. "
@@ -445,7 +445,7 @@ class WorkerLog:
         """
         stamped = f"{datetime.now(UTC).isoformat(timespec='seconds')} {line}"
         try:
-            with self.path.open("a") as handle:
+            with open_private(self.path) as handle:
                 handle.write(stamped + "\n")
         except OSError as exc:
             self.failures += 1
