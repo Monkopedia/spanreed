@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable, Generator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import IO, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -1254,3 +1254,148 @@ class TestConfigurableTimeouts:
             elapsed = time.monotonic() - started
         assert 0.4 <= elapsed < 3.0, elapsed
         assert "no frame from the peer for 0s" in capsys.readouterr().err
+
+
+class TestBridgeSteadyState:
+    """What the bridge does REPEATEDLY, not just in its first second (#43).
+
+    Re-measured on main before this class existed: of the issue's five one-line
+    mutations, only the watchdog-disabled one was caught (by #72/#74's tests).
+    These four still left all 676 tests green:
+
+    1. `_last_recv` never refreshed -> every healthy bridge kills itself after
+       recv_timeout, forever, with CI green.
+    3. the outbound cursor never advances -> the whole inbox is re-forwarded
+       every poll.
+    4. a saved cursor is ignored -> a restart re-sends everything.
+    5. mirrored entries advertised back -> unbounded registry growth.
+    """
+
+    @staticmethod
+    def _bridge(
+        tmp_path: Path, **kw: float
+    ) -> tuple[Bridge, StateStore, io.BytesIO, int, threading.Thread]:
+        store = StateStore(root=tmp_path / "local")
+        sink = io.BytesIO()
+        peer_r, peer_w = os.pipe()
+        conn = Bridge(
+            os.fdopen(peer_r, "rb"),
+            sink,
+            "kaladin",
+            store,
+            poll_interval=0.05,
+            sync_interval=kw.pop("sync_interval", 10),
+            recv_timeout=kw.pop("recv_timeout", 60),
+        )
+        return conn, store, sink, peer_w, threading.Thread(target=conn.run, daemon=True)
+
+    @staticmethod
+    def _frames(sink: io.BytesIO, kind: str) -> list[dict[str, object]]:
+        lines = sink.getvalue().decode().splitlines()
+        return [f for f in (json.loads(x) for x in lines if x.strip()) if f.get("kind") == kind]
+
+    @staticmethod
+    def _queue(store: StateStore, msg_id: str) -> None:
+        # Mail queued for a remote agent: it sits in `<id>@adolin.jsonl`, the
+        # outbound queue the bridge tails.
+        (store.root / "inboxes" / "agent-r@adolin.jsonl").open("a").write(
+            json.dumps(
+                {
+                    "msg_id": msg_id,
+                    "from_agent": "agent-local",
+                    "to_agent": "agent-r@adolin",
+                    "body": msg_id,
+                    "ts": "2026-01-01T00:00:00Z",
+                    "in_reply_to": None,
+                }
+            )
+            + "\n"
+        )
+
+    @staticmethod
+    def _hello(peer: IO[bytes]) -> None:
+        peer.write((json.dumps({"kind": "hello", "host": "adolin"}) + "\n").encode())
+        peer.flush()
+
+    def test_the_cursor_advances_and_a_message_is_sent_once(self, tmp_path: Path) -> None:
+        # Kills mutation 3. Ten-plus poll intervals: without the cursor the
+        # message would be re-emitted on every one of them.
+        _conn, store, sink, peer_w, thread = self._bridge(tmp_path)
+        self._queue(store, "m1")
+        thread.start()
+        with os.fdopen(peer_w, "wb") as peer:
+            self._hello(peer)
+            _wait(lambda: bool(self._frames(sink, "msg")))
+            time.sleep(0.6)
+        thread.join(timeout=5.0)
+        assert [f["message"]["msg_id"] for f in self._frames(sink, "msg")] == ["m1"]  # type: ignore[index]
+        assert store.get_cursor(".bridge.agent-r@adolin") == "m1"
+
+    def test_a_saved_cursor_is_honoured_on_restart(self, tmp_path: Path) -> None:
+        # Kills mutation 4: protocol.md promises a restart resumes without
+        # re-sending.
+        _conn, store, sink, peer_w, thread = self._bridge(tmp_path)
+        self._queue(store, "already-sent")
+        self._queue(store, "new")
+        store.set_cursor(".bridge.agent-r@adolin", "already-sent")
+        thread.start()
+        with os.fdopen(peer_w, "wb") as peer:
+            self._hello(peer)
+            _wait(lambda: bool(self._frames(sink, "msg")))
+            time.sleep(0.3)
+        thread.join(timeout=5.0)
+        assert [f["message"]["msg_id"] for f in self._frames(sink, "msg")] == ["new"]  # type: ignore[index]
+
+    def test_a_live_peer_keeps_the_link_up_past_the_watchdog(self, tmp_path: Path) -> None:
+        # Kills mutation 1, the one that matters most, and the positive control
+        # for the watchdog-fires tests: a guard that can only fire is as broken
+        # as one that never can. A peer that sends nothing but pings for four
+        # watchdog windows must not be torn down.
+        # 0.5s watchdog against pings 0.1s apart: five pings of margin per
+        # window, so a loaded machine stalling for a few hundred ms cannot fail
+        # it, while a watchdog that is never refreshed still fires inside 0.5s.
+        conn, _store, _sink, peer_w, thread = self._bridge(tmp_path, recv_timeout=0.5)
+        thread.start()
+        with os.fdopen(peer_w, "wb") as peer:
+            self._hello(peer)
+            for _ in range(15):  # 1.5s of pings = three watchdog windows
+                peer.write((json.dumps({"kind": "ping"}) + "\n").encode())
+                peer.flush()
+                time.sleep(0.1)
+            assert thread.is_alive(), "the watchdog tore down a link that was pinging"
+        thread.join(timeout=5.0)
+        assert conn._end_reason == "the pipe closed"  # pyright: ignore[reportPrivateUsage]
+
+    def test_mirrored_agents_are_never_advertised_back(self, tmp_path: Path) -> None:
+        # Kills mutation 5: re-advertising `agent-r@adolin` to adolin makes it
+        # `agent-r@adolin@kaladin` there, then `...@adolin` here, one @host per
+        # sync round, forever.
+        _conn, store, sink, peer_w, thread = self._bridge(tmp_path)
+        _register_live(store, "agent-local", "local")
+        remote = {
+            "agent_id": "agent-r",
+            "name": "r",
+            "working_dir": "/r",
+            "pid": os.getpid(),
+            "pid_start": None,
+            "last_seen": "2026-01-01T00:00:00Z",
+        }
+        thread.start()
+        with os.fdopen(peer_w, "wb") as peer:
+            self._hello(peer)
+            peer.write((json.dumps({"kind": "registry", "agents": [remote]}) + "\n").encode())
+            peer.flush()
+            _wait(lambda: any(a.agent_id == "agent-r@adolin" for a in store.list_agents()))
+            # Ask for a fresh advertisement AFTER the mirror exists.
+            before = len(self._frames(sink, "registry"))
+            peer.write((json.dumps({"kind": "registry-request"}) + "\n").encode())
+            peer.flush()
+            _wait(lambda: len(self._frames(sink, "registry")) > before)
+        thread.join(timeout=5.0)
+        advertised = [
+            cast("dict[str, object]", a)["agent_id"]
+            for f in self._frames(sink, "registry")
+            for a in cast("list[object]", f["agents"])
+        ]
+        assert "agent-local" in advertised, advertised  # the control: it advertises at all
+        assert not [i for i in advertised if "@" in str(i)], advertised
