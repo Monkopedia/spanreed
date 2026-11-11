@@ -1244,14 +1244,28 @@ class TestConfigurableTimeouts:
                 kill=lambda: None,
             ),
         )
+        # On its own thread with a bounded join: called directly, a broken
+        # watchdog never returns and the whole suite HANGS here instead of
+        # failing (#78 review). The pipe stays open until after the join, so
+        # only the watchdog can end the run.
+        holder: list[Bridge | None] = [None]
+        runner = threading.Thread(
+            target=lambda: bridge._run_bridge_once(  # pyright: ignore[reportPrivateUsage]
+                proc, "kaladin", StateStore(root=tmp_path), holder, recv_timeout=0.4
+            ),
+            daemon=True,
+        )
         with os.fdopen(peer_w, "wb") as peer:
             peer.write((json.dumps({"kind": "hello", "host": "adolin"}) + "\n").encode())
             peer.flush()
             started = time.monotonic()
-            bridge._run_bridge_once(  # pyright: ignore[reportPrivateUsage]
-                proc, "kaladin", StateStore(root=tmp_path), [None], recv_timeout=0.4
-            )
+            runner.start()
+            runner.join(timeout=5.0)
             elapsed = time.monotonic() - started
+            fired = not runner.is_alive()
+            if not fired and holder[0] is not None:
+                holder[0].stop()  # let the daemon thread exit rather than leak
+        assert fired, "the watchdog never fired: a silent, open pipe kept the bridge up"
         assert 0.4 <= elapsed < 3.0, elapsed
         assert "no frame from the peer for 0s" in capsys.readouterr().err
 
