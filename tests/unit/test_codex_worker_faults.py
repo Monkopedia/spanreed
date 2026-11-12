@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -40,6 +41,7 @@ from spanreed.codex_worker import (
     AUTH_TOKENS_REFRESH,
     THREAD_STATUS_CHANGED,
     CodexWorker,
+    NameInUse,
     WorkerConfig,
     WorkerLog,
     WorkerLogUnwritable,
@@ -882,3 +884,95 @@ def test_a_log_that_becomes_unwritable_mid_run_keeps_the_line(tmp_path: Path) ->
     assert log.failures == 1
     # And the file still holds what it took before the fault, unharmed.
     assert "APPROVE execCommandApproval subject=ls" in path.read_text()
+
+
+# ------------------------------------------------------- one name, two workers
+
+
+def _dead_pid() -> int:
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
+class TestOneNameOneWorker:
+    """#65: a second worker on the same --name ran every message twice, then
+    unregistered the survivor when it exited.
+
+    An in-process pair cannot reproduce the production case -- both workers
+    share this process's pid, and "same pid" is what marks a row as this
+    process's own. So the other worker is represented by a row held under a
+    genuinely live OTHER process (the parent), or a dead one.
+    """
+
+    def test_a_live_worker_on_the_same_name_is_refused_before_anything_spawns(
+        self, make_worker: MakeWorker, store: StateStore
+    ) -> None:
+        store.register_agent(
+            name="reviewer", working_dir="/elsewhere", pid=os.getppid(), agent_id="agent-reviewer"
+        )
+        stub, worker = make_worker(start=False)
+        with pytest.raises(NameInUse, match=f"pid {os.getppid()}"):
+            worker.start()
+        # Refused BEFORE connect(): the server was never even asked to start.
+        assert stub.received == [], stub.received
+        held = [a for a in store.list_agents(include_stale=True) if a.agent_id == "agent-reviewer"]
+        assert [a.pid for a in held] == [os.getppid()], "the live holder's row was touched"
+        assert "REFUSING TO START" in log_of(worker)
+
+    def test_a_crashed_worker_on_the_same_name_does_not_block_a_restart(
+        self, make_worker: MakeWorker, store: StateStore
+    ) -> None:
+        # A stale row is a worker that died without deregistering. Restarting
+        # it is exactly what has to keep working.
+        store.register_agent(
+            name="reviewer", working_dir="/elsewhere", pid=_dead_pid(), agent_id="agent-reviewer"
+        )
+        _stub, worker = make_worker()
+        assert worker.thread_id is not None
+        held = [a for a in store.list_agents(include_stale=True) if a.agent_id == "agent-reviewer"]
+        assert [a.pid for a in held] == [os.getpid()]
+
+    def test_close_does_not_unregister_a_row_another_worker_now_holds(
+        self, make_worker: MakeWorker, store: StateStore
+    ) -> None:
+        _stub, worker = make_worker()
+        # Another process takes the id after this worker registered.
+        store.register_agent(
+            name="reviewer", working_dir="/elsewhere", pid=os.getppid(), agent_id="agent-reviewer"
+        )
+        worker.close()
+        held = [a for a in store.list_agents(include_stale=True) if a.agent_id == "agent-reviewer"]
+        assert [a.pid for a in held] == [os.getppid()], "close() deleted another worker's row"
+        assert "NOT deregistering agent-reviewer" in log_of(worker)
+
+    def test_close_still_unregisters_its_own_row(
+        self, make_worker: MakeWorker, store: StateStore
+    ) -> None:
+        _stub, worker = make_worker()
+        worker.close()
+        assert not [
+            a for a in store.list_agents(include_stale=True) if a.agent_id == "agent-reviewer"
+        ]
+
+    def test_serve_reports_the_refusal_in_one_line_and_exits_1(
+        self,
+        make_worker: MakeWorker,
+        store: StateStore,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store.register_agent(
+            name="reviewer", working_dir="/elsewhere", pid=os.getppid(), agent_id="agent-reviewer"
+        )
+        _stub, worker = make_worker(start=False)
+        # Bound the loop serve() would enter if the refusal were missing. Without
+        # this, that regression starts a worker that polls forever and HANGS the
+        # suite instead of failing it -- which is exactly what the first draft
+        # of this test did under its own mutation check.
+        bounded_run = worker.run
+        monkeypatch.setattr(worker, "run", lambda: bounded_run(max_polls=1))
+        assert worker.serve() == 1
+        err = capsys.readouterr().err
+        assert "is already in use by a running worker" in err
+        assert "FAILED TO START" not in log_of(worker)

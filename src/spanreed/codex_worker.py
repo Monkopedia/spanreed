@@ -85,8 +85,8 @@ from spanreed.codex_client import (
     ServerRequestHandler,
     TurnResult,
 )
-from spanreed.protocol import Message, Status, validate_agent_id
-from spanreed.store import StateStore, default_state_root
+from spanreed.protocol import Agent, Message, Status, validate_agent_id
+from spanreed.store import StateStore, default_state_root, is_stale
 
 AUTH_TOKENS_REFRESH = "account/chatgptAuthTokens/refresh"
 """Server request sent when Codex got a ``401`` and wants the *client* to supply
@@ -349,6 +349,16 @@ class InboxUnreadable(RuntimeError):
     """
 
 
+class NameInUse(RuntimeError):
+    """Another live worker already holds this ``--name`` (#65).
+
+    Without this check a second worker started under the same name upserted the
+    first one's registry row and polled the same inbox: every message ran as two
+    Codex turns -- in ``auto`` or ``full``, every command twice -- and whichever
+    exited first deleted the row the other was still using.
+    """
+
+
 class NoTerminalForAskMode(RuntimeError):
     """``--mode ask`` was asked for where there is nobody to ask.
 
@@ -544,6 +554,10 @@ class CodexWorker:
             # the check for anyone driving the worker as a library.
             self.log.write(f"[codex-worker] REFUSING TO START: {refusal}")
             raise NoTerminalForAskMode(refusal)
+        # Also before connect(): a name another live worker holds would mean
+        # spawning an app-server only to refuse. Checked again just before
+        # registering, to narrow the window a slow thread/start leaves open.
+        self._refuse_if_name_held()
         self.log.write(
             f"[codex-worker] starting {config.agent_id} ({config.name}) "
             f"cwd={config.cwd} mode={config.mode} "
@@ -590,6 +604,7 @@ class CodexWorker:
         self.thread_id = _thread_id_of(thread)
         self.log.write(f"[codex-worker] thread {self.thread_id} started (fresh; no resume)")
 
+        self._refuse_if_name_held()
         agent = self.store.register_agent(
             name=config.name,
             working_dir=str(config.cwd),
@@ -607,12 +622,54 @@ class CodexWorker:
             f"inbox cursor={self._cursor or '(none — the whole inbox is pending)'}"
         )
 
+    def _holder(self) -> Agent | None:
+        """The registry row currently holding this worker's id, live or not."""
+        return next(
+            (
+                a
+                for a in self.store.list_agents(include_stale=True)
+                if a.agent_id == self.config.agent_id
+            ),
+            None,
+        )
+
+    def _refuse_if_name_held(self) -> None:
+        """Raise :class:`NameInUse` if a LIVE process other than this one holds the id.
+
+        A stale row is not a refusal: that is a worker that crashed without
+        deregistering, and restarting it is exactly what should work.
+        """
+        holder = self._holder()
+        if holder is None or holder.pid == os.getpid() or is_stale(holder):
+            return
+        reason = (
+            f"--name {self.config.name!r} is already in use by a running worker "
+            f"(registry id {self.config.agent_id}, pid {holder.pid}). Two workers on one "
+            f"name would both run every message -- in mode {self.config.mode}, every "
+            f"command twice -- and whichever exits first would unregister the other. "
+            f"Stop pid {holder.pid} first, or pick a different --name."
+        )
+        self.log.write(f"[codex-worker] REFUSING TO START: {reason}")
+        raise NameInUse(reason)
+
     def close(self) -> None:
-        """Leave the bus and reap the server. Safe to call twice."""
+        """Leave the bus and reap the server. Safe to call twice.
+
+        Deregisters only a row that is still this process's. If another worker
+        has since taken the id, deleting it would unregister a worker that is
+        still running (#65).
+        """
         if self._registered:
-            self.store.deregister_agent(self.config.agent_id)
+            holder = self._holder()
+            if holder is not None and holder.pid == os.getpid():
+                self.store.deregister_agent(self.config.agent_id)
+                self.log.write(f"[codex-worker] deregistered {self.config.agent_id}")
+            else:
+                self.log.write(
+                    f"[codex-worker] NOT deregistering {self.config.agent_id}: the row now "
+                    f"belongs to pid {holder.pid if holder else '(none)'}, not this process"
+                )
             self._registered = False
-            self.log.write(f"[codex-worker] deregistered {self.config.agent_id}")
         self.client.close()
 
     def serve(self) -> int:
@@ -624,12 +681,13 @@ class CodexWorker:
         """
         try:
             self.start()
-        except NoTerminalForAskMode as exc:
+        except (NoTerminalForAskMode, NameInUse) as exc:
             # Not routed through the FAILED TO START arm below: that one prints
-            # the app-server's output and its exit status, and here there is no
-            # app-server -- nothing was spawned. A page of empty server capture
-            # under a one-line configuration error is how a diagnosable refusal
-            # reads as a crash.
+            # the app-server's output and its exit status, and a refusal is a
+            # one-line configuration error, not a server fault. Usually nothing
+            # was spawned at all; a NameInUse caught by the second, late check
+            # has a server running, and close() reaps it. A page of server
+            # capture under a one-line refusal is how it reads as a crash.
             print(f"spanreed codex: {exc}", file=sys.stderr, flush=True)
             self.close()
             return 1
