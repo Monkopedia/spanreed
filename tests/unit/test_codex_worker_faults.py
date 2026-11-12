@@ -920,6 +920,34 @@ class TestOneNameOneWorker:
         assert [a.pid for a in held] == [os.getppid()], "the live holder's row was touched"
         assert "REFUSING TO START" in log_of(worker)
 
+    def test_a_holder_that_appears_during_thread_start_is_still_refused(
+        self,
+        make_worker: MakeWorker,
+        store: StateStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The late, pre-register check (#80 review): the early check passes,
+        # then another worker takes the name while this one is inside
+        # thread/start. Without the second check, register_agent would upsert
+        # over the live holder.
+        _stub, worker = make_worker(start=False)
+        real_thread_start = worker.client.thread_start
+
+        def racing_thread_start(**params: Any) -> Any:
+            store.register_agent(
+                name="reviewer",
+                working_dir="/elsewhere",
+                pid=os.getppid(),
+                agent_id="agent-reviewer",
+            )
+            return real_thread_start(**params)
+
+        monkeypatch.setattr(worker.client, "thread_start", racing_thread_start)
+        with pytest.raises(NameInUse):
+            worker.start()
+        held = [a for a in store.list_agents(include_stale=True) if a.agent_id == "agent-reviewer"]
+        assert [a.pid for a in held] == [os.getppid()], "the late arrival's row was overwritten"
+
     def test_a_crashed_worker_on_the_same_name_does_not_block_a_restart(
         self, make_worker: MakeWorker, store: StateStore
     ) -> None:

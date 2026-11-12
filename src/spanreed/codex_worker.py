@@ -86,7 +86,7 @@ from spanreed.codex_client import (
     TurnResult,
 )
 from spanreed.protocol import Agent, Message, Status, validate_agent_id
-from spanreed.store import StateStore, default_state_root, is_stale
+from spanreed.store import AgentIdHeld, StateStore, default_state_root, is_stale
 
 AUTH_TOKENS_REFRESH = "account/chatgptAuthTokens/refresh"
 """Server request sent when Codex got a ``401`` and wants the *client* to supply
@@ -554,9 +554,9 @@ class CodexWorker:
             # the check for anyone driving the worker as a library.
             self.log.write(f"[codex-worker] REFUSING TO START: {refusal}")
             raise NoTerminalForAskMode(refusal)
-        # Also before connect(): a name another live worker holds would mean
-        # spawning an app-server only to refuse. Checked again just before
-        # registering, to narrow the window a slow thread/start leaves open.
+        # Before connect(): a name another live worker holds would mean
+        # spawning an app-server only to refuse. This early check is the cheap
+        # one; the authoritative one is atomic, inside register_agent below.
         self._refuse_if_name_held()
         self.log.write(
             f"[codex-worker] starting {config.agent_id} ({config.name}) "
@@ -604,16 +604,22 @@ class CodexWorker:
         self.thread_id = _thread_id_of(thread)
         self.log.write(f"[codex-worker] thread {self.thread_id} started (fresh; no resume)")
 
-        self._refuse_if_name_held()
-        agent = self.store.register_agent(
-            name=config.name,
-            working_dir=str(config.cwd),
-            # The worker process's own pid: liveness of this entry *is* this
-            # process's liveness (protocol.md — `pid` is the pid of whatever the
-            # entry tracks). There is no Claude session behind it.
-            pid=os.getpid(),
-            agent_id=config.agent_id,
-        )
+        try:
+            agent = self.store.register_agent(
+                name=config.name,
+                working_dir=str(config.cwd),
+                # The worker process's own pid: liveness of this entry *is* this
+                # process's liveness (protocol.md — `pid` is the pid of whatever
+                # the entry tracks). There is no Claude session behind it.
+                pid=os.getpid(),
+                agent_id=config.agent_id,
+                # Atomic with the write, under the registry lock: another worker
+                # that took the name while this one was in thread/start is
+                # caught here, with no window between the check and the upsert.
+                refuse_live_holder=True,
+            )
+        except AgentIdHeld as exc:
+            raise self._name_in_use(exc.holder) from None
         self._registered = True
         self._cursor = self.store.get_cursor(config.agent_id)
         self.store.set_status(config.agent_id, "idle")
@@ -642,6 +648,9 @@ class CodexWorker:
         holder = self._holder()
         if holder is None or holder.pid == os.getpid() or is_stale(holder):
             return
+        raise self._name_in_use(holder)
+
+    def _name_in_use(self, holder: Agent) -> NameInUse:
         reason = (
             f"--name {self.config.name!r} is already in use by a running worker "
             f"(registry id {self.config.agent_id}, pid {holder.pid}). Two workers on one "
@@ -650,7 +659,7 @@ class CodexWorker:
             f"Stop pid {holder.pid} first, or pick a different --name."
         )
         self.log.write(f"[codex-worker] REFUSING TO START: {reason}")
-        raise NameInUse(reason)
+        return NameInUse(reason)
 
     def close(self) -> None:
         """Leave the bus and reap the server. Safe to call twice.
