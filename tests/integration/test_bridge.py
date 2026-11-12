@@ -1413,3 +1413,52 @@ class TestBridgeSteadyState:
         ]
         assert "agent-local" in advertised, advertised  # the control: it advertises at all
         assert not [i for i in advertised if "@" in str(i)], advertised
+
+
+def test_a_registry_frame_arriving_after_teardown_does_not_resurrect_mirrors(
+    tmp_path: Path,
+) -> None:
+    """The race behind CI run 43153344546's flaky teardown failure.
+
+    Teardown clears the peer's mirrored agents, but the reader thread is still
+    alive and can apply a registry frame the peer had already sent, putting
+    them back. Those rows are owned by this process's pid, and `conjoin`
+    outlives a dropped link, so a disconnected peer's agents would read as LIVE.
+    Made deterministic here by sending the late frame after the run returns.
+    """
+    store = StateStore(root=tmp_path / "a")
+    peer_r, peer_w = os.pipe()
+    conn = Bridge(
+        os.fdopen(peer_r, "rb"),
+        io.BytesIO(),
+        "hostA",
+        store,
+        poll_interval=0.05,
+        sync_interval=10,
+        recv_timeout=60,
+    )
+    runner = threading.Thread(target=conn.run, daemon=True)
+    runner.start()
+    agent = {
+        "agent_id": "agent-bob",
+        "name": "bob",
+        "working_dir": "/b",
+        "pid": os.getpid(),
+        "pid_start": None,
+        "last_seen": "2026-01-01T00:00:00Z",
+    }
+    registry = (json.dumps({"kind": "registry", "agents": [agent]}) + "\n").encode()
+    with os.fdopen(peer_w, "wb") as peer:
+        peer.write((json.dumps({"kind": "hello", "host": "hostB"}) + "\n").encode())
+        peer.write(registry)
+        peer.flush()
+        _wait(lambda: any(a.agent_id == "agent-bob@hostB" for a in store.list_agents()))
+        conn.stop()
+        runner.join(timeout=5.0)
+        assert not runner.is_alive()
+        assert store.list_agents(include_stale=True) == []
+        # The peer's in-flight frame lands after teardown; the reader is alive.
+        peer.write(registry)
+        peer.flush()
+        time.sleep(0.3)
+    assert [a.agent_id for a in store.list_agents(include_stale=True)] == []

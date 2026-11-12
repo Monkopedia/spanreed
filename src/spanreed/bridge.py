@@ -151,6 +151,14 @@ class Bridge:
         self._registry_requested = threading.Event()
         # A diagnosis observed before there was a peer record to write it to.
         self._deferred_note: str | None = None
+        # Teardown clears the mirrored agents, but the reader thread is still
+        # running then and can apply a registry frame the peer had already
+        # sent -- re-mirroring the peer's agents AFTER the clear. Those rows are
+        # owned by this process's pid, and `conjoin` outlives a dropped link,
+        # so they read as LIVE while the peer is disconnected. One lock and a
+        # flag make "clear" and "apply" mutually exclusive and final.
+        self._mirror_lock = threading.Lock()
+        self._torn_down = False
         # Why the link ended, for the disconnect line. First writer wins: the
         # watchdog and an external stop() name the cause, and the reader's EOF
         # that usually follows them must not overwrite it.
@@ -315,7 +323,10 @@ class Bridge:
             return
         raw_agents = cast("list[object]", frame["agents"])
         agents = [Agent.model_validate(a) for a in raw_agents]
-        self.store.sync_remote_agents(self.peer_host, agents, self._my_pid, self._my_pid_start)
+        with self._mirror_lock:
+            if self._torn_down:
+                return  # arrived after teardown cleared the mirror; see __init__
+            self.store.sync_remote_agents(self.peer_host, agents, self._my_pid, self._my_pid_start)
         self._peer_registry_seen.set()
         now = datetime.now(UTC)
         with self._link_lock:
@@ -504,7 +515,9 @@ class Bridge:
                     f"disconnected from {who} after {_duration(time.monotonic() - started)}: {why}"
                 )
             if self.peer_host is not None:
-                self.store.clear_remote_agents(self.peer_host)
+                with self._mirror_lock:
+                    self._torn_down = True
+                    self.store.clear_remote_agents(self.peer_host)
                 # The record is updated, never deleted: "a bridge to this host
                 # was up and is now gone" is a diagnosis, and removing the file
                 # would make it indistinguishable from "no bridge was ever
