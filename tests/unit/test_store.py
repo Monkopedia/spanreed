@@ -1023,3 +1023,55 @@ class TestFormatAge:
     def test_a_future_timestamp_says_check_the_clocks(self) -> None:
         now = datetime(2026, 1, 2, tzinfo=UTC)
         assert "check the clocks on both hosts" in format_age(now + timedelta(hours=1), now=now)
+
+
+class TestRefuseLiveHolder:
+    """register_agent(refuse_live_holder=True): the atomic half of #65's fix.
+
+    The check runs inside the registry lock, so there is no window between
+    "is this id held?" and the upsert that two starters can both pass through.
+    """
+
+    def test_a_live_holder_with_another_pid_is_refused_and_left_intact(
+        self, store: StateStore
+    ) -> None:
+        store.register_agent(name="w", working_dir="/a", pid=os.getppid(), agent_id="agent-w")
+        with pytest.raises(store_module.AgentIdHeld) as caught:
+            store.register_agent(
+                name="w",
+                working_dir="/b",
+                pid=os.getpid(),
+                agent_id="agent-w",
+                refuse_live_holder=True,
+            )
+        assert caught.value.holder.pid == os.getppid()
+        assert [a.pid for a in store.list_agents(include_stale=True)] == [os.getppid()]
+
+    def test_a_stale_holder_is_taken_over(self, store: StateStore) -> None:
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        store.register_agent(name="w", working_dir="/a", pid=dead.pid, agent_id="agent-w")
+        store.register_agent(
+            name="w",
+            working_dir="/b",
+            pid=os.getpid(),
+            agent_id="agent-w",
+            refuse_live_holder=True,
+        )
+        assert [a.pid for a in store.list_agents(include_stale=True)] == [os.getpid()]
+
+    def test_re_registering_ones_own_pid_is_not_a_conflict(self, store: StateStore) -> None:
+        store.register_agent(name="w", working_dir="/a", pid=os.getpid(), agent_id="agent-w")
+        store.register_agent(
+            name="w",
+            working_dir="/a",
+            pid=os.getpid(),
+            agent_id="agent-w",
+            refuse_live_holder=True,
+        )
+
+    def test_the_default_still_upserts_over_a_live_holder(self, store: StateStore) -> None:
+        # The SessionStart hook depends on this (#16); refusal is opt-in.
+        store.register_agent(name="w", working_dir="/a", pid=os.getppid(), agent_id="agent-w")
+        store.register_agent(name="w", working_dir="/b", pid=os.getpid(), agent_id="agent-w")
+        assert [a.pid for a in store.list_agents(include_stale=True)] == [os.getpid()]

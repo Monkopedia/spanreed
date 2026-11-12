@@ -173,6 +173,14 @@ def peer_link_is_attached(link: PeerLink) -> bool:
     return pid_start_time(link.bridge_pid) == link.bridge_pid_start
 
 
+class AgentIdHeld(RuntimeError):
+    """``register_agent(refuse_live_holder=True)`` found a live row it would take over."""
+
+    def __init__(self, holder: Agent) -> None:
+        super().__init__(f"{holder.agent_id} is held by live pid {holder.pid}")
+        self.holder = holder
+
+
 class StateStore:
     """Filesystem-backed state store for the Spanreed bus."""
 
@@ -222,8 +230,18 @@ class StateStore:
         working_dir: str,
         pid: int,
         agent_id: str | None = None,
+        *,
+        refuse_live_holder: bool = False,
     ) -> Agent:
         """Insert or update an agent in the registry. Returns the (refreshed) Agent.
+
+        ``refuse_live_holder`` makes the upsert conditional: if the id is held
+        by a LIVE row with a different pid, raise :class:`AgentIdHeld` instead
+        of taking it over. The check runs inside the registry lock, so it is
+        atomic with the write -- a caller checking first and registering second
+        leaves a window two starters can both pass through (#65). Off by
+        default, because the SessionStart hook's upsert-over-the-previous-
+        session is deliberate (#16).
 
         If ``agent_id`` is supplied and already present, the existing entry is
         refreshed (upsert): ``pid``/``pid_start``/``last_seen`` are updated and
@@ -249,6 +267,12 @@ class StateStore:
             agents = self._read_registry_unlocked()
             for i, existing in enumerate(agents):
                 if existing.agent_id == new_entry.agent_id:
+                    if (
+                        refuse_live_holder
+                        and existing.pid != new_entry.pid
+                        and not is_stale(existing)
+                    ):
+                        raise AgentIdHeld(existing)
                     # Refresh session-state fields; preserve name/working_dir/
                     # focus (agent customizations). Reset status — a stale
                     # status from a prior session would mislead the fleet view.

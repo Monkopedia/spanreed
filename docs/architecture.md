@@ -389,6 +389,7 @@ row produces a log line naming what happened, what the worker did, and what to c
 | the inbox file is deleted | Treated as empty. Later mail still runs. |
 | mail arrives during a turn | Runs as the next turn, in order. Nothing is lost. |
 | the sender deregisters before the reply | The reply text goes to the log in full, the cursor still advances, the worker stays up. |
+| another **live** worker already holds this `--name` | **Refuses to start**, naming the pid that holds it. The check runs once before anything is spawned, and again atomically inside the registry lock as part of registering, so there's no window between checking and taking the name. Two workers on one name would both run every message, so in `auto`/`full` every command would run twice, and whichever exited first would unregister the other. A **stale** holder (a worker that crashed without deregistering) does not block a restart. On exit, a worker deregisters only a row that is still its own. |
 | `--cwd` is a symlink | Resolved once, at construction. The sandbox is scoped to the real directory and both spellings get the same approval verdict. |
 | `--cwd` is deleted after start | Every turn is **refused** with a reply naming the reason, and the worker stays on the bus — the directory may come back. No turn runs without its boundary. |
 | `--cwd` is not writable | A startup warning naming it. Otherwise the only symptom is the model reporting failed edits as its own fault. |
