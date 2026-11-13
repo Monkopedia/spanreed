@@ -137,7 +137,7 @@ Discovered in test #3: Claude can call the `PushNotification` tool to alert the 
 Background / headless workers have other handles — Claude Code's Remote Control, `claude -p`, scheduled triggers. Spanreed targets the case where a human is actively using a Claude session and another agent needs to interject.
 
 Out-of-scope explicitly:
-- Persistence across machine reboots
+- Persistence across machine reboots (except for sleepers; see "Sleepers" below, whose records survive a reboot by design)
 - Authentication / authorization between agents (single-user assumption)
 
 (Cross-host messaging was previously out-of-scope; it is now an in-design feature — see below.)
@@ -442,6 +442,642 @@ Resolved since:
   which would leave a peer blocked on a reply that is not coming. A turn that produces no terminal
   event before the worker's deadline, and one that completes with no agent message, both reply
   saying exactly that.
+
+## Sleepers: agents that sleep and wake on mail
+
+**Status: design, not built.** The resume mechanics it rests on are measured in
+[findings.md](findings.md#test-6-can-a-claude-session-in-tmux-be-exited-and-resumed-by-session-id-2026-11-13).
+Everything else here is the plan. Anything not measured is listed under "Not
+verified yet" rather than stated as fact.
+
+A **sleeper** is a Claude Code session spanreed manages inside tmux. You create it
+with a name and a directory. When it goes idle, or asks to, its Claude process exits
+and frees its memory. It stays on the bus, addressable by name, and **the next
+message wakes it**: spanreed resumes the same conversation in tmux. It sleeps again
+when it goes idle.
+
+This is the case native cross-session messaging cannot cover: a session that isn't
+running can't receive a native message. A sleeper's inbox is a file, so mail waits,
+and arriving mail is what brings the agent back. (Related: #35, mail sent while a
+session is down is never surfaced.)
+
+### Decisions
+
+**Confirmed by the owner** in the spanreed session on 2026-11-13 ("1–5 confirmed, 6
+yes"). The confirmation is relayed verbatim on #85 (comment 6863746710) and was
+checked against the session transcript in the review of PR #84. It is not yet a
+comment from his own account. The background-work rule under "Going to sleep" was
+settled the same day, as decision 7 on #85: `request_sleep` stops remaining work,
+and the idle timeout never does.
+
+- **Wake resumes the same conversation** (`claude --resume <session-id>`), never a
+  fresh session. *The owner's request:* "Resume, if it doesn't resume there is no
+  value".
+- **The permission mode is chosen at create and kept for the agent's whole life.**
+  It is stored in the sleeper record and passed on every launch. *The owner's
+  request:* "allow permission mode on create and always keep it".
+- **No persistent spanreed process.** This was **the author's proposal**, which
+  the owner then accepted ("6 yes"); it was not his own idea. The owner asked "Do we need a persistent process? Or do we
+  need locks around how we resume?", and this design is the answer to that
+  question. (Earlier in the same conversation the author had read the owner's
+  silence as a yes to a per-machine controller process, the opposite answer. That
+  is one more reason this needs his explicit confirmation.) Every job a daemon
+  would do falls to something already running at the moment it's needed; see "Who
+  does what". `docs/open-questions.md` still lists daemon lifecycle in general as
+  undecided, and this covers sleepers only.
+
+- **Wait until the agent is up, then deliver.** *The owner's request:* "Can we wait
+  for the agent to be up and then deliver the message?" See "Waking".
+- **Not at-least-once: "read" is decided by the transcript.** *The owner:* "I don't
+  love at least once". The transcript check was the author's proposal, which he
+  accepted ("Yeah"). See "What counts as read".
+
+- **Managing sleepers across `conjoin` is wanted, after local sleepers work.**
+  This is decision 8, tracked in #86. See "Across `conjoin`".
+
+Also the author's, for the owner to see: no ssh agent in a woken sleeper (see
+"Environment"), and a signal-first exit.
+
+### The sleeper record
+
+`<state>/sleepers/<name>.json`, owner-only like the rest of the state root. It is the
+source of truth, and it survives a reboot:
+
+| field | meaning |
+|---|---|
+| `name`, `agent_id` | `agent_id` is `agent-<name>`, validated by `validate_agent_id` |
+| `cwd` | the directory Claude runs in |
+| `session_id` | a UUID chosen at create; `--session-id` on the first launch, `--resume` after that |
+| `permission_mode` | fixed at create; passed on every launch |
+| `idle_timeout_s` | default 900 (15 min), set per sleeper |
+| `claude_path`, `spanreed_path`, `path_env` | resolved at create and used for every launch; see "Environment" |
+| `state` | `asleep`, `awake`, or `sleeping` (committed to sleep, Claude being ended) |
+| `generation` | incremented on every wake; part of the tmux session name |
+| `tmux_session` | `spanreed-<name>-<generation>` for the current wake |
+| `runner_pid`, `runner_pid_start` | written by the waker under the lock, from tmux's pane pid; confirmed by the runner itself |
+| `claude_pid`, `claude_pid_start` | written by the runner once it has launched Claude |
+| `read_through` | the inbox line number (and its `msg_id`, to detect a rewritten file) up to which every message is **found in the session's transcript**. The no-loss argument rests on this field; see "What counts as read" |
+| `sleep_requested` | set by `request_sleep` |
+| `last_wake_failure` | why the last wake did not come back, with a timestamp |
+| `undelivered_line`, `undelivered_attempts` | the first unread line, and how many launches **where Claude came up** have failed to deliver it; see the poison-line bound |
+| `skipped_lines` | every line the poison bound has skipped: line, `msg_id`, when, why. Never overwritten |
+
+### Who does what, without a daemon
+
+**Waking is done by whoever delivers the mail.** Only two paths write an inbox:
+`StateStore.send_message` (the CLI, the MCP tools, the Codex worker, and through
+them scripts and cron) and `StateStore.append_message` (the `conjoin` bridge). Both
+append the message **first**, then call `wake_if_needed(recipient)`. **That is an
+invariant for any future inbox writer:** append, then call `wake_if_needed`. A
+writer that skips it delivers mail that never wakes anyone. That function:
+
+1. Returns at once if the recipient has no sleeper record. It also does nothing
+   when the bridge's `append_message` dedupes a message it already had, since no
+   new mail arrived.
+2. Takes the sleeper's lock (`<state>/sleepers/<name>.lock`, flock).
+3. Decides **under the lock** whether a wake is needed. It is needed when `state ==
+   asleep`, **or** when `state` is `awake` or `sleeping` but the runner is dead (pid
+   gone, or its start time no longer matches). That covers a crash, an OOM kill, a
+   reboot, or the tmux server going away, whether it happens while awake or in the
+   middle of going to sleep. Without the `sleeping` case, a runner that died
+   mid-exit left a sleeper every later sender skipped, with no `needs_input` (Loss F
+   in the review of PR #84).
+4. If the runner is dead but `claude_pid` is still alive (an orphaned Claude whose
+   runner died), it does **not** resume. Two Claude processes on one conversation
+   is worse than a stalled agent. It records `last_wake_failure` and sets the bus
+   status to `needs_input`.
+5. Otherwise it increments `generation` and **writes the record before launching
+   anything**. A waker that dies after `new-session` but before persisting
+   `generation` would make the next waker reuse the name and get `duplicate session`.
+   Then it launches the runner in a **new detached tmux session named
+   `spanreed-<name>-<generation>`**, using `tmux new-session -d -P -F '#{pane_pid}'`
+   to get the pane's pid back. It writes `state=awake`, `tmux_session`, `runner_pid`
+   and `runner_pid_start`, and releases the lock.
+
+The session name is new on every wake for a reason: the previous runner's session
+can still exist for a moment after it has marked itself asleep (the measured "Loss
+A" in the review of PR #84). A fixed name made the next wake fail with `duplicate
+session`, and that mail went unread. `spanreed sleeper attach X` finds the current
+session name for you.
+
+**If the wake fails, the send still succeeds.** For example: no `tmux` on the
+sender's PATH, a sandbox that can't reach the tmux socket, or `tmux` exiting
+non-zero. The message is already in the inbox. The failure is recorded in
+`last_wake_failure`, the bus status goes to `needs_input`, and the mail waits for
+the next send or a `spanreed sleeper wake X`. A wake failure must never be silent,
+and must never cost the sender its message.
+
+**The runner** (`spanreed sleeper _run <name> <generation>`) runs inside the tmux
+pane and exists only while the agent is awake. On start it takes the lock and
+**confirms it is the runner the record names**. If `generation` has moved on, or
+`runner_pid` is a different live process, it exits without launching anything. If
+the waker died before writing the record, the record has **no live runner**
+(`asleep`, or `awake`/`sleeping` with a stale `runner_pid`), and the runner claims
+it by writing its own pid. So a second
+concurrent wake starts a runner that sees the first one and exits.
+
+Once confirmed, it launches Claude as its child (recording `claude_pid`), watches
+for idleness and `sleep_requested`, and runs the sleep transition when Claude exits
+for any reason.
+
+**A failed wake comes in two forms, and the runner detects both:**
+
+- **Claude exits almost at once** (`claude` missing, a deleted transcript).
+- **Claude stays up but the model can't run.** An expired login or a rate limit
+  doesn't make Claude exit. It answers every turn with a synthetic error record
+  (`authentication_failed`, `rate_limit`). The runner watches the transcript for
+  those, and treats a launch whose only assistant records are synthetic errors as
+  failed.
+
+Either way it records `last_wake_failure` with the reason, sets `needs_input`,
+ends Claude if it is still running, sets **`state=asleep`**, and exits. It does
+**not** retry in a loop. The next mail, or `spanreed sleeper wake X`, tries again.
+Mail is never marked read on a failed wake, by the rule in "What counts as read". (That such failures do exit "almost at once" is
+an assumption; see "Not verified yet".)
+
+### Going to sleep
+
+**Idle detection.** The plugin's hooks for `UserPromptSubmit`, `Stop` and
+`Notification` call `spanreed sleeper _activity <event>`, but only in a sleeper
+session; elsewhere they do nothing. That writes the last event and its time to
+`<state>/sleepers/<name>.activity`. The runner treats the agent as idle when the
+last event is `Stop`, more than `idle_timeout_s` has passed, **and no background
+work is running**. A pending `permission_prompt` also counts as not idle, and sets
+`needs_input`.
+
+**Background work is not idle.** `Stop` fires when a *turn* ends, but a turn can
+leave work running: a background shell command, a subagent, a Monitor. Exiting then
+would kill that work, which is what Claude Code's exit dialog warns about ("The
+following will stop when you exit"). The spanreed inbox Monitor is always running in
+a sleeper, so it is the one background task that does **not** block sleep; anything
+else does. **The source is the `Stop` hook's `background_tasks`** (measured, findings Test
+11). The hook that fires at every turn end lists every running background shell,
+Monitor and subagent. The runner records it with the `Stop` activity, and the
+idle check reads the last one. Two details:
+
+- **Monitors appear as `type: "shell"`**, so the inbox Monitor is excluded by
+  `command == "spanreed inbox-watch"`, not by type. Any other Monitor counts as
+  busy.
+- **The snapshot is as of the last `Stop`.** Work that ends without starting a
+  turn leaves it out of date, so it errs toward busy, never toward sleeping. Most
+  background shells do start a turn when they finish (Test 11), which refreshes it.
+
+The candidates this replaces don't work. `TaskCreated`/`TaskCompleted` never fire
+for background work. Subagent starts and stops miss work a subagent leaves
+running. The exit dialog lists the same thing but means driving the UI.
+
+**The runner never chooses the dialog's "Move to background and exit"** (option 2,
+seen in Test 11, not exercised). The design's exit is SIGTERM, which never shows
+the dialog. Any fallback path that does see the dialog takes option 1 on the
+`request_sleep` path, or Esc on the idle-timeout path.
+
+**Background work and the two ways to sleep** (owner's decision 7 on #85, which
+corrects an earlier misreading of his first reply):
+
+- **The agent is responsible for shutting down its own background work.** That is
+  the expectation, and the agent's instructions say so.
+- **`request_sleep` with work still running stops that work and sleeps.** The
+  owner: "if the agent calls sleep now, killing anything else running is fine".
+  The exit's "Exit and stop tasks" path, or the signal-first exit, does exactly
+  that. The runner logs what was running when it was stopped.
+- **The idle timeout alone never stops anything.** Background work other than the
+  inbox Monitor blocks a timeout-driven sleep. **Known limitation:** an agent that
+  leaves a never-ending job running, such as a dev server or a file watcher, and
+  never asks to sleep, stays awake and uses memory until someone stops the job or
+  the agent calls `request_sleep`. There is no cap. The owner's words: "we can just
+  [list] it as a limitation".
+
+**Asked for.** A new MCP tool, `request_sleep`, sets `sleep_requested`. The runner
+acts on it at the next `Stop`. In a session that is not a sleeper, the tool returns
+an error rather than doing nothing.
+
+### What counts as read: a delivered record in the transcript
+
+Review of PR #84 found three ways the earlier drafts lost mail: during the exit
+(Loss B), on the normal wake path (C), and between the idle decision and the
+snapshot (D). They had one cause: "read" meant "in the inbox before some snapshot",
+which says nothing about whether Claude ever received the message.
+
+**A message counts as read only if a delivered record in the session's transcript
+carries its `msg_id`.** Claude Code writes each session's conversation to a
+transcript file on disk; the hooks give its path. The transcript is fully written
+once Claude has exited, so it is checked only then: at sleep, and before a wake.
+
+**"Delivered" is exact, and does not mean "the id is somewhere in the file".**
+Measured in findings Test 7: for a Monitor event, Claude Code first writes a
+`queue-operation` / `enqueue` record holding the full event, `msg_id` included, and
+only then the `user` record that is the turn's actual input. An exit between the
+two would leave the id in the file with the message never received (Loss E). So the check parses the transcript as JSON lines and counts exactly three kinds of
+record as delivery:
+
+1. **A Monitor event delivered between turns:** a `user` record whose
+   `message.content` is a **string** starting with `<task-notification>`. The
+   `msg_id` is read from the event's JSON. A `user` record holding a `tool_result`
+   block is not a delivery, even when it contains the same text: an agent that
+   prints a transcript produces exactly that (measured in the review of PR #84).
+2. **A Monitor event delivered mid-turn:** an `attachment` record with `type ==
+   "queued_command"`, with the `msg_id` read from its `prompt`. Other attachment
+   types (`file`, `edited_text_file`, …) can carry msg ids from files and edits,
+   and are not deliveries.
+3. **A `recv_messages` result Claude actually received:** a `tool_result` paired by
+   `tool_use_id` with a `tool_use` of the spanreed `recv_messages` tool. The ids
+   are parsed **only from the paired `tool_result` block's `content`**, the text
+   Claude was given. The record's `message.content` is a list holding that block.
+   The block's `content` is a string, and all 2,539 real results measured had that
+   form. If it is ever a list of `text` blocks (the API allows it), they are
+   joined. Ids count only when that text is **complete `{"result":[…]}` JSON**. Reading
+   mail through the tool is reading it, so a message read this way after its
+   Monitor event was dropped is not replayed.
+
+   **Never `toolUseResult` or `mcpMeta`.** Those fields hold a clean copy of the
+   full result, and Claude never sees them. A recv result can be over the token
+   limit, in which case Claude got only `Error: result (N characters) exceeds
+   maximum allowed tokens…`. Or it can be persisted, in which case Claude got a
+   2 KB preview. Either way the complete id list is still in `mcpMeta`. The review
+   of PR #84 measured 561 of 2,539 real recv results like that (544 over the
+   limit, 10 previews, 7 errors). Counting their ids as read would mark mail read
+   that Claude never received. **A result that isn't complete JSON in
+   `message.content` counts as nothing.**
+
+**A candidate record counts only if the model actually ran on it.** That means a
+**non-synthetic assistant record** follows it with the candidate in its
+`parentUuid` chain: `model` is not `"<synthetic>"`, and there is no `error`.
+
+When the API call fails (rate limit, expired login, server error), Claude Code
+still writes the delivered record. It then writes a synthetic assistant record
+carrying the error, and the model never runs. The review of PR #84 measured 148
+real task-notification records answered only that way: 82 `rate_limit`, 36
+`authentication_failed`, 25 `server_error`, 5 other. Some fell off the
+conversation chain at a later compaction or resume. 19 were never seen by the
+model at all, including 18 bus messages during one weekly-limit window. Counting
+those as read is mail loss. A record answered only by a synthetic error counts as
+**unread**, and so does a complete `recv_messages` result followed only by one.
+
+Nothing else counts: never `queue-operation`, never a hidden structured copy of
+a tool result, and never a substring anywhere in a record. An id the agent wrote itself (an `in_reply_to`, a quoted id in a body, the
+agent grepping its own inbox) therefore doesn't count. The implementation's tests
+include a negative control for each excluded kind: enqueue-only, a `tool_result`
+that isn't from `recv_messages`, a non-`queued_command` attachment, an over-limit
+`recv_messages` result whose `mcpMeta` holds the ids, and a task-notification
+followed only by a synthetic `rate_limit` record. All must count as unread.
+
+**The one bounded duplicate, stated rather than hidden.** A message Claude saw
+only partly is replayed once. That covers only a 2 KB preview, or a full list the
+agent read through a separate tool call (a `cat` of the saved output file, say,
+which is a `tool_result` this rule ignores). That is the safe direction: the
+alternative is guessing it was read. It is the only case where "nothing is
+redelivered" doesn't hold.
+
+**This depends on `msg_id` being the first field of every inbox line.** Monitor
+events are truncated at about 514 characters (measured in the review of PR #84:
+9,448 of 10,178), and the id survives only because it comes first. That is now an
+invariant of the inbox format, and the check proves only that Claude saw a ~500
+character preview of the message, not its whole body. The full body is always one
+`recv_messages` call away, and the preview says so.
+
+**The transcript is not a promised API, so the check fails safe.** The hooks are
+documented to hand over `transcript_path`, but the record format inside is
+Claude Code's internal format and could change in any release. Whenever the
+transcript is **missing, unreadable, or contains none of the record kinds above**
+(as if the format had changed under us), every line after `read_through` counts as
+**unread**. The cost is a replay, so mail may be seen twice. The runner also sets
+`needs_input` with the reason, so the owner learns the check stopped working
+rather than finding out through duplicates. **In this fail-safe mode, step 4 does
+not relaunch and the poison bound does not count.** The agent sleeps with
+`needs_input`, and the backlog is replayed once per wake. Without this, every
+check would find everything unread and relaunch. Each relaunch would replay the
+whole backlog, so duplicates would grow roughly quadratically, and every line
+would end up in `skipped_lines` despite having been delivered. A format change can therefore cost
+duplicates, never lost mail. (Prompted by reports, on 2026-11-13, of claude.ai
+changing what its conversation exports and containers keep. That is a different
+product from Claude Code's local transcripts, which were still being written on
+kaladin the same day: 100 since 2026-11-11, including both test sessions. But it
+shows the format sits outside our control.)
+
+`first_unread_line()` walks the inbox from `read_through` and returns the first
+line whose `msg_id` has no delivered record. It builds the set of delivered ids
+**once per check**, in one pass over the transcript. A transcript grows without
+bound, so this is a full read each time, at sleep and at wake, never per line.
+
+**A line that never reaches a delivered record** (a corrupt line, or one the Monitor
+cannot deliver) would otherwise stop `first_unread_line()` forever: every idle cycle
+would relaunch and every wake would replay it. After **3** launches that fail to
+deliver the same line, the runner skips it and sets `needs_input`. The bound is
+defined carefully, because a careless version loses mail:
+
+- **Only launches where the model actually ran count:** a **non-synthetic
+  assistant record** was written during the launch. Neither hook activity nor a
+  growing transcript is evidence. A session with an expired login or a rate limit
+  stays up, fires `UserPromptSubmit`, and writes a full set of records for every
+  Monitor event, all answered by a synthetic error (measured in the review of PR
+  #84). A launch whose new assistant records are all synthetic `rate_limit`,
+  `authentication_failed` or `server_error` errors is a **failed wake**, not a
+  failed delivery, and doesn't count. Otherwise a rate-limit window would skip
+  backlog one message at a time, and those messages would never be delivered.
+- **Both kinds count:** a wake from `asleep`, and a step-4 relaunch. Counting only
+  wakes would never trip on the idle → step 4 → relaunch loop.
+- **The counter resets** whenever `first_unread_line()` moves past
+  `undelivered_line`.
+- **Skipped lines are kept durably** in `skipped_lines` (line, `msg_id`, when,
+  why). They don't go in `last_wake_failure`, which each new failure overwrites.
+  `sleeper list` shows them. A message is never skipped silently, and a skip is
+  never forgotten.
+
+**`read_through` starts at the end of the inbox** when the sleeper is created. A
+`retire X` followed by `create X` (`retire` leaves the inbox in place) must not
+replay X's whole history into a fresh conversation.
+
+The owner rejected an at-least-once design that could redeliver messages; this is
+the exact alternative.
+
+**Considered and declined: an explicit acknowledgement.** Every loss path found in
+review of PR #84 came from inferring "read" from the transcript. Each one is
+patched above, but the transcript is not a promised API. The alternative is for
+the agent to call an ack tool for each message it has handled, with only acked mail
+counting as read. That would make the transcript irrelevant, and with it API
+errors, truncated results and format changes. Its cost is a duplicate whenever the
+agent forgets to ack. The owner declined it for now ("Stick with B for now, I don't
+want the overhead"; #85). If the transcript format changes under us, this is the
+design to switch to, and the fail-safe above keeps that switch from being urgent.
+
+### Waking: wait until the agent is up, then deliver
+
+The owner's model: don't hand a message to a session that isn't ready for it. Wait
+until the agent is up, then deliver through the normal path.
+
+- **While asleep, mail just sits in the inbox.** There is no separate queue. The
+  inbox is already a file, and nothing reads it while the agent sleeps.
+- **On wake,** the runner computes `first_unread_line()` against the transcript,
+  which is complete because Claude isn't running. It records the result as
+  `read_through` and launches Claude.
+- **The sleeper's inbox Monitor starts from that line**, instead of from the end
+  of the file (`tail -n 0`). It is a spanreed reader, not bare `tail`. While
+  replaying, it **skips any line that already has a delivery** in the sense of
+  "What counts as read" (for example, a message read through `recv_messages` after
+  its Monitor event was dropped), then follows the file as usual. Without that filter, a replay would redeliver messages
+  Claude already had: the at-least-once behaviour the owner declined. Every unread message, including
+  the one that woke the agent, reaches Claude **the same way mail reaches an awake
+  agent**, and the Monitor starts the turns itself. No first prompt and no special
+  path. Non-sleeper sessions keep `tail -n 0`.
+- **A crash or reboot while awake** needs nothing extra. The next wake computes
+  `first_unread_line()` from the transcript, which is just as complete after a
+  crash.
+
+**Measured in findings Test 9:** a reader started mid-file does deliver mail that
+arrived while the agent was down. Today's `tail -n 0` never does. But the Monitor
+**batches** lines that arrive close together into one event and one turn. A batch
+is **cut off at about 3,000 characters**, and lines past the cut never reach Claude.
+So the replaying reader hands lines over **one at a time, with a pause between
+them** long enough that they arrive as separate events, rather than replaying
+the backlog in one burst. The read check doesn't depend on that pacing: a line cut
+from a batch has no delivered record, so it counts as unread and is delivered at
+the next relaunch or wake. Pacing only avoids that delay. (The same ~3 KB cut
+affects awake agents today; that is a separate bug, tracked on its own.)
+
+### Committing to sleep, in this order
+
+1. **Decide.** The last event is a `Stop`, and one of:
+   - **the idle timeout has passed and no background work is running** (other than
+     the inbox Monitor), or
+   - **the agent called `request_sleep`** and a short quiet period has passed with
+     no new turn starting. Background work does not block this path; it is stopped
+     at the exit (decision 7).
+
+   The quiet period gives a Monitor event queued behind the final turn time to
+   start its own turn.
+2. Under the lock, set `state=sleeping`. Senders who see `sleeping` append and do
+   nothing else; the runner checks the inbox after the exit.
+3. **End Claude** (see "The exit"), and wait until the process is actually gone.
+4. **Under the lock, compute `first_unread_line()`** against the now-complete
+   transcript. If any line is unread, whether it arrived before the decision, during
+   the exit, or a moment ago, **do not sleep**. Set **`state=awake`** and relaunch
+   Claude in the same runner and tmux session, with its Monitor starting from that
+   line. `generation` and `tmux_session` don't change.
+5. Otherwise set `state=asleep` and `read_through`, release the lock, and exit.
+
+### The exit
+
+Typing `/exit` into the pane is fragile. It depends on Claude Code's UI: the prompt
+must be empty, and the confirmation dialog must keep its current wording, its option
+order and its default ("Exit and stop tasks", measured in Test 6). Any of those can
+change in a Claude Code release. The runner has a sturdier option: Claude is its
+child, so it can end it with a **signal**, with no UI involved.
+
+Plan:
+- **Preferred: SIGTERM to Claude.** Measured in findings Test 8. Claude exits
+  within a second, its transcript is complete, and a resume restores the
+  conversation. No dialog is involved. As with `/exit`, it stops background work,
+  so on the idle-timeout path the "no background work" check must already have
+  passed.
+- **Escalation sends SIGKILL to the whole process group**, not just Claude's pid.
+  SIGKILL to the pid alone leaves the inbox Monitor's `tail` orphaned on the
+  inbox (Test 8).
+- **Fallback:** `/exit` plus the dialog.
+- **Either way,** the runner never trusts the keys it sent or the signal it raised.
+  It waits for the child process to exit, and if Claude is still running after a
+  grace period it escalates (dialog, then SIGTERM, then SIGKILL) and records which
+  step was needed.
+
+A signal skips the dialog, and the dialog is also the only complete list of
+background work (see "Going to sleep"). So picking the signal depends on the hooks
+being enough to answer "is anything else running?".
+
+### Why no message is lost
+
+Take a message M, appended to the inbox by its sender before the sender takes the
+lock.
+
+- **M is in the transcript.** Claude received it. Nothing is owed.
+- **M is not in the transcript, and its sender took the lock before step 4.** The
+  sender saw `awake` or `sleeping` and did nothing more. At step 4, under the lock
+  and against a complete transcript, M is unread, so the runner relaunches and the
+  Monitor delivers M.
+- **M's sender took the lock after step 5.** It saw `asleep` and launched a wake.
+  The wake computes `first_unread_line()`, which is at or before M, and the Monitor
+  starts there.
+
+So M always ends up in front of Claude. One case isn't immediate: if M's sender
+saw `sleeping` with a live runner, and the runner then dies before step 4, M waits
+in the inbox until **the next send** (or a `spanreed sleeper wake X`), because no
+daemon notices the death. M isn't stranded, since any later sender sees a dead
+runner and wakes the agent. But that is the latency the no-daemon decision pays. Because the check reads the transcript,
+nothing is redelivered that Claude already received. The same lock, plus the
+runner confirming it is the runner the record names, rules out a double wake. The
+argument holds **only if the transcript records every Monitor-delivered `msg_id`**,
+which is why that is measured first.
+
+### Liveness: where "the record decides" has to change
+
+For an agent with a sleeper record, presence comes from the record, not the pid.
+`is_stale(agent)` is a pure function of a registry row today. It becomes
+`is_present(agent, store)`, which also checks the sleeper record. Every current
+caller has to move to it:
+
+| site | what it does today | what changes for a sleeper |
+|---|---|---|
+| `store.py` `list_agents` | hides stale rows | asleep sleepers are listed |
+| `store.py` `prune_stale` | **permanently deletes** stale rows | must never delete a sleeper's row |
+| `store.py` `_resolve_recipient` (live-by-name) | name resolution among live agents | an asleep sleeper resolves by name |
+| `store.py` `delivery_verdict` | "session running, monitor tailing" | a new verdict: "queued; agent asleep, wake launched", or the wake failure |
+| `store.py` `register_agent(refuse_live_holder=True)` | refuses a live holder (#80) | an asleep sleeper holds its name |
+| `bridge.py` `_send_registry` | advertises only live rows | advertises asleep sleepers, so peers can mail them |
+| `cli.py` `list` LIVE/STALE | | shows `asleep`, `awake`, `sleeping`, or `awake (runner dead)` / `sleeping (runner dead)`, so a crashed sleeper never reads as healthy |
+| `codex_worker.py` name-held check | | a sleeper's name counts as held |
+
+### Environment
+
+A woken runner's environment is the tmux server's global environment. If no server
+is running, for example after a reboot, that comes from whichever process happens
+to start the server: possibly a cron job with a minimal PATH, an ssh-launched
+`conjoin --serve`, or a Claude session whose `CLAUDECODE`/`CLAUDE_*` variables would
+leak into the woken session. So **nothing about the launch depends on the tmux
+server's environment.** The runner starts from an **empty environment plus an
+allowlist**, not from what it inherited minus a few names. A denylist misses
+whatever variable leaks next. The allowlist:
+- **From the record:** `PATH` and the absolute paths to `claude` and `spanreed`, as
+  resolved by `create`.
+- **From the account, not the caller:** `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`,
+  `LANG` and `LC_*`, `TERM`.
+- **Set by spanreed:** `SPANREED_AGENT_NAME`, `SPANREED_SLEEPER=1`.
+
+Nothing else comes through, in particular any `CLAUDECODE`/`CLAUDE_*` variable or
+a sender's API credentials. **A known gap:** `SSH_AUTH_SOCK` is per-login, so a woken
+sleeper has no ssh agent, and `git push` over ssh from inside one fails. That is
+deliberate for now, and stated rather than hidden.
+
+### Across `conjoin`
+
+Mail to a sleeper on another machine needs nothing new in the bridge, apart from
+advertising asleep agents:
+1. The sender's machine queues it in the outbound inbox `agent-X@hostB.jsonl`, as for
+   any remote agent.
+2. The bridge forwards it, and the bridge on hostB writes it to `agent-X`'s inbox
+   with `append_message`.
+3. That write runs `wake_if_needed`, **on hostB**, where the tmux session, the login
+   and the sleeper record all live.
+4. If the link is down, the mail waits on the sending machine, and the reconnect
+   delivers it and wakes the sleeper. That is durable end to end.
+
+What changes:
+- **Peers must see asleep sleepers**, or no remote agent can address them.
+  `_send_registry` advertises them (see the liveness table), with the `asleep`/`awake`
+  marker. Peers mirror it, and an older peer ignores the field.
+- **The serve end of a bridge is ssh-launched**, so a wake it triggers starts tmux
+  from an ssh session. That is the `KillUserProcesses` risk under "Not verified yet",
+  and the environment allowlist exists for the same reason.
+- **A remote sender can't tell "asleep" from "awake" in its delivery verdict** beyond
+  what the last registry sync showed. It gets "queued for the bridge", which is true.
+
+**Managing a sleeper on another machine** (create, wake, sleep, retire and list it
+from here, e.g. `sleeper create --host`) is **wanted, and comes after local sleepers
+work end to end.** That is the owner's decision 8 on #85: "Get everything working
+first, then let's worry about it, but I would like support for management over
+conjoin". It is tracked in #86, along with the questions it raises: the carrier,
+authorizing a remote create, and resolving paths on the target host. It is not
+part of the first implementation. Mail already wakes a remote sleeper without it.
+
+### Commands
+
+```
+spanreed sleeper create --name X --cwd DIR [--permission-mode MODE] [--idle-timeout 15m]
+spanreed sleeper list
+spanreed sleeper attach X     # tmux attach to the current session-name generation
+spanreed sleeper wake X       # by hand; the same path a message takes
+spanreed sleeper sleep X      # by hand; the same as request_sleep
+spanreed sleeper retire X     # exits it if awake, deletes the record, removes the row
+```
+
+`create` refuses a name already held by a live agent or an existing sleeper (the
+same rule as #80). `retire` leaves the inbox file in place as history. Mail
+addressed to a retired sleeper is refused, like mail to any unknown agent.
+
+### Compatibility
+
+The `asleep`/`awake`/`sleeping` marker on a registry row is a **new field** with a default, and peers mirror it as-is,
+not a new `status` value; an older spanreed rejects any `status` it doesn't
+recognize when it reads the registry. `Agent` is a default pydantic model, so an
+older binary ignores the new field when reading.
+
+Older binaries still hurt sleepers in two ways:
+- An older binary decides liveness by pid, so sleepers disappear from its `list`
+  while asleep.
+- **An older binary that rewrites the registry on the same host** (`set_status`,
+  `prune`) **drops the marker or prunes the row.**
+
+The sleeper record is unaffected, so the row is restored at the next wake or
+`list`. But every host needs the new version.
+
+### Not verified yet
+
+Measured in Test 6: starting with `--session-id`, `/exit` and its confirmation
+dialog, resume restoring the conversation, resume keeping the permission mode when
+it is passed again, and the Monitor restarting on resume. Everything below is
+assumed until measured, and the implementation PR has to measure it:
+- ~~`UserPromptSubmit` firing for turns the inbox Monitor starts~~: **measured,
+  it does** (Test 7). So do `Stop` with the Monitor running, and an `idle_prompt`
+  notification 60 s after `Stop`.
+- **A `Notification` of type `permission_prompt` reaching a plugin hook.**
+- **`Stop` and `UserPromptSubmit` firing in a resumed session.**
+- **SessionStart `source: "resume"` re-registering the row.** The `resume` matcher
+  exists in `hooks.json`, but Test 6 didn't check the registry after the resume.
+- **`tmux new-session -d` from an ssh-launched serve end outliving the ssh
+  session:** **measured, it does** on kaladin and adolin (findings Test 10), where
+  `KillUserProcesses` is off. But a tmux **server** that an ssh-launched wake
+  starts stays in the ssh login's scope, so on a host with
+  `KillUserProcesses=yes` it would die with the session. **Open, the owner's
+  call:** start tmux via `systemd-run --user --scope` to rule that out
+  everywhere.
+- **A failed wake from a fresh launch.** Measured in the review of PR #84: a
+  session that stays up through an expired login or a rate limit answers every
+  turn with synthetic error records. Not measured: what a *fresh* `claude
+  --resume` does when the login is already expired. It may exit, or show a login
+  prompt; the runner has to handle both.
+- ~~A session ended by SIGTERM or SIGKILL resuming cleanly~~: **measured, it
+  does** (findings Test 8), at idle. Still open: a signal sent **mid-turn or
+  mid-write**, or with an `enqueue` pending.
+- ~~The transcript being complete after a signal~~: **measured complete** after
+  SIGINT, SIGTERM and SIGKILL at idle (Test 8). The negative control the
+  implementation needs is unchanged: a transcript holding only the `enqueue` for M
+  must report M unread.
+- ~~A replaying Monitor reader~~: **measured, it delivers** (findings Test 9).
+  Lines that arrive close together are batched, and a batch is cut off at ~3 KB;
+  see "Waking". Still open: how wide the batching window is, so the replay pacing
+  can be chosen.
+- ~~Background work other than the Monitor~~: **measured** (Test 11). The `Stop`
+  hook's `background_tasks` lists it; task hooks don't fire. Still open:
+  `background_tasks` in a resumed session.
+- **A Monitor event queued behind the final turn** starting its own turn within the
+  quiet period after `request_sleep`. If it doesn't, step 4 still catches the
+  message; this only decides whether a sleep is skipped or happens.
+- ~~How a resume behaves when mail arrived while the session was down~~:
+  **measured** (Test 9). With `tail -n 0` it's never delivered; started mid-file,
+  it is.
+- **The `/exit` confirmation dialog** keeping its current wording and default across
+  Claude Code versions. The runner must check that Claude actually exited, not trust
+  the keys it sent.
+- **The tmux session teardown window:** measured in the review of PR #84, which is
+  why session names include `generation`. Not yet measured with that fix in place.
+- **An expired login makes every wake on that machine fail at once.** Every
+  sleeper shares the one Claude Code login, and mail piles up behind all of them.
+  The design cannot fix this, since logging in needs a human. It can make it loud
+  and early:
+  - each failed wake records the reason and sets `needs_input`;
+  - `sleeper list` groups wake failures by reason, so "12 sleepers, one cause" reads
+    as one problem;
+  - while a sleeper is awake, the runner watches for Claude Code's "login expires in
+    N day(s)" warning and reports it before it starts failing wakes. That warning
+    is visible on screen (Test 6), but whether a hook or a file exposes it isn't
+    known yet.
+- **macOS**, where nothing here has been run. One point is not an open question:
+  the lock is `fcntl.flock`, the system call. macOS has it, and spanreed's registry
+  lock already depends on it there. The `flock` **command-line tool** isn't on
+  macOS, and nothing here uses it.
+
+
+- **Typing into a resumed session.** In Test 8 the first prompt sent with
+  `send-keys … Enter` to each resumed session was left unsubmitted. The design no
+  longer types prompts on wake, since the Monitor delivers. But anything that does
+  type must check the input was actually submitted.
 
 ## Cross-host: the SSH bus-bridge
 
