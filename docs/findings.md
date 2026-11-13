@@ -355,3 +355,160 @@ text Claude received counts.)
 fires `TaskCreated`; whether a session with a pending `enqueue` keeps it across an
 exit; anything about resume. The spike was exited with `/exit` and its registry row
 deregistered.
+
+## Test 8: Does a session ended by a signal keep its transcript and resume cleanly? (2026-11-13)
+
+Settles the open question under "The exit" in the sleepers design. Claude Code
+2.1.283, tmux 3.8, kaladin. One fresh session per signal (`m1-sigint`, `-sigterm`,
+`-sigkill`), each given a code word and one real bus message, whose Monitor turn
+completed before the signal. The signal was sent with `kill`, then the session was
+resumed with `--resume <uuid>`.
+
+- **Which process to signal.** tmux's `pane_pid` is the `claude` process itself
+  (the shell execs it). Its children are `spanreed-mcp` and the Monitor's `zsh -c …
+  spanreed inbox-watch`, with `tail -n 0 -F` under that.
+- **SIGINT and SIGTERM:** Claude exited within 0.5–1.0 s, taking the MCP server and
+  the Monitor with it, and the tmux session closed.
+- **SIGKILL:** Claude exited at once, but **the Monitor's `zsh` and `tail -F`
+  survived as orphans**, reparented to `systemd --user`. The orphan died on the
+  next inbox write. Until mail arrives, a SIGKILLed session leaves a stray `tail` on
+  its own inbox. **Escalation must kill Claude's whole process group**, not just
+  its pid.
+- **The transcript was complete after all three signals:**
+  - every line parses as JSON;
+  - the pre-signal copy is a byte-exact prefix of the post-signal file;
+  - each holds the `enqueue` plus the delivered `user` record for the message, and
+    the final assistant reply (`stop_reason: end_turn`).
+- **What each signal adds at exit:** SIGKILL adds nothing. SIGINT and SIGTERM add
+  `last-prompt`, `cost-state`, and a **"Monitor stopped" `user` record whose
+  content starts with `<task-notification>` but holds no inbox line and no
+  `msg_id`**. A read check that takes the `msg_id` from the event JSON correctly
+  counts nothing from it. It belongs in the check's negative tests.
+- **Resume restored the conversation every time**, with the code word and the last
+  `msg_id` recalled, appending to the same transcript. After SIGINT and SIGTERM,
+  resume writes a synthetic "No response requested." record in reply to that
+  Monitor-stopped record, and no real turn runs. The registry rows went from STALE
+  to LIVE with the new pids on resume. That is a side observation toward "the
+  `resume` SessionStart re-registers", though it doesn't show which component did
+  it.
+- **Surprising:** on each resumed session, the first prompt sent with `tmux
+  send-keys "<text>" Enter` sat in the input box unsubmitted, and a later `C-m`
+  submitted it. Anything that types into a resumed session must check the input
+  was actually submitted.
+
+Not measured: a signal mid-turn or mid-write (all were sent at idle); a signal with
+an `enqueue` pending; a Ctrl-C keystroke; macOS.
+
+## Test 9: Does an inbox Monitor started mid-file deliver mail that arrived while the session was down? (2026-11-13)
+
+Checks the "Waking" step of the sleepers design. Claude Code 2.1.283, kaladin,
+spike `m2-spike`. A wrapper `spanreed` went first on the spike's `PATH`, with the
+repo unchanged, so that `inbox-watch` ran `tail -n +N -F` from a chosen line. The
+spike was told to reply `GOT <msg_id>` from the Monitor event alone, without
+calling any tool.
+
+- **With today's `tail -n 0`, mail that arrived while the session was down is
+  never delivered.** Control: three messages B–D were sent while down. Then a
+  resume and 40 s of nothing.
+- **Started mid-file, the reader delivers it.** About 1 s after the resume, B, C and
+  D reached Claude as a Monitor event. Line 1, before the start line, was not
+  repeated. Afterwards the reader followed the file normally: a live message E
+  arrived as its own event and turn.
+- **Lines that arrive close together are batched into ONE event and ONE turn.** B–D
+  came as one `<event>` holding three JSON lines. That is not specific to replay:
+  two live messages sent 100 ms apart also batched. The transcript records it as
+  usual: `enqueue`, `dequeue`, then one `user` record holding all three `msg_id`s.
+- **A batch is cut off at about 3,000 characters, and lines past the cut never
+  reach Claude.** Eight ~310-character messages replayed as one event, cut at 3,015
+  characters (`...(truncated)`). The 8th message's `msg_id` is in **no** transcript
+  record. Claude only wrote "(event truncated — additional messages may exist)".
+  Nothing re-sent it in that session. That cut is separate from the ~514-character
+  truncation of stored records seen in the review of PR #84. **The same cut applies
+  to awake agents today** when several long messages land within a fraction of a
+  second.
+- **The "Monitor stopped" notice written at `/exit`** is the same kind of
+  no-`msg_id` `user` record seen in Test 8.
+
+Not measured: how wide the batching window is; whether the ~3 KB limit is in
+characters or bytes; replay through a filter that skips already-delivered lines;
+macOS.
+
+## Test 10: Does a tmux session started over ssh outlive the connection? (2026-11-13)
+
+In the sleepers design, mail arriving over `conjoin` is delivered by the bridge's
+ssh-launched serve end, which then runs `tmux new-session -d` to wake the sleeper.
+
+| | kaladin | adolin |
+|---|---|---|
+| systemd | 262 | 262 |
+| logind `KillUserProcesses` (live value) | false | false |
+| `Linger` | yes | yes |
+| tmux | 3.8 | 3.8 |
+
+- **adolin, real ssh.**
+  - **Fresh server:** no tmux server was running, so the ssh command started one,
+    and the session **survived** the ssh exit. But **the tmux server stayed inside
+    the ssh login's scope** (`session-137.scope`, then `active (abandoned)`).
+    Only the pane moved to its own `tmux-spawn-*.scope` under the user manager.
+  - **Existing server:** a server already running outside the ssh session (a
+    `systemd-run --user` unit) left nothing in the login scope, and the session
+    survived.
+- **kaladin, an approximation.** ssh into kaladin has no key auth, so each
+  launcher ran inside a transient `systemd-run --user --scope` instead. Both cases
+  survived. This exercises a user scope, not logind's end-of-session handling.
+- **What it means:** no extra handling is needed on these hosts today. But on a
+  host with `KillUserProcesses=yes`, a tmux server **started** by an ssh-launched
+  wake would be killed with the ssh session. That would happen on the first wake
+  after a reboot, if nothing else had started tmux. Starting tmux through
+  `systemd-run --user --scope` would avoid that on any host. That decision belongs
+  to the owner.
+
+Not measured: real ssh into kaladin; a host with `KillUserProcesses=yes` or no
+linger; whether a woken Claude survives its tmux server being killed; the Mac,
+which has no systemd or logind.
+
+## Test 11: What signals background work? (2026-11-13)
+
+Answers the open question under "Going to sleep" in the sleepers design. Claude
+Code 2.1.283, kaladin. The spike `m3-bgspike` ran in `bypassPermissions` with
+harmless `sleep`/`echo` only, and logging hooks on `Stop`, `StopFailure`,
+`SubagentStart`/`Stop`, `TaskCreated`/`Completed`, `Pre`/`PostToolUse`,
+`Notification` and `SessionEnd`, among others.
+
+- **The `Stop` hook's input lists all running background work** in a
+  `background_tasks` array, which Test 7 didn't log:
+  ```
+  {"id":"…","type":"shell","status":"running","command":"spanreed inbox-watch", …}
+  {"id":"…","type":"shell","status":"running","command":"sleep 240 && echo m3-long-done", …}
+  {"id":"…","type":"subagent","status":"running","agent_type":"general-purpose", …}
+  ```
+  **Monitors appear as `type: "shell"`**, the inbox Monitor included. Only
+  `command` (`spanreed inbox-watch`) tells it apart from a background shell.
+- **`TaskCreated` and `TaskCompleted` never fired** for a background shell. The
+  hooks docs tie them to the task-list tools, not to background work. A finishing
+  background shell instead **starts a turn** (`UserPromptSubmit` with a
+  `<task-notification>`, then `Stop`), which resets the idle clock.
+- **Subagents:** `SubagentStart`/`SubagentStop` fire, but a subagent can stop while
+  work it started is still running. That work stays in the main session's
+  `background_tasks`. So counting subagent starts and stops is not enough. There is
+  also a stray `SubagentStop` with an empty `agent_type` about 1–4 s after every
+  `Stop`, with no matching start.
+- **The exit dialog** lists the same work (Monitors labelled `monitor ·`):
+  ```
+  The following will stop when you exit:
+  monitor · Spanreed bus message arrived (one JSON line in yo…
+  shell · sleep 240 && echo m3-long-done
+  ❯ 1. Exit and stop tasks
+    2. Move to background and exit
+    3. Stay
+  ```
+  Esc cancels cleanly, and the background process survives. Typing `/exit` fires
+  no hook. **Option 2, "Move to background and exit", is new**, and was not
+  exercised.
+- **Idle with work running:** `Stop` fired with `sleep 240` running, and
+  `idle_prompt` followed exactly 60.0 s later. `Notification` carries no
+  `background_tasks`.
+
+Not measured: `background_tasks` in a resumed session; option 2; `session_crons`
+with a cron set. Cleanup: `/exit`, deregister, no `m3-` rows or `sr-m3-` sessions
+left.
