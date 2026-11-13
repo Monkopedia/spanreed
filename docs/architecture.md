@@ -700,6 +700,20 @@ invariant of the inbox format, and the check proves only that Claude saw a ~500
 character preview of the message, not its whole body. The full body is always one
 `recv_messages` call away, and the preview says so.
 
+**The transcript is not a promised API, so the check fails safe.** The hooks are
+documented to hand over `transcript_path`, but the record format inside is
+Claude Code's internal format and could change in any release. Whenever the
+transcript is **missing, unreadable, or contains none of the record kinds above**
+(as if the format had changed under us), every line after `read_through` counts as
+**unread**. The cost is a replay, so mail may be seen twice. The runner also sets
+`needs_input` with the reason, so the owner learns the check stopped working
+rather than finding out through duplicates. A format change can therefore cost
+duplicates, never lost mail. (Prompted by reports, on 2026-11-13, of claude.ai
+changing what its conversation exports and containers keep. That is a different
+product from Claude Code's local transcripts, which were still being written on
+kaladin the same day: 100 since 2026-11-11, including both test sessions. But it
+shows the format sits outside our control.)
+
 `first_unread_line()` walks the inbox from `read_through` and returns the first
 line whose `msg_id` has no delivered record. It builds the set of delivered ids
 **once per check**, in one pass over the transcript. A transcript grows without
