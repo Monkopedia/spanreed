@@ -466,8 +466,9 @@ session is down is never surfaced.)
 **Confirmed by the owner** in the spanreed session on 2026-11-13 ("1–5 confirmed, 6
 yes"). The confirmation is relayed verbatim on #85 (comment 6863746710) and was
 checked against the session transcript in the review of PR #84. It is not yet a
-comment from his own account. The background-work rule below was settled the
-same day, as decision 7 on #85.
+comment from his own account. The background-work rule under "Going to sleep" was
+settled the same day, as decision 7 on #85: `request_sleep` stops remaining work,
+and the idle timeout never does.
 
 - **Wake resumes the same conversation** (`claude --resume <session-id>`), never a
   fresh session. *The owner's request:* "Resume, if it doesn't resume there is no
@@ -515,6 +516,7 @@ source of truth, and it survives a reboot:
 | `read_through` | the inbox line number (and its `msg_id`, to detect a rewritten file) up to which every message is **found in the session's transcript**. The no-loss argument rests on this field; see "What counts as read" |
 | `sleep_requested` | set by `request_sleep` |
 | `last_wake_failure` | why the last wake did not come back, with a timestamp |
+| `undelivered_line`, `undelivered_attempts` | the first unread line and how many launches have failed to deliver it; see the poison-line bound |
 
 ### Who does what, without a daemon
 
@@ -565,8 +567,9 @@ and must never cost the sender its message.
 pane and exists only while the agent is awake. On start it takes the lock and
 **confirms it is the runner the record names**. If `generation` has moved on, or
 `runner_pid` is a different live process, it exits without launching anything. If
-the waker died before writing the record, the record still reads `asleep` with no
-live runner, and the runner claims it by writing its own pid. So a second
+the waker died before writing the record, the record has **no live runner**
+(`asleep`, or `awake`/`sleeping` with a stale `runner_pid`), and the runner claims
+it by writing its own pid. So a second
 concurrent wake starts a runner that sees the first one and exits.
 
 Once confirmed, it launches Claude as its child (recording `claude_pid`), watches
@@ -605,15 +608,21 @@ The dialog is the only source known to be complete, and it is also the fragile U
 described under "The exit". Which to rely on is decided by measurement in the
 implementation PR, not here.
 
-**Known limitation (owner's call, decision 7 on #85): background work that never
-finishes keeps the agent awake.** Examples are a dev server or a file watcher.
-Any background work other than the inbox Monitor blocks sleep, and that includes
-`request_sleep`. So a never-ending task keeps the sleeper awake, using memory,
-until someone stops the task. There is no cap, and nothing ends the work on the
-agent's behalf. "Let `request_sleep` end it" is deferred, not rejected. The
-owner's words: "That's fine for now, we can just it as a limitation". Whether these
-hooks fire as documented here, including for turns the inbox Monitor starts, is
-**not yet measured**, and idle detection depends on it.
+**Background work and the two ways to sleep** (owner's decision 7 on #85, which
+corrects an earlier misreading of his first reply):
+
+- **The agent is responsible for shutting down its own background work.** That is
+  the expectation, and the agent's instructions say so.
+- **`request_sleep` with work still running stops that work and sleeps.** The
+  owner: "if the agent calls sleep now, killing anything else running is fine".
+  The exit's "Exit and stop tasks" path, or the signal-first exit, does exactly
+  that. The runner logs what was running when it was stopped.
+- **The idle timeout alone never stops anything.** Background work other than the
+  inbox Monitor blocks a timeout-driven sleep. **Known limitation:** an agent that
+  leaves a never-ending job running, such as a dev server or a file watcher, and
+  never asks to sleep, stays awake and uses memory until someone stops the job or
+  the agent calls `request_sleep`. There is no cap. The owner's words: "we can just
+  [list] it as a limitation".
 
 **Asked for.** A new MCP tool, `request_sleep`, sets `sleep_requested`. The runner
 acts on it at the next `Stop`. In a session that is not a sleeper, the tool returns
@@ -635,16 +644,31 @@ once Claude has exited, so it is checked only then: at sleep, and before a wake.
 Measured in findings Test 7: for a Monitor event, Claude Code first writes a
 `queue-operation` / `enqueue` record holding the full event, `msg_id` included, and
 only then the `user` record that is the turn's actual input. An exit between the
-two would leave the id in the file with the message never received (Loss E). So the
-check:
-- parses the transcript as JSON lines, and accepts only `user` records, plus
-  `attachment` records for mail delivered mid-turn;
-- **never** counts `queue-operation`;
-- matches the `msg_id` inside the Monitor event text, **never** a substring
-  anywhere in the record.
+two would leave the id in the file with the message never received (Loss E). So the check parses the transcript as JSON lines and counts exactly three kinds of
+record as delivery:
 
-An id the agent wrote itself (an `in_reply_to`, a quoted id in a body, the agent
-grepping its own inbox) therefore doesn't count.
+1. **A Monitor event delivered between turns:** a `user` record whose
+   `message.content` is a **string** starting with `<task-notification>`. The
+   `msg_id` is read from the event's JSON. A `user` record holding a `tool_result`
+   block is not a delivery, even when it contains the same text: an agent that
+   prints a transcript produces exactly that (measured in the review of PR #84).
+2. **A Monitor event delivered mid-turn:** an `attachment` record with `type ==
+   "queued_command"`, with the `msg_id` read from its `prompt`. Other attachment
+   types (`file`, `edited_text_file`, …) can carry msg ids from files and edits,
+   and are not deliveries.
+3. **A `recv_messages` result:** a `tool_result` paired by `tool_use_id` with a
+   `tool_use` of the spanreed `recv_messages` tool, with the returned messages'
+   `msg_id`s parsed from the result. Reading mail through the tool is reading it.
+   Without this, a message read that way after its Monitor event was dropped
+   would be replayed, which is the at-least-once behaviour the owner declined.
+   The review of PR #84 found nine real ids in exactly this state: enqueued, never
+   delivered as an event, read through tool output.
+
+Nothing else counts: never `queue-operation`, and never a substring anywhere in a
+record. An id the agent wrote itself (an `in_reply_to`, a quoted id in a body, the
+agent grepping its own inbox) therefore doesn't count. The implementation's tests
+include a negative control for each excluded kind: enqueue-only, a `tool_result`
+that isn't from `recv_messages`, and a non-`queued_command` attachment.
 
 **This depends on `msg_id` being the first field of every inbox line.** Monitor
 events are truncated at about 514 characters (measured in the review of PR #84:
@@ -660,9 +684,11 @@ bound, so this is a full read each time, at sleep and at wake, never per line.
 
 **A line that never reaches a delivered record** (a corrupt line, or one the Monitor
 cannot deliver) would otherwise stop `first_unread_line()` forever: every idle cycle
-would relaunch and every wake would replay it. After **3** wakes that fail to
+would relaunch and every wake would replay it. After **3** launches that fail to
 deliver the same line, the runner skips it, records it in `last_wake_failure`, and
-sets `needs_input`. A message is never skipped silently.
+sets `needs_input`. A launch is either kind: a wake from `asleep`, or a step-4
+relaunch. Counting only wakes would never trip on the idle → step 4 → relaunch
+loop. A message is never skipped silently.
 
 **`read_through` starts at the end of the inbox** when the sleeper is created. A
 `retire X` followed by `create X` (`retire` leaves the inbox in place) must not
@@ -683,9 +709,9 @@ until the agent is up, then deliver through the normal path.
   `read_through` and launches Claude.
 - **The sleeper's inbox Monitor starts from that line**, instead of from the end
   of the file (`tail -n 0`). It is a spanreed reader, not bare `tail`. While
-  replaying, it **skips any line that already has a delivered record** (a message
-  read through `recv_messages`, say, while an earlier event was missed), then
-  follows the file as usual. Without that filter, a replay would redeliver messages
+  replaying, it **skips any line that already has a delivery** in the sense of
+  "What counts as read" (for example, a message read through `recv_messages` after
+  its Monitor event was dropped), then follows the file as usual. Without that filter, a replay would redeliver messages
   Claude already had: the at-least-once behaviour the owner declined. Every unread message, including
   the one that woke the agent, reaches Claude **the same way mail reaches an awake
   agent**, and the Monitor starts the turns itself. No first prompt and no special
@@ -700,10 +726,15 @@ live line doing so, not a replayed one.
 
 ### Committing to sleep, in this order
 
-1. **Decide.** The agent is idle, or has asked to sleep. The last event is a `Stop`,
-   no background work is running, and after `request_sleep` a short quiet period has
-   passed with no new turn starting. A Monitor event queued behind the final turn
-   gets that long to start its own turn.
+1. **Decide.** The last event is a `Stop`, and one of:
+   - **the idle timeout has passed and no background work is running** (other than
+     the inbox Monitor), or
+   - **the agent called `request_sleep`** and a short quiet period has passed with
+     no new turn starting. Background work does not block this path; it is stopped
+     at the exit (decision 7).
+
+   The quiet period gives a Monitor event queued behind the final turn time to
+   start its own turn.
 2. Under the lock, set `state=sleeping`. Senders who see `sleeping` append and do
    nothing else; the runner checks the inbox after the exit.
 3. **End Claude** (see "The exit"), and wait until the process is actually gone.
@@ -750,7 +781,11 @@ lock.
   The wake computes `first_unread_line()`, which is at or before M, and the Monitor
   starts there.
 
-So M always ends up in front of Claude. Because the check reads the transcript,
+So M always ends up in front of Claude. One case isn't immediate: if M's sender
+saw `sleeping` with a live runner, and the runner then dies before step 4, M waits
+in the inbox until **the next send** (or a `spanreed sleeper wake X`), because no
+daemon notices the death. M isn't stranded, since any later sender sees a dead
+runner and wakes the agent. But that is the latency the no-daemon decision pays. Because the check reads the transcript,
 nothing is redelivered that Claude already received. The same lock, plus the
 runner confirming it is the runner the record names, rules out a double wake. The
 argument holds **only if the transcript records every Monitor-delivered `msg_id`**,
@@ -771,7 +806,7 @@ caller has to move to it:
 | `store.py` `delivery_verdict` | "session running, monitor tailing" | a new verdict: "queued; agent asleep, wake launched", or the wake failure |
 | `store.py` `register_agent(refuse_live_holder=True)` | refuses a live holder (#80) | an asleep sleeper holds its name |
 | `bridge.py` `_send_registry` | advertises only live rows | advertises asleep sleepers, so peers can mail them |
-| `cli.py` `list` LIVE/STALE | | shows `asleep`, `awake`, or `awake (runner dead)`, so a crashed sleeper does not read as healthy |
+| `cli.py` `list` LIVE/STALE | | shows `asleep`, `awake`, `sleeping`, or `awake (runner dead)` / `sleeping (runner dead)`, so a crashed sleeper never reads as healthy |
 | `codex_worker.py` name-held check | | a sleeper's name counts as held |
 
 ### Environment
@@ -839,7 +874,7 @@ addressed to a retired sleeper is refused, like mail to any unknown agent.
 
 ### Compatibility
 
-The `asleep`/`awake` marker on a registry row is a **new field** with a default,
+The `asleep`/`awake`/`sleeping` marker on a registry row is a **new field** with a default, and peers mirror it as-is,
 not a new `status` value; an older spanreed rejects any `status` it doesn't
 recognize when it reads the registry. `Agent` is a default pydantic model, so an
 older binary ignores the new field when reading.

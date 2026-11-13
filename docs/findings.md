@@ -338,10 +338,14 @@ records hold the `msg_id`, in this order:
 
 So the id is in the transcript **before** Claude has received the message. A check
 for "read" must look for the delivered record, never just the id anywhere in the
-file. (The review of PR #84 measured the same across 21 local transcripts: 13,144
-Monitor-enqueued ids, every one later delivered, and 9,448 of 10,178 delivered
-events truncated at about 514 characters, with the `msg_id` surviving because it
-is the first field.)
+file. (The review of PR #84 measured the same across 21 local transcripts. It also found
+9,448 of 10,178 delivered events truncated at about 514 characters, with the
+`msg_id` surviving because it is the first field. An earlier round of that review
+said all 13,144 Monitor-enqueued ids were "later delivered". The stricter count
+from its next round **corrects that**: nine ids, five in one session and four in
+another, have an `enqueue` and **no** delivered record. Their only other appearance
+is in `tool_result` output. So a pending enqueue can simply be dropped, which is
+real, observed evidence that "read" must mean a delivered record.)
 
 **Not measured by this run:** whether a background shell command or a subagent
 fires `TaskCreated`; whether a session with a pending `enqueue` keeps it across an
