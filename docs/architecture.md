@@ -446,8 +446,9 @@ Resolved since:
 ## Sleepers: agents that sleep and wake on mail
 
 **Status: design, not built.** The resume mechanics it rests on are measured in
-[findings.md](findings.md#test-6-can-a-claude-session-in-tmux-be-exited-and-resumed-by-session-id-2026-11-13);
-everything else here is the plan.
+[findings.md](findings.md#test-6-can-a-claude-session-in-tmux-be-exited-and-resumed-by-session-id-2026-11-13).
+Everything else here is the plan. Anything not measured is listed under "Not
+verified yet" rather than stated as fact.
 
 A **sleeper** is a Claude Code session spanreed manages inside tmux. You create it
 with a name and a directory. When it goes idle, or asks to, its Claude process exits
@@ -457,18 +458,23 @@ when it goes idle.
 
 This is the case native cross-session messaging cannot cover: a session that isn't
 running can't receive a native message. A sleeper's inbox is a file, so mail waits,
-and arriving mail is what brings the agent back.
+and arriving mail is what brings the agent back. (Related: #35, mail sent while a
+session is down is never surfaced.)
 
-### Decisions (the owner's, 2026-11-13)
+### Decisions
+
+These are the owner's, quoted verbatim in #85. Until the
+owner confirms them there, read them as proposed.
 
 - **Wake resumes the same conversation** (`claude --resume <session-id>`), never a
-  fresh session. A sleeper that forgets everything between wakes has no value.
+  fresh session.
 - **The permission mode is chosen at create and kept for the agent's whole life.**
-  It is stored in the sleeper record and passed on every resume. Without that, a
-  resumed session would start in the default mode, not the mode the agent was
-  created with.
+  It is stored in the sleeper record and passed on every launch.
 - **No persistent spanreed process.** Every job a daemon would do falls to
-  something that already runs at the moment it's needed (see "Who does what").
+  something already running at the moment it's needed (see "Who does what"). This
+  is a deliberate departure from leaving the question open:
+  `docs/open-questions.md` still lists daemon lifecycle in general as undecided,
+  and this decision covers sleepers only.
 
 ### The sleeper record
 
@@ -477,115 +483,171 @@ source of truth, and it survives a reboot:
 
 | field | meaning |
 |---|---|
-| `name`, `agent_id` | `agent_id` is `agent-<name>`, the same rule as `SPANREED_AGENT_NAME`, validated by `validate_agent_id` |
+| `name`, `agent_id` | `agent_id` is `agent-<name>`, validated by `validate_agent_id` |
 | `cwd` | the directory Claude runs in |
-| `session_id` | a UUID chosen at create and passed as `--session-id`, then `--resume` on every wake |
+| `session_id` | a UUID chosen at create; `--session-id` on the first launch, `--resume` after that |
 | `permission_mode` | fixed at create; passed on every launch |
 | `idle_timeout_s` | default 900 (15 min), set per sleeper |
-| `state` | `awake` or `asleep` |
-| `runner_pid`, `runner_pid_start` | the runner (below) while awake; how a crashed or rebooted runner is told apart from a live one |
-| `slept_after_msg_id` | the last inbox message the agent had when it went to sleep; see "Mail that arrives while asleep" |
-| `sleep_requested` | set by the `request_sleep` tool |
-| `last_wake_failure` | why the last wake did not come back, if it didn't |
+| `claude_path`, `spanreed_path`, `path_env` | resolved at create and used for every launch; see "Environment" |
+| `state` | `asleep` or `awake` |
+| `generation` | incremented on every wake; part of the tmux session name |
+| `tmux_session` | `spanreed-<name>-<generation>` for the current wake |
+| `runner_pid`, `runner_pid_start` | written by the waker under the lock, from tmux's pane pid; confirmed by the runner itself |
+| `claude_pid`, `claude_pid_start` | written by the runner once it has launched Claude |
+| `slept_after_msg_id` | see "Going to sleep"; this definition is what the race argument depends on |
+| `sleep_requested` | set by `request_sleep` |
+| `last_wake_failure` | why the last wake did not come back, with a timestamp |
 
 ### Who does what, without a daemon
 
-**Liveness.** A registry row today is present only while its pid is alive. For an
-agent with a sleeper record, **the record decides instead**: the row is present
-while the record exists, awake or asleep. Retiring the sleeper (deleting the
-record) is the only way it leaves the bus. `list` shows `asleep` / `awake`.
-Nothing has to be running for an asleep agent to stay visible. That includes after
-a reboot, because the record is on disk.
+**Waking is done by whoever delivers the mail.** Only two paths write an inbox:
+`StateStore.send_message` (the CLI, the MCP tools, the Codex worker, and through
+them scripts and cron) and `StateStore.append_message` (the `conjoin` bridge). Both
+append the message **first**, then call `wake_if_needed(recipient)`. That function:
 
-**Waking is done by whoever delivers the mail.** Every inbox write goes through the
-store (`send_message`, and `append_message` for the cross-host bridge), so that is
-where the wake goes. After appending, if the recipient has a sleeper record whose
-state is `asleep`, the store takes the sleeper's lock, re-reads the state and, if it
-is still asleep, launches the runner in a new detached tmux session
-(`spanreed-<name>`), marks it `awake`, and releases the lock. `tmux new-session -d`
-returns at once, so the sender is not held up, and the tmux server owns the session,
-so it outlives the sending process (an MCP call, a CLI command, `conjoin`). Mail
-arriving over `conjoin` from another machine therefore wakes a local sleeper with no
-extra work.
+1. Returns at once if the recipient has no sleeper record. It also does nothing
+   when the bridge's `append_message` dedupes a message it already had, since no
+   new mail arrived.
+2. Takes the sleeper's lock (`<state>/sleepers/<name>.lock`, flock).
+3. Decides **under the lock** whether a wake is needed. It is needed when `state ==
+   asleep`, **or** when `state == awake` but the runner is dead (pid gone, or its
+   start time no longer matches). The second case covers a crash or a reboot while
+   awake. Checking only `state == asleep` would leave a crashed sleeper unwakeable.
+4. If the runner is dead but `claude_pid` is still alive (an orphaned Claude whose
+   runner died), it does **not** resume. Two Claude processes on one conversation
+   is worse than a stalled agent. It records `last_wake_failure` and sets the bus
+   status to `needs_input`.
+5. Otherwise it increments `generation` and launches the runner in a **new detached
+   tmux session named `spanreed-<name>-<generation>`**, using `tmux new-session -d
+   -P -F '#{pane_pid}'` so it gets the pane's pid back. It writes `state=awake`,
+   `tmux_session`, `runner_pid` and `runner_pid_start`, then releases the lock.
 
-**The runner** is a small spanreed process that lives inside the tmux pane and
-exists only while the agent is awake: `spanreed sleeper _run <name>`. It:
+The session name is new on every wake for a reason: the previous runner's session
+can still exist for a moment after it has marked itself asleep (the measured "Loss
+A" in the review of PR #84). A fixed name made the next wake fail with `duplicate
+session`, and that mail went unread. `spanreed sleeper attach X` finds the current
+session name for you.
 
-- launches Claude as its child, with `SPANREED_AGENT_NAME=<name>`, `--resume
-  <session-id>` (or `--session-id` on the very first launch), and the recorded
-  `--permission-mode`;
-- watches for idleness and for `sleep_requested`, and puts Claude to sleep when
-  either is due (below);
-- when Claude exits, for any reason, runs the sleep transition under the lock;
-- if Claude exits almost at once on a wake (`claude` missing from `PATH`, an
-  expired login, a deleted transcript), records `last_wake_failure`, sets the
-  agent's bus status to `needs_input`, and does **not** retry in a loop. A wake
-  that silently never comes back is the failure this design most has to avoid.
+**If the wake fails, the send still succeeds.** For example: no `tmux` on the
+sender's PATH, a sandbox that can't reach the tmux socket, or `tmux` exiting
+non-zero. The message is already in the inbox. The failure is recorded in
+`last_wake_failure`, the bus status goes to `needs_input`, and the mail waits for
+the next send or a `spanreed sleeper wake X`. A wake failure must never be silent,
+and must never cost the sender its message.
 
-So the only processes involved are Claude itself and its runner, and both exist
-only while the agent is awake.
+**The runner** (`spanreed sleeper _run <name> <generation>`) runs inside the tmux
+pane and exists only while the agent is awake. On start it takes the lock and
+**confirms it is the runner the record names**. If `generation` has moved on, or
+`runner_pid` is a different live process, it exits without launching anything. If
+the waker died before writing the record, the record still reads `asleep` with no
+live runner, and the runner claims it by writing its own pid. So a second
+concurrent wake starts a runner that sees the first one and exits.
+
+Once confirmed, it launches Claude as its child (recording `claude_pid`), watches
+for idleness and `sleep_requested`, and runs the sleep transition when Claude exits
+for any reason.
+
+If Claude exits almost at once on a wake (`claude` missing, an expired login, a
+deleted transcript), the runner records `last_wake_failure`, sets `needs_input`,
+and does **not** retry in a loop. (That such failures do exit "almost at once" is
+an assumption; see "Not verified yet".)
 
 ### Going to sleep
 
-**Idle is measured from hooks, not from the screen.** Claude Code fires
-`UserPromptSubmit` when a turn starts (including turns the inbox Monitor starts) and
-`Stop` when it ends. A `Notification` of type `permission_prompt` means Claude is
-waiting on a human. The plugin's hooks for these call `spanreed sleeper _activity
-<event>`, but only in a sleeper session; in any other session they do nothing. That
-writes the last event and its time to `<state>/sleepers/<name>.activity`.
-
-The runner treats the agent as idle when the last event is `Stop` and more than
-`idle_timeout_s` has passed. **A turn in progress never counts as idle, and neither
-does a pending permission prompt.** A permission prompt also sets the bus status to
-`needs_input`, so a stuck sleeper is visible.
+**Idle detection.** The plugin's hooks for `UserPromptSubmit`, `Stop` and
+`Notification` call `spanreed sleeper _activity <event>`, but only in a sleeper
+session; elsewhere they do nothing. That writes the last event and its time to
+`<state>/sleepers/<name>.activity`. The runner treats the agent as idle when the
+last event is `Stop` and more than `idle_timeout_s` has passed. A pending
+`permission_prompt` also counts as not idle, and sets `needs_input`. Whether these
+hooks fire as documented here, including for turns the inbox Monitor starts, is
+**not yet measured**, and idle detection depends on it.
 
 **Asked for.** A new MCP tool, `request_sleep`, sets `sleep_requested`. The runner
-acts on it at the next `Stop`, so the agent finishes its reply first. In a session
-that is not a sleeper, the tool returns an error rather than doing nothing.
+acts on it at the next `Stop`. In a session that is not a sleeper, the tool returns
+an error rather than doing nothing.
 
-**The exit.** The runner clears the prompt line and types `/exit`. Claude Code then
-**asks for confirmation**, because the inbox Monitor is a background task (measured;
-see findings Test 6), and the runner confirms. If Claude is still running after a
-grace period, the runner sends SIGTERM to its child. Whether a session killed that
-way resumes cleanly is **not yet measured**.
+**Committing to sleep, in this order:**
 
-### The race: mail arriving while going to sleep
+1. Under the lock, the runner records **`slept_after_msg_id` = the id of the last
+   message in the inbox at this moment**, before anything else happens. Any message
+   after it is treated as possibly unread, even if it arrives while Claude is still
+   on screen. (Taking the snapshot after the exit instead loses a message that
+   lands during the exit dialog. That was "Loss B" in the review of PR #84.)
+2. It types `/exit`, and confirms the background-task dialog that Claude Code shows
+   because the inbox Monitor is running (measured, findings Test 6). If Claude is
+   still running after a grace period, it sends SIGTERM to its child.
+3. After Claude has exited, it takes the lock, sets `state=asleep`, and re-reads the
+   inbox. If anything is newer than `slept_after_msg_id`, it does not sleep: it
+   resumes Claude straight away in the same session, which counts as a fresh wake
+   for the record.
+4. It releases the lock and exits. Its tmux session then closes, and the next wake
+   uses a new session name anyway.
 
-Both transitions take the sleeper's lock (`<state>/sleepers/<name>.lock`, flock):
+### Why no message is lost
 
-- **sleep:** after Claude has exited, the runner takes the lock, sets `state=asleep`
-  and `slept_after_msg_id`, then re-reads the inbox. If anything newer than
-  `slept_after_msg_id` is there, it resumes Claude straight away instead of exiting.
-- **wake:** the sender appends the mail first, then takes the lock and checks the
-  state.
+Take a message M, appended by its sender before the sender takes the lock.
 
-Any message lands in one of two places. Either its sender saw `awake` (the runner
-was still up), so it was written before the runner's re-read under the lock and
-the runner sees it. Or its sender saw `asleep`, so the sender launches the wake.
-**No message can arrive in between and be left unread with the agent asleep.** The
-same lock prevents a double wake: two senders that both see `asleep` serialize, and
-the second one sees `awake`.
+- **M was appended before step 1.** Then M is at or before `slept_after_msg_id`. It
+  was in the inbox while Claude was running, and the inbox Monitor reported it.
+  Claude handling it is exactly what not-yet-idle means. (Whether Claude actually
+  acted on it is the agent's business, not the bus's.)
+- **M was appended after step 1, and its sender took the lock before step 3.** The
+  sender saw `awake` with a live runner, so it did nothing. M is newer than
+  `slept_after_msg_id` and is in the inbox before step 3's re-read under the lock,
+  so the runner sees it and resumes instead of sleeping.
+- **M's sender took the lock after step 3.** It saw `asleep` and launched a wake,
+  under a new session name, so a still-closing previous session can't block it.
 
-A runner that died without running the sleep transition (a crash, or a reboot while
-awake) leaves `state=awake` with a dead `runner_pid`. Wake treats that as asleep.
+The same lock, plus the runner confirming it is the runner the record names, rules
+out a double wake.
 
 ### Mail that arrives while asleep
 
-The inbox Monitor starts with `tail -n 0`, so on a resume it would never see the
-mail that arrived while the agent was asleep, including the message that woke it.
-On `SessionStart` with `source: "resume"` in a sleeper, the hook adds a line to the
+The inbox Monitor starts with `tail -n 0`, so on a resume it would never see mail
+that arrived while the agent was asleep, including the message that woke it. On
+`SessionStart` with `source: "resume"` in a sleeper, the hook adds a line to the
 agent's context: how many messages arrived after `slept_after_msg_id`, and the exact
 `recv_messages(agent_id, since_msg_id=...)` call that reads them.
+
+### Liveness: where "the record decides" has to change
+
+For an agent with a sleeper record, presence comes from the record, not the pid.
+`is_stale(agent)` is a pure function of a registry row today. It becomes
+`is_present(agent, store)`, which also checks the sleeper record. Every current
+caller has to move to it:
+
+| site | what it does today | what changes for a sleeper |
+|---|---|---|
+| `store.py` `list_agents` | hides stale rows | asleep sleepers are listed |
+| `store.py` `prune_stale` | **permanently deletes** stale rows | must never delete a sleeper's row |
+| `store.py` `_resolve_recipient` (live-by-name) | name resolution among live agents | an asleep sleeper resolves by name |
+| `store.py` `delivery_verdict` | "session running, monitor tailing" | a new verdict: "queued; agent asleep, wake launched", or the wake failure |
+| `store.py` `register_agent(refuse_live_holder=True)` | refuses a live holder (#80) | an asleep sleeper holds its name |
+| `bridge.py` `_send_registry` | advertises only live rows | advertises asleep sleepers, so peers can mail them |
+| `cli.py` `list` LIVE/STALE | | shows `asleep`, `awake`, or `awake (runner dead)`, so a crashed sleeper does not read as healthy |
+| `codex_worker.py` name-held check | | a sleeper's name counts as held |
+
+### Environment
+
+A woken runner's environment is the tmux server's global environment. If no server
+is running, for example after a reboot, that comes from whichever process happens
+to start the server: possibly a cron job with a minimal PATH, an ssh-launched
+`conjoin --serve`, or a Claude session whose `CLAUDECODE`/`CLAUDE_*` variables would
+leak into the woken session. So **nothing about the launch depends on the tmux
+server's environment.** `create` resolves `claude_path`, `spanreed_path` and the
+PATH to use, and stores them in the record. Every launch runs with those set
+explicitly and with `CLAUDECODE` and `CLAUDE_*` unset.
 
 ### Commands
 
 ```
 spanreed sleeper create --name X --cwd DIR [--permission-mode MODE] [--idle-timeout 15m]
 spanreed sleeper list
+spanreed sleeper attach X     # tmux attach to the current session-name generation
 spanreed sleeper wake X       # by hand; the same path a message takes
 spanreed sleeper sleep X      # by hand; the same as request_sleep
 spanreed sleeper retire X     # exits it if awake, deletes the record, removes the row
-tmux attach -t spanreed-X     # to watch or take over an awake sleeper
 ```
 
 `create` refuses a name already held by a live agent or an existing sleeper (the
@@ -595,24 +657,46 @@ addressed to a retired sleeper is refused, like mail to any unknown agent.
 ### Compatibility
 
 The `asleep`/`awake` marker on a registry row is a **new field** with a default,
-not a new `status` value. An older spanreed rejects any `status` it doesn't
-recognize when it reads the registry. Older versions also decide liveness by pid
-alone, so on a host running an older spanreed, sleepers simply disappear from the
-list while asleep. Every host needs the new version for sleepers to be visible
-everywhere.
+not a new `status` value; an older spanreed rejects any `status` it doesn't
+recognize when it reads the registry. `Agent` is a default pydantic model, so an
+older binary ignores the new field when reading.
 
-### Not verifiable yet, or deliberately open
+Older binaries still hurt sleepers in two ways:
+- An older binary decides liveness by pid, so sleepers disappear from its `list`
+  while asleep.
+- **An older binary that rewrites the registry on the same host** (`set_status`,
+  `prune`) **drops the marker or prunes the row.**
 
-- **SIGTERM as the exit fallback:** does a session killed that way resume cleanly?
-- **The `/exit` confirmation dialog is Claude Code UI**, and its wording and default
-  can change between versions. The runner should check that Claude actually exited,
-  rather than trusting the keys it sent.
-- **An expired login makes every wake fail.** The design reports that loudly; it
+The sleeper record is unaffected, so the row is restored at the next wake or
+`list`. But every host needs the new version.
+
+### Not verified yet
+
+Measured in Test 6: starting with `--session-id`, `/exit` and its confirmation
+dialog, resume restoring the conversation, resume keeping the permission mode when
+it is passed again, and the Monitor restarting on resume. Everything below is
+assumed until measured, and the implementation PR has to measure it:
+
+- **`UserPromptSubmit` firing for turns the inbox Monitor starts.** Idle detection
+  depends on it.
+- **A `Notification` of type `permission_prompt` reaching a plugin hook.**
+- **`Stop` and `UserPromptSubmit` firing in a resumed session.**
+- **SessionStart `source: "resume"` re-registering the row.** The `resume` matcher
+  exists in `hooks.json`, but Test 6 didn't check the registry after the resume.
+- **`tmux new-session -d` started by an MCP server, the CLI or an ssh-launched
+  bridge outliving that process.** systemd-logind's `KillUserProcesses=yes` would
+  kill a tmux server started from an ssh session.
+- **A failed wake** (missing binary, expired login, deleted transcript) making
+  Claude exit quickly enough for the runner to detect.
+- **A session ended by SIGTERM** resuming cleanly.
+- **The `/exit` confirmation dialog** keeping its current wording and default across
+  Claude Code versions. The runner must check that Claude actually exited, not trust
+  the keys it sent.
+- **The tmux session teardown window:** measured in the review of PR #84, which is
+  why session names include `generation`. Not yet measured with that fix in place.
+- **An expired login** makes every wake fail. The design reports that loudly; it
   does not fix it.
-- **macOS:** tmux and `flock` both exist there, but none of this has been run on the
-  Mac.
-- **Hooks in a resumed session:** the hooks are documented to fire, but this hasn't
-  been measured in a resumed sleeper yet.
+- **macOS**, where nothing here has been run.
 
 ## Cross-host: the SSH bus-bridge
 
