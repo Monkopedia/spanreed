@@ -492,8 +492,11 @@ and the idle timeout never does.
   love at least once". The transcript check was the author's proposal, which he
   accepted ("Yeah"). See "What counts as read".
 
+- **Managing sleepers across `conjoin` is wanted, after local sleepers work.**
+  This is decision 8, tracked in #86. See "Across `conjoin`".
+
 Also the author's, for the owner to see: no ssh agent in a woken sleeper (see
-"Environment"), no cross-host create/wake/retire in v1, and a signal-first exit.
+"Environment"), and a signal-first exit.
 
 ### The sleeper record
 
@@ -853,9 +856,13 @@ What changes:
 - **A remote sender can't tell "asleep" from "awake" in its delivery verdict** beyond
   what the last registry sync showed. It gets "queued for the bridge", which is true.
 
-Deliberately not in v1: **creating, waking or retiring a sleeper on another
-machine** (`sleeper create --host`, and so on). Mail already wakes a remote sleeper,
-and creating one is a deliberate act you do on the machine it will run on.
+**Managing a sleeper on another machine** (create, wake, sleep, retire and list it
+from here, e.g. `sleeper create --host`) is **wanted, and comes after local sleepers
+work end to end.** That is the owner's decision 8 on #85: "Get everything working
+first, then let's worry about it, but I would like support for management over
+conjoin". It is tracked in #86, along with the questions it raises: the carrier,
+authorizing a remote create, and resolving paths on the target host. It is not
+part of the first implementation. Mail already wakes a remote sleeper without it.
 
 ### Commands
 
