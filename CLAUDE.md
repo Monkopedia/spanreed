@@ -64,4 +64,4 @@ docs/              architecture, protocol, findings, open questions
 
 ## Git workflow
 
-**Changes land through pull requests**, each sent to an independent reviewer dispatched over the spanreed bus. That's the cross-session review this project was built for, now in use. Every change since 0.1.0 has landed as a PR, though not every PR got its review (#60 merged without one, and the PR says so). Which changes need the owner's signoff before merging is set by the fleet's review policy, not here.
+**Changes land through pull requests**, each sent to an independent reviewer dispatched over the spanreed bus. That's the cross-session review this project was built for, now in use. Every change since 0.1.0 has landed as a PR, though not every PR was approved before merging (#60 merged without an approving review, and the PR's comments say so). Which changes need the owner's signoff before merging is set by the fleet's review policy, not here.
