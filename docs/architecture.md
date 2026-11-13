@@ -519,7 +519,8 @@ source of truth, and it survives a reboot:
 | `read_through` | the inbox line number (and its `msg_id`, to detect a rewritten file) up to which every message is **found in the session's transcript**. The no-loss argument rests on this field; see "What counts as read" |
 | `sleep_requested` | set by `request_sleep` |
 | `last_wake_failure` | why the last wake did not come back, with a timestamp |
-| `undelivered_line`, `undelivered_attempts` | the first unread line and how many launches have failed to deliver it; see the poison-line bound |
+| `undelivered_line`, `undelivered_attempts` | the first unread line, and how many launches **where Claude came up** have failed to deliver it; see the poison-line bound |
+| `skipped_lines` | every line the poison bound has skipped: line, `msg_id`, when, why. Never overwritten |
 
 ### Who does what, without a daemon
 
@@ -603,9 +604,10 @@ a sleeper, so it is the one background task that does **not** block sleep; anyth
 else does. Two possible sources for "is anything else running":
 - **Hooks** (`SubagentStart`/`SubagentStop`, `TaskCreated`/`TaskCompleted`). Whether
   these cover background shell commands is unknown.
-- **The exit dialog itself**, which lists every background task. If it lists
-  anything besides the inbox Monitor, the runner cancels the exit (Esc) and treats
-  the agent as busy.
+- **The exit dialog itself**, which lists every background task. **On the
+  idle-timeout path**, if it lists anything besides the inbox Monitor, the runner
+  cancels the exit (Esc) and treats the agent as busy. On the `request_sleep` path
+  it takes "Exit and stop tasks" instead (decision 7).
 
 The dialog is the only source known to be complete, and it is also the fragile UI
 described under "The exit". Which to rely on is decided by measurement in the
@@ -659,19 +661,37 @@ record as delivery:
    "queued_command"`, with the `msg_id` read from its `prompt`. Other attachment
    types (`file`, `edited_text_file`, …) can carry msg ids from files and edits,
    and are not deliveries.
-3. **A `recv_messages` result:** a `tool_result` paired by `tool_use_id` with a
-   `tool_use` of the spanreed `recv_messages` tool, with the returned messages'
-   `msg_id`s parsed from the result. Reading mail through the tool is reading it.
-   Without this, a message read that way after its Monitor event was dropped
-   would be replayed, which is the at-least-once behaviour the owner declined.
-   The review of PR #84 found nine real ids in exactly this state: enqueued, never
-   delivered as an event, read through tool output.
+3. **A `recv_messages` result Claude actually received:** a `tool_result` paired by
+   `tool_use_id` with a `tool_use` of the spanreed `recv_messages` tool. The ids
+   are parsed **only from the result's `message.content`**, the text Claude was
+   given, and only when that text is **complete `{"result":[…]}` JSON**. Reading
+   mail through the tool is reading it, so a message read this way after its
+   Monitor event was dropped is not replayed.
 
-Nothing else counts: never `queue-operation`, and never a substring anywhere in a
-record. An id the agent wrote itself (an `in_reply_to`, a quoted id in a body, the
+   **Never `toolUseResult` or `mcpMeta`.** Those fields hold a clean copy of the
+   full result, and Claude never sees them. A recv result can be over the token
+   limit, in which case Claude got only `Error: result (N characters) exceeds
+   maximum allowed tokens…`. Or it can be persisted, in which case Claude got a
+   2 KB preview. Either way the complete id list is still in `mcpMeta`. The review
+   of PR #84 measured 561 of 2,539 real recv results like that (544 over the
+   limit, 10 previews, 7 errors). Counting their ids as read would mark mail read
+   that Claude never received. **A result that isn't complete JSON in
+   `message.content` counts as nothing.**
+
+Nothing else counts: never `queue-operation`, never a hidden structured copy of
+a tool result, and never a substring anywhere in a record. An id the agent wrote itself (an `in_reply_to`, a quoted id in a body, the
 agent grepping its own inbox) therefore doesn't count. The implementation's tests
 include a negative control for each excluded kind: enqueue-only, a `tool_result`
-that isn't from `recv_messages`, and a non-`queued_command` attachment.
+that isn't from `recv_messages`, a non-`queued_command` attachment, and an
+over-limit `recv_messages` result whose `mcpMeta` holds the ids. All must count
+as unread.
+
+**The one bounded duplicate, stated rather than hidden.** A message Claude saw
+only partly is replayed once. That covers only a 2 KB preview, or a full list the
+agent read through a separate tool call (a `cat` of the saved output file, say,
+which is a `tool_result` this rule ignores). That is the safe direction: the
+alternative is guessing it was read. It is the only case where "nothing is
+redelivered" doesn't hold.
 
 **This depends on `msg_id` being the first field of every inbox line.** Monitor
 events are truncated at about 514 characters (measured in the review of PR #84:
@@ -688,10 +708,22 @@ bound, so this is a full read each time, at sleep and at wake, never per line.
 **A line that never reaches a delivered record** (a corrupt line, or one the Monitor
 cannot deliver) would otherwise stop `first_unread_line()` forever: every idle cycle
 would relaunch and every wake would replay it. After **3** launches that fail to
-deliver the same line, the runner skips it, records it in `last_wake_failure`, and
-sets `needs_input`. A launch is either kind: a wake from `asleep`, or a step-4
-relaunch. Counting only wakes would never trip on the idle → step 4 → relaunch
-loop. A message is never skipped silently.
+deliver the same line, the runner skips it and sets `needs_input`. The bound is
+defined carefully, because a careless version loses mail:
+
+- **Only launches where Claude actually came up count:** a hook activity was
+  recorded, or the transcript grew. A launch that fails at once (expired login,
+  missing `claude`) is a **failed wake**, not a failed delivery, and doesn't count.
+  Otherwise an expired login would skip one backlog message per three sends, and
+  those messages would never be delivered after the login was fixed.
+- **Both kinds count:** a wake from `asleep`, and a step-4 relaunch. Counting only
+  wakes would never trip on the idle → step 4 → relaunch loop.
+- **The counter resets** whenever `first_unread_line()` moves past
+  `undelivered_line`.
+- **Skipped lines are kept durably** in `skipped_lines` (line, `msg_id`, when,
+  why). They don't go in `last_wake_failure`, which each new failure overwrites.
+  `sleeper list` shows them. A message is never skipped silently, and a skip is
+  never forgotten.
 
 **`read_through` starts at the end of the inbox** when the sleeper is created. A
 `retire X` followed by `create X` (`retire` leaves the inbox in place) must not

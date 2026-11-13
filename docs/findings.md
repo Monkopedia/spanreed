@@ -343,9 +343,13 @@ file. (The review of PR #84 measured the same across 21 local transcripts. It al
 `msg_id` surviving because it is the first field. An earlier round of that review
 said all 13,144 Monitor-enqueued ids were "later delivered". The stricter count
 from its next round **corrects that**: nine ids, five in one session and four in
-another, have an `enqueue` and **no** delivered record. Their only other appearance
-is in `tool_result` output. So a pending enqueue can simply be dropped, which is
-real, observed evidence that "read" must mean a delivered record.)
+another, have an `enqueue` and **no** delivered record. So a pending enqueue can simply be dropped, which is real, observed
+evidence that "read" must mean a delivered record. The ids also turned up in
+`recv_messages` results, but the next review round showed Claude never saw them
+there. Five sat behind an over-the-token-limit error, with the ids only in the
+hidden `mcpMeta` copy. Four sat behind a 2 KB preview that didn't contain them. So
+at least four of the nine were **never read at all**, which is why only the result
+text Claude received counts.)
 
 **Not measured by this run:** whether a background shell command or a subagent
 fires `TaskCreated`; whether a session with a pending `enqueue` keeps it across an
