@@ -558,8 +558,25 @@ an assumption; see "Not verified yet".)
 `Notification` call `spanreed sleeper _activity <event>`, but only in a sleeper
 session; elsewhere they do nothing. That writes the last event and its time to
 `<state>/sleepers/<name>.activity`. The runner treats the agent as idle when the
-last event is `Stop` and more than `idle_timeout_s` has passed. A pending
-`permission_prompt` also counts as not idle, and sets `needs_input`. Whether these
+last event is `Stop`, more than `idle_timeout_s` has passed, **and no background
+work is running**. A pending `permission_prompt` also counts as not idle, and sets
+`needs_input`.
+
+**Background work is not idle.** `Stop` fires when a *turn* ends, but a turn can
+leave work running: a background shell command, a subagent, a Monitor. Exiting then
+would kill that work, which is what Claude Code's exit dialog warns about ("The
+following will stop when you exit"). The spanreed inbox Monitor is always running in
+a sleeper, so it is the one background task that does **not** block sleep; anything
+else does. Two possible sources for "is anything else running":
+- **Hooks** (`SubagentStart`/`SubagentStop`, `TaskCreated`/`TaskCompleted`). Whether
+  these cover background shell commands is unknown.
+- **The exit dialog itself**, which lists every background task. If it lists
+  anything besides the inbox Monitor, the runner cancels the exit (Esc) and treats
+  the agent as busy.
+
+The dialog is the only source known to be complete, and it is also the fragile UI
+described under "The exit". Which to rely on is decided by measurement in the
+implementation PR, not here. Whether these
 hooks fire as documented here, including for turns the inbox Monitor starts, is
 **not yet measured**, and idle detection depends on it.
 
@@ -574,15 +591,36 @@ an error rather than doing nothing.
    after it is treated as possibly unread, even if it arrives while Claude is still
    on screen. (Taking the snapshot after the exit instead loses a message that
    lands during the exit dialog. That was "Loss B" in the review of PR #84.)
-2. It types `/exit`, and confirms the background-task dialog that Claude Code shows
-   because the inbox Monitor is running (measured, findings Test 6). If Claude is
-   still running after a grace period, it sends SIGTERM to its child.
+2. It ends Claude (see "The exit", below), then waits until the process is
+   actually gone.
 3. After Claude has exited, it takes the lock, sets `state=asleep`, and re-reads the
    inbox. If anything is newer than `slept_after_msg_id`, it does not sleep: it
    resumes Claude straight away in the same session, which counts as a fresh wake
    for the record.
 4. It releases the lock and exits. Its tmux session then closes, and the next wake
    uses a new session name anyway.
+
+### The exit
+
+Typing `/exit` into the pane is fragile. It depends on Claude Code's UI: the prompt
+must be empty, and the confirmation dialog must keep its current wording, its option
+order and its default ("Exit and stop tasks", measured in Test 6). Any of those can
+change in a Claude Code release. The runner has a sturdier option: Claude is its
+child, so it can end it with a **signal**, with no UI involved.
+
+Plan, pending measurement:
+- **Preferred:** a signal to the child (SIGINT or SIGTERM), **if** a session ended
+  that way is measured to resume cleanly with its conversation intact. Not yet
+  measured.
+- **Fallback:** `/exit` plus the dialog.
+- **Either way,** the runner never trusts the keys it sent or the signal it raised.
+  It waits for the child process to exit, and if Claude is still running after a
+  grace period it escalates (dialog, then SIGTERM, then SIGKILL) and records which
+  step was needed.
+
+A signal skips the dialog, and the dialog is also the only complete list of
+background work (see "Going to sleep"). So picking the signal depends on the hooks
+being enough to answer "is anything else running?".
 
 ### Why no message is lost
 
@@ -635,9 +673,46 @@ is running, for example after a reboot, that comes from whichever process happen
 to start the server: possibly a cron job with a minimal PATH, an ssh-launched
 `conjoin --serve`, or a Claude session whose `CLAUDECODE`/`CLAUDE_*` variables would
 leak into the woken session. So **nothing about the launch depends on the tmux
-server's environment.** `create` resolves `claude_path`, `spanreed_path` and the
-PATH to use, and stores them in the record. Every launch runs with those set
-explicitly and with `CLAUDECODE` and `CLAUDE_*` unset.
+server's environment.** The runner starts from an **empty environment plus an
+allowlist**, not from what it inherited minus a few names. A denylist misses
+whatever variable leaks next. The allowlist:
+- **From the record:** `PATH` and the absolute paths to `claude` and `spanreed`, as
+  resolved by `create`.
+- **From the account, not the caller:** `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`,
+  `LANG` and `LC_*`, `TERM`.
+- **Set by spanreed:** `SPANREED_AGENT_NAME`, `SPANREED_SLEEPER=1`.
+
+Nothing else comes through, in particular any `CLAUDECODE`/`CLAUDE_*` variable or
+a sender's API credentials. **A known gap:** `SSH_AUTH_SOCK` is per-login, so a woken
+sleeper has no ssh agent, and `git push` over ssh from inside one fails. That is
+deliberate for now, and stated rather than hidden.
+
+### Across `conjoin`
+
+Mail to a sleeper on another machine needs nothing new in the bridge, apart from
+advertising asleep agents:
+1. The sender's machine queues it in the outbound inbox `agent-X@hostB.jsonl`, as for
+   any remote agent.
+2. The bridge forwards it, and the bridge on hostB writes it to `agent-X`'s inbox
+   with `append_message`.
+3. That write runs `wake_if_needed`, **on hostB**, where the tmux session, the login
+   and the sleeper record all live.
+4. If the link is down, the mail waits on the sending machine, and the reconnect
+   delivers it and wakes the sleeper. That is durable end to end.
+
+What changes:
+- **Peers must see asleep sleepers**, or no remote agent can address them.
+  `_send_registry` advertises them (see the liveness table), with the `asleep`/`awake`
+  marker. Peers mirror it, and an older peer ignores the field.
+- **The serve end of a bridge is ssh-launched**, so a wake it triggers starts tmux
+  from an ssh session. That is the `KillUserProcesses` risk under "Not verified yet",
+  and the environment allowlist exists for the same reason.
+- **A remote sender can't tell "asleep" from "awake" in its delivery verdict** beyond
+  what the last registry sync showed. It gets "queued for the bridge", which is true.
+
+Deliberately not in v1: **creating, waking or retiring a sleeper on another
+machine** (`sleeper create --host`, and so on). Mail already wakes a remote sleeper,
+and creating one is a deliberate act you do on the machine it will run on.
 
 ### Commands
 
@@ -694,9 +769,21 @@ assumed until measured, and the implementation PR has to measure it:
   the keys it sent.
 - **The tmux session teardown window:** measured in the review of PR #84, which is
   why session names include `generation`. Not yet measured with that fix in place.
-- **An expired login** makes every wake fail. The design reports that loudly; it
-  does not fix it.
-- **macOS**, where nothing here has been run.
+- **An expired login makes every wake on that machine fail at once.** Every
+  sleeper shares the one Claude Code login, and mail piles up behind all of them.
+  The design cannot fix this, since logging in needs a human. It can make it loud
+  and early:
+  - each failed wake records the reason and sets `needs_input`;
+  - `sleeper list` groups wake failures by reason, so "12 sleepers, one cause" reads
+    as one problem;
+  - while a sleeper is awake, the runner watches for Claude Code's "login expires in
+    N day(s)" warning and reports it before it starts failing wakes. That warning
+    is visible on screen (Test 6), but whether a hook or a file exposes it isn't
+    known yet.
+- **macOS**, where nothing here has been run. One point is not an open question:
+  the lock is `fcntl.flock`, the system call. macOS has it, and spanreed's registry
+  lock already depends on it there. The `flock` **command-line tool** isn't on
+  macOS, and nothing here uses it.
 
 ## Cross-host: the SSH bus-bridge
 
