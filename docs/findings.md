@@ -263,3 +263,46 @@ path check bounds what a process does — which is independent of any run.
 **The lesson.** A diagnostic that cannot reproduce the configuration it is
 diagnosing measures itself. That is this project's founding complaint about the
 thirty spike runs above, committed by the tool written in response to them.
+
+## Test 6: Can a Claude session in tmux be exited and resumed by session id? (2026-11-13)
+
+Run to settle the assumption the sleepers design rests on, before writing it down.
+Claude Code 2.1.283, tmux 3.8, on kaladin, in `~/git/spanreed` (a directory whose
+workspace trust was already accepted).
+
+**What was run:**
+
+1. `tmux new-session -d` running `SPANREED_AGENT_NAME=sleeper-spike claude
+   --session-id <uuid> --permission-mode acceptEdits`.
+2. Through `tmux send-keys`: *"Remember the code word PELICAN-7. Reply with only:
+   ok"*. It replied `ok`.
+3. `C-u`, then `/exit` + Enter.
+4. A new tmux session running the same command with `--resume <uuid>` instead of
+   `--session-id <uuid>`, then: *"What was the code word? Reply with only the word."*
+
+**Observed:**
+
+- **Starting with a chosen session id works.** The session came up with
+  `acceptEdits` shown in its status line, and the spanreed plugin's inbox Monitor
+  running.
+- **`/exit` does not exit straight away.** Claude Code showed *"Background work is
+  running. The following will stop when you exit: monitor · Spanreed bus message
+  arrived…"* with three options: *Exit and stop tasks* (the default), *Move to
+  background and exit*, *Stay*. The inbox Monitor is the background task. One more
+  Enter accepted the default; the process exited and the tmux session closed. No
+  `claude` process for that session id was left.
+- **Resume restores the conversation.** The resumed session answered `PELICAN-7`.
+- **Resume keeps the permission mode because it was passed again.** This run does
+  not show what a resume without the flag does. The design passes the flag every
+  time, so it doesn't depend on that.
+- **The Monitor restarts on resume.** The old one was reported stopped and a new one
+  running.
+- Also on screen, and relevant to anything unattended: *"Your login expires in 1
+  day"*. An expired login would make every unattended wake fail.
+
+**Not measured by this run:** whether `Stop` / `UserPromptSubmit` hooks fire in a
+resumed session, whether a session ended by SIGTERM resumes cleanly, how a resume
+behaves when mail arrived while the session was down, and anything on macOS.
+
+**Cleanup:** the spike exited through the same `/exit` path, and its registry row
+(`agent-sleeper-spike`) was deregistered. `spanreed list` shows 0 rows for it.
