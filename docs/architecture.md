@@ -482,6 +482,12 @@ verbatim. Until he confirms there, none of these is settled.
   does what". `docs/open-questions.md` still lists daemon lifecycle in general as
   undecided, and this covers sleepers only.
 
+- **Wait until the agent is up, then deliver.** *The owner's request:* "Can we wait
+  for the agent to be up and then deliver the message?" See "Waking".
+- **Not at-least-once: "read" is decided by the transcript.** *The owner:* "I don't
+  love at least once". The transcript check was the author's proposal, which he
+  accepted ("Yeah"). See "What counts as read".
+
 Also the author's, for the owner to see: no ssh agent in a woken sleeper (see
 "Environment"), no cross-host create/wake/retire in v1, and a signal-first exit.
 
@@ -503,7 +509,7 @@ source of truth, and it survives a reboot:
 | `tmux_session` | `spanreed-<name>-<generation>` for the current wake |
 | `runner_pid`, `runner_pid_start` | written by the waker under the lock, from tmux's pane pid; confirmed by the runner itself |
 | `claude_pid`, `claude_pid_start` | written by the runner once it has launched Claude |
-| `surfaced_through` | the id of the latest inbox message known to have been **put in front of Claude** as turn input. The no-loss argument rests on this field; see "What counts as read" |
+| `read_through` | the inbox line number (and its `msg_id`, to detect a rewritten file) up to which every message is **found in the session's transcript**. The no-loss argument rests on this field; see "What counts as read" |
 | `sleep_requested` | set by `request_sleep` |
 | `last_wake_failure` | why the last wake did not come back, with a timestamp |
 
@@ -598,74 +604,69 @@ hooks fire as documented here, including for turns the inbox Monitor starts, is
 acts on it at the next `Stop`. In a session that is not a sleeper, the tool returns
 an error rather than doing nothing.
 
-### What counts as read
+### What counts as read: the transcript says so
 
-The first two versions of this design treated a message as read once it was in the
-inbox before some snapshot. Review of PR #84 found three ways mail was lost because
-of that (Losses B, C and D): during the exit, on the normal wake path, and between
-the idle decision and the snapshot. So the definition changes:
+Review of PR #84 found three ways the earlier drafts lost mail: during the exit
+(Loss B), on the normal wake path (C), and between the idle decision and the
+snapshot (D). They had one cause: "read" meant "in the inbox before some snapshot",
+which says nothing about whether Claude ever received the message.
 
-**A message counts as read only once it has been put in front of Claude as the
-input to a turn.** Anything after `surfaced_through` is unread, however long it has
-been in the inbox. Two things advance `surfaced_through`:
+**A message counts as read only if its `msg_id` appears in the session's
+transcript.** Claude Code writes each session's conversation to a transcript file
+on disk; the hooks give its path. Every inbox line the Monitor hands Claude becomes
+part of that conversation, `msg_id` included. The transcript is fully written once
+Claude has exited, so it is checked only then: at sleep, and before a wake.
 
-- **A Monitor-started turn.** The `UserPromptSubmit` hook receives the turn's input
-  (`prompt_text`). For a turn the inbox Monitor starts, that input carries the inbox
-  line, `msg_id` included. The hook advances `surfaced_through` to the latest inbox
-  message it sees there. This assumes `prompt_text` contains the Monitor event's
-  text for Monitor-started turns, which is **not yet measured**; see the fallback
-  below.
-- **The wake prompt.** Every wake starts a turn on purpose; see "Every wake starts a
-  turn".
+`first_unread_line()` walks the inbox from `read_through` and returns the first
+line whose `msg_id` is **not** in the transcript. Delivery is in order, so
+everything before that line counts as read.
 
-Delivery is therefore **at-least-once**. A message may be shown twice (for example,
-the Monitor and a wake prompt both carry it), but it is never treated as read
-without having been shown. A duplicate costs the agent a moment's attention. A loss
-costs the message.
+This records what Claude actually received, not a guess from timing. It does not
+depend on reading the screen, on a hook's text, or on how quickly the Monitor
+fires. The owner rejected an at-least-once design that could redeliver messages;
+this is the exact alternative.
 
-**Fallback if `prompt_text` turns out not to carry the Monitor event:** advance
-`surfaced_through` to the inbox tail as of the last `Stop`. That leaves a window:
-mail that lands while the final turn runs, and is queued behind it, could be marked
-read unseen. The implementation PR has to measure which mechanism holds before
-choosing.
+That the transcript does contain each Monitor-delivered line with its `msg_id` is
+**not yet measured**, and everything here depends on it. It is the first thing the
+implementation PR measures.
 
-### Every wake starts a turn
+### Waking: wait until the agent is up, then deliver
 
-A resumed `claude` with nothing to do waits at an empty prompt. Context added by
-the `SessionStart` hook does not start a turn (that was Loss C). So the runner
-launches Claude **with a first prompt**:
+The owner's model: don't hand a message to a session that isn't ready for it. Wait
+until the agent is up, then deliver through the normal path.
 
-```
-claude --resume <session-id> --permission-mode <mode> "<wake prompt>"
-```
+- **While asleep, mail just sits in the inbox.** There is no separate queue. The
+  inbox is already a file, and nothing reads it while the agent sleeps.
+- **On wake,** the runner computes `first_unread_line()` against the transcript,
+  which is complete because Claude isn't running. It records the result as
+  `read_through` and launches Claude.
+- **The sleeper's inbox Monitor starts from that line**, `tail -n +<line> -F`,
+  instead of from the end of the file (`tail -n 0`). Every unread message, including
+  the one that woke the agent, reaches Claude **the same way mail reaches an awake
+  agent**, and the Monitor starts the turns itself. No first prompt and no special
+  path. Non-sleeper sessions keep `tail -n 0`.
+- **A crash or reboot while awake** needs nothing extra. The next wake computes
+  `first_unread_line()` from the transcript, which is just as complete after a
+  crash.
 
-- **The wake prompt** carries every inbox message after `surfaced_through`, verbatim
-  and in the same JSON-line form the Monitor uses. If they don't fit a size cap, it
-  carries the ones that fit plus the exact `recv_messages(agent_id,
-  since_msg_id=...)` call for the rest, and advances `surfaced_through` only through
-  what it actually included.
-- **On launch** the runner also resets `<name>.activity` to a `woke` event. A stale
-  `Stop` left from before the sleep can then never read as idle.
-
-That `claude --resume <id> "<prompt>"` starts an interactive session with that first
-turn is **not yet measured**. Test 6 drove its resumed session with `tmux
-send-keys`. Typing the prompt into the pane is the fallback.
+That `tail -n +N -F` started by the plugin's Monitor delivers the replayed lines as
+ordinary Monitor events is **not yet measured**.
 
 ### Committing to sleep, in this order
 
-1. **Decide.** The agent is idle (see above) or has asked to sleep, and the last
-   event is a `Stop`.
-2. **End Claude** (see "The exit"), and wait until the process is actually gone.
-3. **Under the lock, re-read the inbox.** If anything is after `surfaced_through`,
-   do not sleep. Relaunch Claude **in the same runner and the same tmux session**,
-   with a wake prompt carrying those messages. `generation` and `tmux_session` don't
-   change; only a wake from asleep gets a new name.
-4. Otherwise set `state=asleep`, release the lock, and exit. The runner's tmux
-   session then closes, and the next wake uses a new name anyway.
-
-Nothing is snapshotted at the moment of deciding. Because the check is against
-`surfaced_through`, the gap between deciding and exiting is harmless (that was Loss
-D): mail landing in it is after `surfaced_through`, so step 3 catches it.
+1. **Decide.** The agent is idle, or has asked to sleep. The last event is a `Stop`,
+   no background work is running, and after `request_sleep` a short quiet period has
+   passed with no new turn starting. A Monitor event queued behind the final turn
+   gets that long to start its own turn.
+2. Under the lock, set `state=sleeping`. Senders who see `sleeping` append and do
+   nothing else; the runner checks the inbox after the exit.
+3. **End Claude** (see "The exit"), and wait until the process is actually gone.
+4. **Under the lock, compute `first_unread_line()`** against the now-complete
+   transcript. If any line is unread, whether it arrived before the decision, during
+   the exit, or a moment ago, **do not sleep**. Relaunch Claude in the same runner
+   and tmux session, with its Monitor starting from that line. `generation` and
+   `tmux_session` don't change.
+5. Otherwise set `state=asleep` and `read_through`, release the lock, and exit.
 
 ### The exit
 
@@ -691,19 +692,23 @@ being enough to answer "is anything else running?".
 
 ### Why no message is lost
 
-Take a message M, appended by its sender before the sender takes the lock.
+Take a message M, appended to the inbox by its sender before the sender takes the
+lock.
 
-- **M is at or before `surfaced_through`.** Then it was put in front of Claude as
-  turn input, by definition. Nothing is owed.
-- **M is after `surfaced_through`, and its sender took the lock before step 3.** The
-  sender saw `awake` with a live runner and did nothing. M is in the inbox before
-  step 3's re-read under the lock, so the runner sees it and relaunches with M in
-  the wake prompt instead of sleeping.
-- **M's sender took the lock after step 3.** It saw `asleep` and launched a wake,
-  under a new session name, and that wake's prompt carries M.
+- **M is in the transcript.** Claude received it. Nothing is owed.
+- **M is not in the transcript, and its sender took the lock before step 4.** The
+  sender saw `awake` or `sleeping` and did nothing more. At step 4, under the lock
+  and against a complete transcript, M is unread, so the runner relaunches and the
+  Monitor delivers M.
+- **M's sender took the lock after step 5.** It saw `asleep` and launched a wake.
+  The wake computes `first_unread_line()`, which is at or before M, and the Monitor
+  starts there.
 
-In every case M ends up as turn input. The same lock, plus the runner confirming it
-is the runner the record names, rules out a double wake.
+So M always ends up in front of Claude. Because the check reads the transcript,
+nothing is redelivered that Claude already received. The same lock, plus the
+runner confirming it is the runner the record names, rules out a double wake. The
+argument holds **only if the transcript records every Monitor-delivered `msg_id`**,
+which is why that is measured first.
 
 ### Liveness: where "the record decides" has to change
 
@@ -822,11 +827,14 @@ assumed until measured, and the implementation PR has to measure it:
   Claude exit quickly enough for the runner to detect.
 - **A session ended by SIGTERM, or by SIGKILL**, resuming cleanly. The exit
   escalation ends in SIGKILL, so both matter.
-- **`UserPromptSubmit`'s `prompt_text` carrying the Monitor event's text,
-  `msg_id` included, for Monitor-started turns.** "What counts as read" depends on
-  it; the fallback is stated there.
-- **`claude --resume <id> "<prompt>"` starting an interactive session with that
-  first turn.** Typing the prompt into the pane is the fallback.
+- **The transcript containing every Monitor-delivered inbox line with its
+  `msg_id`**, and being complete once Claude has exited (including after
+  SIGTERM/SIGKILL). The no-loss argument depends on this. It is measured first.
+- **The plugin Monitor started with `tail -n +N -F`** delivering the replayed lines
+  as ordinary Monitor events that start turns.
+- **A Monitor event queued behind the final turn** starting its own turn within the
+  quiet period after `request_sleep`. If it doesn't, step 4 still catches the
+  message; this only decides whether a sleep is skipped or happens.
 - **How a resume behaves when mail arrived while the session was down.** This is
   listed as not measured in findings Test 6.
 - **The `/exit` confirmation dialog** keeping its current wording and default across
