@@ -463,18 +463,27 @@ session is down is never surfaced.)
 
 ### Decisions
 
-These are the owner's, quoted verbatim in #85. Until the
-owner confirms them there, read them as proposed.
+**Proposed, pending the owner's confirmation on #85**, which quotes his words
+verbatim. Until he confirms there, none of these is settled.
 
 - **Wake resumes the same conversation** (`claude --resume <session-id>`), never a
-  fresh session.
+  fresh session. *The owner's request:* "Resume, if it doesn't resume there is no
+  value".
 - **The permission mode is chosen at create and kept for the agent's whole life.**
-  It is stored in the sleeper record and passed on every launch.
-- **No persistent spanreed process.** Every job a daemon would do falls to
-  something already running at the moment it's needed (see "Who does what"). This
-  is a deliberate departure from leaving the question open:
-  `docs/open-questions.md` still lists daemon lifecycle in general as undecided,
-  and this decision covers sleepers only.
+  It is stored in the sleeper record and passed on every launch. *The owner's
+  request:* "allow permission mode on create and always keep it".
+- **No persistent spanreed process.** This one is **the author's proposal, not the
+  owner's decision.** The owner asked "Do we need a persistent process? Or do we
+  need locks around how we resume?", and this design is the answer to that
+  question. (Earlier in the same conversation the author had read the owner's
+  silence as a yes to a per-machine controller process, the opposite answer. That
+  is one more reason this needs his explicit confirmation.) Every job a daemon
+  would do falls to something already running at the moment it's needed; see "Who
+  does what". `docs/open-questions.md` still lists daemon lifecycle in general as
+  undecided, and this covers sleepers only.
+
+Also the author's, for the owner to see: no ssh agent in a woken sleeper (see
+"Environment"), no cross-host create/wake/retire in v1, and a signal-first exit.
 
 ### The sleeper record
 
@@ -494,7 +503,7 @@ source of truth, and it survives a reboot:
 | `tmux_session` | `spanreed-<name>-<generation>` for the current wake |
 | `runner_pid`, `runner_pid_start` | written by the waker under the lock, from tmux's pane pid; confirmed by the runner itself |
 | `claude_pid`, `claude_pid_start` | written by the runner once it has launched Claude |
-| `slept_after_msg_id` | see "Going to sleep"; this definition is what the race argument depends on |
+| `surfaced_through` | the id of the latest inbox message known to have been **put in front of Claude** as turn input. The no-loss argument rests on this field; see "What counts as read" |
 | `sleep_requested` | set by `request_sleep` |
 | `last_wake_failure` | why the last wake did not come back, with a timestamp |
 
@@ -503,7 +512,9 @@ source of truth, and it survives a reboot:
 **Waking is done by whoever delivers the mail.** Only two paths write an inbox:
 `StateStore.send_message` (the CLI, the MCP tools, the Codex worker, and through
 them scripts and cron) and `StateStore.append_message` (the `conjoin` bridge). Both
-append the message **first**, then call `wake_if_needed(recipient)`. That function:
+append the message **first**, then call `wake_if_needed(recipient)`. **That is an
+invariant for any future inbox writer:** append, then call `wake_if_needed`. A
+writer that skips it delivers mail that never wakes anyone. That function:
 
 1. Returns at once if the recipient has no sleeper record. It also does nothing
    when the bridge's `append_message` dedupes a message it already had, since no
@@ -517,10 +528,13 @@ append the message **first**, then call `wake_if_needed(recipient)`. That functi
    runner died), it does **not** resume. Two Claude processes on one conversation
    is worse than a stalled agent. It records `last_wake_failure` and sets the bus
    status to `needs_input`.
-5. Otherwise it increments `generation` and launches the runner in a **new detached
-   tmux session named `spanreed-<name>-<generation>`**, using `tmux new-session -d
-   -P -F '#{pane_pid}'` so it gets the pane's pid back. It writes `state=awake`,
-   `tmux_session`, `runner_pid` and `runner_pid_start`, then releases the lock.
+5. Otherwise it increments `generation` and **writes the record before launching
+   anything**. A waker that dies after `new-session` but before persisting
+   `generation` would make the next waker reuse the name and get `duplicate session`.
+   Then it launches the runner in a **new detached tmux session named
+   `spanreed-<name>-<generation>`**, using `tmux new-session -d -P -F '#{pane_pid}'`
+   to get the pane's pid back. It writes `state=awake`, `tmux_session`, `runner_pid`
+   and `runner_pid_start`, and releases the lock.
 
 The session name is new on every wake for a reason: the previous runner's session
 can still exist for a moment after it has marked itself asleep (the measured "Loss
@@ -584,21 +598,74 @@ hooks fire as documented here, including for turns the inbox Monitor starts, is
 acts on it at the next `Stop`. In a session that is not a sleeper, the tool returns
 an error rather than doing nothing.
 
-**Committing to sleep, in this order:**
+### What counts as read
 
-1. Under the lock, the runner records **`slept_after_msg_id` = the id of the last
-   message in the inbox at this moment**, before anything else happens. Any message
-   after it is treated as possibly unread, even if it arrives while Claude is still
-   on screen. (Taking the snapshot after the exit instead loses a message that
-   lands during the exit dialog. That was "Loss B" in the review of PR #84.)
-2. It ends Claude (see "The exit", below), then waits until the process is
-   actually gone.
-3. After Claude has exited, it takes the lock, sets `state=asleep`, and re-reads the
-   inbox. If anything is newer than `slept_after_msg_id`, it does not sleep: it
-   resumes Claude straight away in the same session, which counts as a fresh wake
-   for the record.
-4. It releases the lock and exits. Its tmux session then closes, and the next wake
-   uses a new session name anyway.
+The first two versions of this design treated a message as read once it was in the
+inbox before some snapshot. Review of PR #84 found three ways mail was lost because
+of that (Losses B, C and D): during the exit, on the normal wake path, and between
+the idle decision and the snapshot. So the definition changes:
+
+**A message counts as read only once it has been put in front of Claude as the
+input to a turn.** Anything after `surfaced_through` is unread, however long it has
+been in the inbox. Two things advance `surfaced_through`:
+
+- **A Monitor-started turn.** The `UserPromptSubmit` hook receives the turn's input
+  (`prompt_text`). For a turn the inbox Monitor starts, that input carries the inbox
+  line, `msg_id` included. The hook advances `surfaced_through` to the latest inbox
+  message it sees there. This assumes `prompt_text` contains the Monitor event's
+  text for Monitor-started turns, which is **not yet measured**; see the fallback
+  below.
+- **The wake prompt.** Every wake starts a turn on purpose; see "Every wake starts a
+  turn".
+
+Delivery is therefore **at-least-once**. A message may be shown twice (for example,
+the Monitor and a wake prompt both carry it), but it is never treated as read
+without having been shown. A duplicate costs the agent a moment's attention. A loss
+costs the message.
+
+**Fallback if `prompt_text` turns out not to carry the Monitor event:** advance
+`surfaced_through` to the inbox tail as of the last `Stop`. That leaves a window:
+mail that lands while the final turn runs, and is queued behind it, could be marked
+read unseen. The implementation PR has to measure which mechanism holds before
+choosing.
+
+### Every wake starts a turn
+
+A resumed `claude` with nothing to do waits at an empty prompt. Context added by
+the `SessionStart` hook does not start a turn (that was Loss C). So the runner
+launches Claude **with a first prompt**:
+
+```
+claude --resume <session-id> --permission-mode <mode> "<wake prompt>"
+```
+
+- **The wake prompt** carries every inbox message after `surfaced_through`, verbatim
+  and in the same JSON-line form the Monitor uses. If they don't fit a size cap, it
+  carries the ones that fit plus the exact `recv_messages(agent_id,
+  since_msg_id=...)` call for the rest, and advances `surfaced_through` only through
+  what it actually included.
+- **On launch** the runner also resets `<name>.activity` to a `woke` event. A stale
+  `Stop` left from before the sleep can then never read as idle.
+
+That `claude --resume <id> "<prompt>"` starts an interactive session with that first
+turn is **not yet measured**. Test 6 drove its resumed session with `tmux
+send-keys`. Typing the prompt into the pane is the fallback.
+
+### Committing to sleep, in this order
+
+1. **Decide.** The agent is idle (see above) or has asked to sleep, and the last
+   event is a `Stop`.
+2. **End Claude** (see "The exit"), and wait until the process is actually gone.
+3. **Under the lock, re-read the inbox.** If anything is after `surfaced_through`,
+   do not sleep. Relaunch Claude **in the same runner and the same tmux session**,
+   with a wake prompt carrying those messages. `generation` and `tmux_session` don't
+   change; only a wake from asleep gets a new name.
+4. Otherwise set `state=asleep`, release the lock, and exit. The runner's tmux
+   session then closes, and the next wake uses a new name anyway.
+
+Nothing is snapshotted at the moment of deciding. Because the check is against
+`surfaced_through`, the gap between deciding and exiting is harmless (that was Loss
+D): mail landing in it is after `surfaced_through`, so step 3 catches it.
 
 ### The exit
 
@@ -626,27 +693,17 @@ being enough to answer "is anything else running?".
 
 Take a message M, appended by its sender before the sender takes the lock.
 
-- **M was appended before step 1.** Then M is at or before `slept_after_msg_id`. It
-  was in the inbox while Claude was running, and the inbox Monitor reported it.
-  Claude handling it is exactly what not-yet-idle means. (Whether Claude actually
-  acted on it is the agent's business, not the bus's.)
-- **M was appended after step 1, and its sender took the lock before step 3.** The
-  sender saw `awake` with a live runner, so it did nothing. M is newer than
-  `slept_after_msg_id` and is in the inbox before step 3's re-read under the lock,
-  so the runner sees it and resumes instead of sleeping.
+- **M is at or before `surfaced_through`.** Then it was put in front of Claude as
+  turn input, by definition. Nothing is owed.
+- **M is after `surfaced_through`, and its sender took the lock before step 3.** The
+  sender saw `awake` with a live runner and did nothing. M is in the inbox before
+  step 3's re-read under the lock, so the runner sees it and relaunches with M in
+  the wake prompt instead of sleeping.
 - **M's sender took the lock after step 3.** It saw `asleep` and launched a wake,
-  under a new session name, so a still-closing previous session can't block it.
+  under a new session name, and that wake's prompt carries M.
 
-The same lock, plus the runner confirming it is the runner the record names, rules
-out a double wake.
-
-### Mail that arrives while asleep
-
-The inbox Monitor starts with `tail -n 0`, so on a resume it would never see mail
-that arrived while the agent was asleep, including the message that woke it. On
-`SessionStart` with `source: "resume"` in a sleeper, the hook adds a line to the
-agent's context: how many messages arrived after `slept_after_msg_id`, and the exact
-`recv_messages(agent_id, since_msg_id=...)` call that reads them.
+In every case M ends up as turn input. The same lock, plus the runner confirming it
+is the runner the record names, rules out a double wake.
 
 ### Liveness: where "the record decides" has to change
 
@@ -763,7 +820,15 @@ assumed until measured, and the implementation PR has to measure it:
   kill a tmux server started from an ssh session.
 - **A failed wake** (missing binary, expired login, deleted transcript) making
   Claude exit quickly enough for the runner to detect.
-- **A session ended by SIGTERM** resuming cleanly.
+- **A session ended by SIGTERM, or by SIGKILL**, resuming cleanly. The exit
+  escalation ends in SIGKILL, so both matter.
+- **`UserPromptSubmit`'s `prompt_text` carrying the Monitor event's text,
+  `msg_id` included, for Monitor-started turns.** "What counts as read" depends on
+  it; the fallback is stated there.
+- **`claude --resume <id> "<prompt>"` starting an interactive session with that
+  first turn.** Typing the prompt into the pane is the fallback.
+- **How a resume behaves when mail arrived while the session was down.** This is
+  listed as not measured in findings Test 6.
 - **The `/exit` confirmation dialog** keeping its current wording and default across
   Claude Code versions. The runner must check that Claude actually exited, not trust
   the keys it sent.
