@@ -18,7 +18,7 @@ Sessions coordinate through filesystem state under `~/.claude/spanreed/` (regist
 
 1. **Docs are authoritative for design.** Behavior changes (especially anything that touches the wire format, the MCP tool surface, or filesystem layout) require updating `docs/architecture.md` or `docs/protocol.md` in the same commit. Don't infer design from code; if the doc is wrong, fix the doc.
 
-2. **Tests required for new code paths.** If you add a function, add a test. If you change behavior, update the test. Run `make test` before commit. Pre-commit gates this.
+2. **Tests required for new code paths.** If you add a function, add a test. If you change behavior, update the test. Run `make check` before you push. Nothing enforces it locally unless you've run `uv run pre-commit install` (see `docs/development.md`): that runs ruff and pyright at commit and pytest at push. CI runs the same checks on every push and PR, but `main` has no branch protection, so a red CI does not block a merge.
 
 3. **Findings ≠ design.** Empirical results from running experiments go in `docs/findings.md`. Decisions about how things *should* work go in `docs/architecture.md` or `docs/protocol.md`. Don't mix them.
 
@@ -64,4 +64,4 @@ docs/              architecture, protocol, findings, open questions
 
 ## Git workflow
 
-For now: **direct commits to main** with discipline (pre-commit must pass). Once v1 is usable, switch to **PR-based workflow** and dogfood spanreed for cross-session PR review (the project's whole motivating use case).
+**Changes land through pull requests**, each sent to an independent reviewer dispatched over the spanreed bus. That's the cross-session review this project was built for, now in use. Every change since 0.1.0 has landed as a PR, though not every PR got its review (#60 merged without one, and the PR says so). Which changes need the owner's signoff before merging is set by the fleet's review policy, not here.
