@@ -30,8 +30,14 @@ from spanreed._fsmode import private_dir, tighten_tree, touch_private, write_pri
 from spanreed.codex_approvals import MODES
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.protocol import Agent, validate_agent_id
+from spanreed.sleeper_runner import (
+    RETIRE_WAIT_S,
+    record_activity,
+    request_sleep,
+    wait_until_asleep,
+    wake_if_needed,
+)
 from spanreed.sleeper_runner import run as run_sleeper
-from spanreed.sleeper_runner import wake_if_needed
 from spanreed.sleepers import (
     DEFAULT_IDLE_TIMEOUT_S,
     PERMISSION_MODES,
@@ -872,6 +878,8 @@ def _cmd_sleeper(args: argparse.Namespace) -> int:
         "wake": _sleeper_wake,
         "attach": _sleeper_attach,
         "_run": _sleeper_run,
+        "_activity": _sleeper_activity,
+        "sleep": _sleeper_sleep,
     }
     try:
         return handlers[args.sleeper_cmd](args)
@@ -993,8 +1001,41 @@ def _sleeper_run(args: argparse.Namespace) -> int:
     return run_sleeper(StateStore(), args.name, args.generation)
 
 
+def _sleeper_activity(_args: argparse.Namespace) -> int:
+    """The plugin's turn hooks: record the turn boundary for the runner's idle check.
+
+    Does nothing outside a sleeper. Always exits 0 and writes nothing to stdout:
+    a hook's output and exit status are instructions to Claude Code, and this one
+    only observes.
+    """
+    if os.environ.get("SPANREED_SLEEPER") != "1":
+        return 0
+    name = os.environ.get("SPANREED_AGENT_NAME", "")
+    try:
+        hook = json.loads(sys.stdin.read() or "{}")
+        record_activity(StateStore(), name, hook)
+    except Exception as exc:  # observing must never break the session
+        print(f"spanreed sleeper _activity: {exc}", file=sys.stderr)
+    return 0
+
+
+def _sleeper_sleep(args: argparse.Namespace) -> int:
+    """By hand, the same as the agent calling ``request_sleep``."""
+    print(f"sleeper {args.name}: {request_sleep(StateStore(), args.name)}")
+    return 0
+
+
 def _sleeper_retire(args: argparse.Namespace) -> int:
-    record = StateStore().retire_sleeper(args.name)
+    store = StateStore()
+    record = store.sleepers.read(args.name)
+    if record is not None and record.state != "asleep" and runner_is_alive(record):
+        print(f"sleeper {args.name} is {record.state}: {request_sleep(store, args.name)}")
+        if not wait_until_asleep(store, args.name, RETIRE_WAIT_S):
+            raise SleeperError(
+                f"{args.name!r} did not go to sleep within {RETIRE_WAIT_S:.0f}s, so it was "
+                f"not retired. It sleeps at the end of its current turn; retire it then."
+            )
+    record = store.retire_sleeper(args.name)
     print(
         f"retired sleeper {record.name} ({record.agent_id}). Its inbox is kept as "
         f"history; mail to it is now refused, as for any unknown agent."
@@ -1214,13 +1255,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_slist = sleeper_sub.add_parser("list", help="Show every sleeper and its record")
     p_slist.add_argument("--json", action="store_true", help="Emit the records as JSON")
     p_retire = sleeper_sub.add_parser(
-        "retire", help="Delete an asleep sleeper's record and row (its inbox is kept)"
+        "retire",
+        help="Put a sleeper to sleep if awake, then delete its record and row (its inbox is kept)",
     )
     p_retire.add_argument("name")
     p_wake = sleeper_sub.add_parser("wake", help="Wake a sleeper by hand (as a message would)")
     p_wake.add_argument("name")
     p_attach = sleeper_sub.add_parser("attach", help="tmux attach to an awake sleeper")
     p_attach.add_argument("name")
+    p_sleep = sleeper_sub.add_parser(
+        "sleep", help="Put a sleeper to sleep at the end of its turn (stops its background work)"
+    )
+    p_sleep.add_argument("name")
+    sleeper_sub.add_parser("_activity", help=argparse.SUPPRESS)
     p_run = sleeper_sub.add_parser("_run", help=argparse.SUPPRESS)
     p_run.add_argument("name")
     p_run.add_argument("generation", type=int)

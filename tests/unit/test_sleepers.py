@@ -319,9 +319,22 @@ class TestRetire:
     def test_an_awake_sleeper_is_refused(self, store: StateStore) -> None:
         store.create_sleeper(_record())
         _set_state(store, "nap", state="awake", runner_pid=os.getpid())
-        with pytest.raises(SleeperError, match="only an asleep sleeper"):
+        with pytest.raises(SleeperError, match="must be asleep to be retired"):
             store.retire_sleeper("nap")
         assert store.sleepers.read("nap") is not None
+
+    def test_a_running_claude_without_a_runner_is_refused(self, store: StateStore) -> None:
+        store.create_sleeper(_record())
+        _set_state(store, "nap", state="awake", runner_pid=_dead_pid(), claude_pid=os.getpid())
+        with pytest.raises(SleeperError, match="must be asleep"):
+            store.retire_sleeper("nap")
+
+    def test_a_crashed_awake_sleeper_can_be_retired(self, store: StateStore) -> None:
+        """Its record says awake, but nothing of it is running."""
+        store.create_sleeper(_record())
+        _set_state(store, "nap", state="awake", runner_pid=_dead_pid(), claude_pid=_dead_pid())
+        store.retire_sleeper("nap")
+        assert store.sleepers.read("nap") is None
 
 
 def test_records_survive_a_new_store_instance(state_root: Path) -> None:

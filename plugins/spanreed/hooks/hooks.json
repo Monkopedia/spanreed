@@ -19,6 +19,36 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${SPANREED_SLEEPER:-}\" != 1 ] || spanreed sleeper _activity"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${SPANREED_SLEEPER:-}\" != 1 ] || spanreed sleeper _activity"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${SPANREED_SLEEPER:-}\" != 1 ] || spanreed sleeper _activity"
+          }
+        ]
+      }
     ]
   }
 }

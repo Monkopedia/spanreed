@@ -884,19 +884,22 @@ class StateStore:
     def retire_sleeper(self, name: str) -> SleeperRecord:
         """Delete sleeper ``name``'s record and registry row. Its inbox is kept.
 
-        Only an asleep sleeper can be retired: ending an awake one needs the
-        runner, which is not built yet. The record goes first, so a crash
-        between the two leaves only a pid-0 row, which is stale and pruned.
+        Refused while its runner or its Claude is running: ``spanreed sleeper
+        retire`` puts an awake sleeper to sleep first. A record that says awake
+        with both gone (a crash) can be retired. The record goes first, so a
+        crash between the two leaves only a pid-0 row, which is stale and pruned.
         """
         with self.sleepers.lock(name):
             record = self.sleepers.read(name)
             if record is None:
                 raise SleeperError(f"there is no sleeper named {name!r}")
-            if record.state != "asleep":
+            claude_alive = record.claude_pid is not None and process_is_alive(
+                record.claude_pid, record.claude_pid_start
+            )
+            if record.state != "asleep" and (runner_is_alive(record) or claude_alive):
                 raise SleeperError(
                     f"sleeper {name!r} is {record.state} (runner pid {record.runner_pid}, "
-                    f"tmux session {record.tmux_session}); only an asleep sleeper can be "
-                    f"retired yet"
+                    f"tmux session {record.tmux_session}); it must be asleep to be retired"
                 )
             self.sleepers.delete(name)
             self.deregister_agent(record.agent_id)

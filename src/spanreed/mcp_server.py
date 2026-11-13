@@ -22,6 +22,7 @@ from mcp.server.mcpserver import MCPServer
 from spanreed._fsmode import open_private, private_dir
 from spanreed.identity import derive_agent_identity
 from spanreed.protocol import Message, Status
+from spanreed.sleeper_runner import request_sleep as request_sleep_for
 from spanreed.store import StateStore, default_state_root
 
 
@@ -261,6 +262,30 @@ def set_status(status: Status) -> dict[str, object] | None:
     agent_id, _ = derive_agent_identity()
     agent = StateStore().set_status(agent_id, status)
     return agent.model_dump(mode="json") if agent else None
+
+
+@mcp_app.tool()
+def request_sleep() -> str:
+    """Go to sleep at the end of this turn. Only for a sleeper: a session spanreed
+    manages in tmux, which sleeps when idle and is woken by its next message.
+
+    Use it when you are done and nothing is pending. Once this turn ends and a
+    few seconds pass with no new turn, your Claude process exits and frees its
+    memory; you stay on the bus, and the next message resumes this same
+    conversation. **Any background work still running then is stopped** (shells,
+    monitors, subagents), so finish or stop it first if it matters. Mail that
+    arrives in the meantime is delivered before you sleep.
+
+    Returns what will happen. Raises if this session is not a sleeper.
+    """
+    name = os.environ.get("SPANREED_AGENT_NAME")
+    if os.environ.get("SPANREED_SLEEPER") != "1" or not name:
+        raise ValueError(
+            "request_sleep is only for sleepers (sessions started by `spanreed sleeper`); "
+            "this session is not one, so there is nothing to put to sleep. An ordinary "
+            "session ends when its user exits it."
+        )
+    return request_sleep_for(StateStore(), name)
 
 
 FOCUS_UPDATE_REQUEST_MARKER = "[FOCUS_UPDATE_REQUEST]"
