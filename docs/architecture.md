@@ -445,11 +445,14 @@ Resolved since:
 
 ## Sleepers: agents that sleep and wake on mail
 
-**Status: being built, in stages.** Built so far (stage 1): the record, `create`,
-`list` and `retire`, and presence from the record at every liveness site. Not built:
-waking on mail (stage 2), the runner and the sleep transition (stage 3), and the
-hooks and `request_sleep` (stage 4). Until stage 2 lands, nothing launches a
-sleeper's Claude, and mail to one waits in its inbox; the delivery verdict says so.
+**Status: being built, in stages.** Built so far: the record, `create`, `list` and
+`retire`, and presence from the record at every liveness site (stage 1); the
+transcript read-check, waking on mail, the runner, and the Monitor's replay
+(stage 2). Not built: idle detection and ending Claude (stage 3), and the hooks
+and `request_sleep` (stage 4). **Until stage 3 lands, a woken sleeper stays awake
+until its Claude exits some other way** (someone attaches and types `/exit`, or
+signals it). When it does, the runner checks the inbox and sleeps or relaunches as
+described below.
 The resume mechanics are measured in
 [findings.md](findings.md#test-6-can-a-claude-session-in-tmux-be-exited-and-resumed-by-session-id-2026-11-13).
 Anything not measured is listed under "Not verified yet" rather than stated as fact.
@@ -943,9 +946,14 @@ allowlist**, not from what it inherited minus a few names. A denylist misses
 whatever variable leaks next. The allowlist:
 - **From the record:** `PATH` and the absolute paths to `claude` and `spanreed`, as
   resolved by `create`.
-- **From the account, not the caller:** `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`,
-  `LANG` and `LC_*`, `TERM`.
-- **Set by spanreed:** `SPANREED_AGENT_NAME`, `SPANREED_SLEEPER=1`.
+- **From the account, not the caller:** `HOME`, `USER`, `LOGNAME`, `SHELL`, read
+  from the password database.
+- **From the tmux pane:** `TERM` (tmux sets it for the pane), `TMPDIR`, `LANG` and
+  `LC_*`. None of these can carry a credential or another session's identity.
+- **Set by spanreed:** `SPANREED_AGENT_NAME`, `SPANREED_SLEEPER=1`, and
+  `SPANREED_STATE_ROOT` (the waker's state root, also passed to the runner with
+  `tmux new-session -e`), so the woken session is on the same bus as the mail that
+  woke it.
 
 Nothing else comes through, in particular any `CLAUDECODE`/`CLAUDE_*` variable or
 a sender's API credentials. **A known gap:** `SSH_AUTH_SOCK` is per-login, so a woken
@@ -986,7 +994,7 @@ part of the first implementation. Mail already wakes a remote sleeper without it
 ### Commands
 
 ```
-spanreed sleeper create --name X --cwd DIR --permission-mode MODE [--idle-timeout 15m]
+spanreed sleeper create --name X --cwd DIR --permission-mode MODE [--model M] [--idle-timeout 15m]
 spanreed sleeper list
 spanreed sleeper attach X     # tmux attach to the current session-name generation
 spanreed sleeper wake X       # by hand; the same path a message takes
@@ -1011,8 +1019,18 @@ Settled while building stage 1 (the author's calls, listed for the owner to see)
   measured.
 - **An asleep sleeper's row carries `pid` 0 and `pid_start` -1**, which no
   process has (see "Compatibility").
-- **`retire` refuses an awake or sleeping sleeper** until the runner exists to end
-  one.
+- **`retire` refuses an awake or sleeping sleeper** until stage 3 can end one.
+- **`--model` is fixed at create and passed on every launch**, like the permission
+  mode. Without it a sleeper gets the model in Claude Code's settings, which need
+  not be the one the owner's own sessions run (they pass `--model`).
+
+**Open, for the owner: a folder Claude Code has never trusted.** The first launch
+in such a directory stops at Claude Code's "do you trust this folder?" dialog
+(measured, findings Test 12). A woken sleeper sitting at that dialog never takes a
+turn and never sleeps. Today someone has to `spanreed sleeper attach X` and
+accept it once; after that every launch goes straight in. Options: refuse
+`create` for an untrusted directory (reading Claude Code's own state to tell,
+which is another internal format), warn at create, or leave it to `attach`.
 
 ### Compatibility
 
@@ -1047,6 +1065,11 @@ assumed until measured, and the implementation PR has to measure it:
   notification 60 s after `Stop`.
 - **A `Notification` of type `permission_prompt` reaching a plugin hook.**
 - **`Stop` and `UserPromptSubmit` firing in a resumed session.**
+- ~~Waking on mail, end to end~~: **measured, it works** (findings Test 12). A
+  message woke an asleep sleeper, the Monitor replayed it, Claude answered; a
+  SIGTERM put it to sleep with `read_through` moved past it; two messages sent
+  while asleep woke it again with `--resume`, arrived as two separate events at
+  the 3 s replay pace, and Claude still had the earlier conversation.
 - **SessionStart `source: "resume"` re-registering the row.** The `resume` matcher
   exists in `hooks.json`, but Test 6 didn't check the registry after the resume.
 - **`tmux new-session -d` from an ssh-launched serve end outliving the ssh

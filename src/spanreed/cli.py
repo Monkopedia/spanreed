@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,9 +30,12 @@ from spanreed._fsmode import private_dir, tighten_tree, touch_private, write_pri
 from spanreed.codex_approvals import MODES
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.protocol import Agent, validate_agent_id
+from spanreed.sleeper_runner import run as run_sleeper
+from spanreed.sleeper_runner import wake_if_needed
 from spanreed.sleepers import (
     DEFAULT_IDLE_TIMEOUT_S,
     PERMISSION_MODES,
+    InboxPosition,
     SleeperError,
     SleeperRecord,
     parse_duration,
@@ -45,6 +49,7 @@ from spanreed.store import (
     peer_link_is_attached,
     runner_is_alive,
 )
+from spanreed.transcript import find_transcript, read_deliveries, scan_inbox, unread_lines
 
 # ---------------------------------------------------------------- commands
 
@@ -395,8 +400,46 @@ def _cmd_inbox_watch(_args: argparse.Namespace) -> int:
     inbox = default_state_root() / "inboxes" / f"{validate_agent_id(agent_id)}.jsonl"
     private_dir(inbox.parent, parents=True)
     touch_private(inbox)
-    os.execvp("tail", ["tail", "-n", "0", "-F", str(inbox)])
+    start = "0"
+    if os.environ.get("SPANREED_SLEEPER") == "1":
+        start = _replay_sleeper_inbox(inbox)
+    os.execvp("tail", ["tail", "-n", start, "-F", str(inbox)])
     # execvp does not return.
+
+
+REPLAY_PACE_S = 3.0
+"""Pause between replayed lines. The Monitor batches lines that arrive close
+together into one event and cuts a batch at about 3,000 characters, losing the
+rest (findings Test 9), so a backlog goes over one line at a time. A line cut
+anyway is still unread by the transcript check and is replayed at the next
+launch; the pause only avoids that delay."""
+
+
+def _replay_sleeper_inbox(inbox: Path) -> str:
+    """Hand a woken sleeper its unread mail, then say where ``tail`` takes over.
+
+    Starts from the record's ``read_through`` and skips every line the
+    transcript shows Claude already received, so nothing it had is sent again.
+    Returns ``tail -n``'s argument: ``+N`` for the first line not looked at.
+    """
+    name = os.environ.get("SPANREED_AGENT_NAME", "")
+    store = StateStore()
+    record = store.sleepers.read(name) if name else None
+    if record is None:
+        return "0"
+    deliveries = read_deliveries(find_transcript(record.session_id))
+    # Untrustworthy transcript: replay everything after read_through. Duplicates,
+    # never a loss.
+    delivered = deliveries.delivered if deliveries.trustworthy else set[str]()
+    after = record.read_through
+    if scan_inbox(inbox, after, delivered).rewritten:
+        after = InboxPosition()
+    lines, count = unread_lines(inbox, after, delivered)
+    for n, line in enumerate(lines):
+        if n:
+            time.sleep(REPLAY_PACE_S)
+        print(line, flush=True)
+    return f"+{count + 1}"
 
 
 # Single source of truth for how to handle an inbound bus message. Embedded in
@@ -826,6 +869,9 @@ def _cmd_sleeper(args: argparse.Namespace) -> int:
         "create": _sleeper_create,
         "list": _sleeper_list,
         "retire": _sleeper_retire,
+        "wake": _sleeper_wake,
+        "attach": _sleeper_attach,
+        "_run": _sleeper_run,
     }
     try:
         return handlers[args.sleeper_cmd](args)
@@ -862,6 +908,7 @@ def _sleeper_create(args: argparse.Namespace) -> int:
             cwd=str(cwd),
             session_id=str(uuid.uuid4()),
             permission_mode=args.permission_mode,
+            model=args.model,
             idle_timeout_s=idle_timeout_s,
             claude_path=str(resolved["claude"]),
             spanreed_path=str(resolved["spanreed"]),
@@ -874,9 +921,11 @@ def _sleeper_create(args: argparse.Namespace) -> int:
         f"  cwd:             {record.cwd}\n"
         f"  session id:      {record.session_id}\n"
         f"  permission mode: {record.permission_mode}\n"
+        f"  model:           {record.model or '(Claude Code default)'}\n"
         f"  idle timeout:    {record.idle_timeout_s}s\n"
         f"  inbox read from: line {record.read_through.line + 1} (earlier mail is history)\n"
-        f"It is on the bus now. Waking it is not built yet, so nothing launches Claude."
+        f"It is on the bus now. The first message to it, or `spanreed sleeper wake "
+        f"{record.name}`, launches it."
     )
     return 0
 
@@ -897,6 +946,7 @@ def _sleeper_list(args: argparse.Namespace) -> int:
         print(f"{r.name}  {state}  ({r.agent_id})")
         print(f"  cwd:             {r.cwd}")
         print(f"  permission mode: {r.permission_mode}")
+        print(f"  model:           {r.model or '(Claude Code default)'}")
         print(f"  idle timeout:    {r.idle_timeout_s}s")
         print(f"  session id:      {r.session_id}  (generation {r.generation})")
         if r.tmux_session:
@@ -913,6 +963,34 @@ def _sleeper_list(args: argparse.Namespace) -> int:
                 f"{format_age(skipped.at)}: {skipped.why}"
             )
     return 0
+
+
+def _sleeper_wake(args: argparse.Namespace) -> int:
+    """Wake by hand: the same path a message takes."""
+    store = StateStore()
+    outcome = wake_if_needed(store, sleeper_agent_id(args.name))
+    if outcome is None:
+        raise SleeperError(f"there is no sleeper named {args.name!r}")
+    print(f"sleeper {args.name}: {outcome.reason}")
+    return 0 if outcome.launched or "already" in outcome.reason else 1
+
+
+def _sleeper_attach(args: argparse.Namespace) -> int:
+    """``tmux attach`` to the sleeper's current session, whatever its generation."""
+    record = StateStore().sleepers.read(args.name)
+    if record is None:
+        raise SleeperError(f"there is no sleeper named {args.name!r}")
+    if record.state == "asleep" or record.tmux_session is None:
+        raise SleeperError(
+            f"sleeper {args.name!r} is asleep, so there is no session to attach to. "
+            f"`spanreed sleeper wake {args.name}` wakes it."
+        )
+    os.execvp("tmux", ["tmux", "attach-session", "-t", record.tmux_session])
+
+
+def _sleeper_run(args: argparse.Namespace) -> int:
+    """The runner, inside the sleeper's tmux pane. Started by a wake, never by hand."""
+    return run_sleeper(StateStore(), args.name, args.generation)
 
 
 def _sleeper_retire(args: argparse.Namespace) -> int:
@@ -1124,6 +1202,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Passed on every launch, for the sleeper's whole life",
     )
     p_create.add_argument(
+        "--model",
+        help="Passed as --model on every launch (default: none passed, so Claude Code's "
+        "own settings decide)",
+    )
+    p_create.add_argument(
         "--idle-timeout",
         default=str(DEFAULT_IDLE_TIMEOUT_S),
         help="Idle time before it sleeps: seconds, or 15m / 1h (default: 900)",
@@ -1134,6 +1217,13 @@ def build_parser() -> argparse.ArgumentParser:
         "retire", help="Delete an asleep sleeper's record and row (its inbox is kept)"
     )
     p_retire.add_argument("name")
+    p_wake = sleeper_sub.add_parser("wake", help="Wake a sleeper by hand (as a message would)")
+    p_wake.add_argument("name")
+    p_attach = sleeper_sub.add_parser("attach", help="tmux attach to an awake sleeper")
+    p_attach.add_argument("name")
+    p_run = sleeper_sub.add_parser("_run", help=argparse.SUPPRESS)
+    p_run.add_argument("name")
+    p_run.add_argument("generation", type=int)
 
     return parser
 

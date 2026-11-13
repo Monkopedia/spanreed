@@ -359,16 +359,18 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed list [--include-stale] [--json]` | Report the bus: agents **and** every cross-host bridge with its sync state. Human-readable by default; `--json` emits the bare agent array (the pre-peer-record output) for scripts |
 | `spanreed send --to AGENT --body BODY [--from F] [--in-reply-to ID]` | Post a message. Exit **0** = a live session (or an attached bridge) is watching that inbox; **2** = the recipient could not be resolved and nothing was written (the resolver's diagnosis goes to stderr as a message, not a traceback); **3** = written but only queued, reason on stderr |
 | `spanreed recv AGENT [--since ID]` | Dump an agent's inbox |
-| `spanreed inbox-watch` | `tail -F` this session's inbox (plugin Monitor) |
+| `spanreed inbox-watch` | `tail -F` this session's inbox (plugin Monitor). In a sleeper (`SPANREED_SLEEPER=1`) it first replays every line after the record's `read_through` that the transcript shows Claude has not received, one line every 3 s, then tails from the line after the last one it looked at |
 | `spanreed session-start` | Register + emit SessionStart hook JSON (plugin hook) |
 | `spanreed status [LEVEL]` | Set this session's status (`idle\|working\|needs_input\|blocked`), or show it |
 | `spanreed status-tracking [on\|off]` | Enable/disable bus-wide status tracking, or show the setting |
 | `spanreed activity-log [on\|off]` | Enable/disable bus-wide activity logging, or show the setting |
 | `spanreed log [--since AGE] [--agent ID\|NAME]` | Dump the activity log as JSON lines |
 | `spanreed codex --name N --cwd DIR [--model M] [--effort E] [--mode MODE] [--instructions TEXT]` | Run a Codex worker: a headless bus agent that turns inbound mail into `codex` turns. `--cwd` is required and has no default. |
-| `spanreed sleeper create --name N --cwd DIR --permission-mode MODE [--idle-timeout T]` | Record a sleeper. It starts asleep and nothing is launched. Resolves `claude` and `spanreed` on the caller's PATH, for every later launch. Refuses a name held by a present agent's id or display name, or by an existing sleeper |
+| `spanreed sleeper create --name N --cwd DIR --permission-mode MODE [--model M] [--idle-timeout T]` | Record a sleeper. It starts asleep and nothing is launched until its first mail or `wake`. Resolves `claude` and `spanreed` on the caller's PATH, for every later launch. Refuses a name held by a present agent's id or display name, or by an existing sleeper |
 | `spanreed sleeper list [--json]` | Every sleeper's record: state (`ASLEEP`, `AWAKE`, `SLEEPING`, with `(runner dead)` when its runner is gone), settings, last wake failure, skipped lines |
 | `spanreed sleeper retire N` | Delete an asleep sleeper's record and row. Its inbox is kept |
+| `spanreed sleeper wake N` | Wake it by hand, by the same path a message takes. Exit 1 if the wake failed (the reason is printed and recorded) |
+| `spanreed sleeper attach N` | `tmux attach` to the sleeper's current session, whatever its generation |
 | `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
 
 ## Cross-host bridge wire-format

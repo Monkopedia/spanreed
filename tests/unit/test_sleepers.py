@@ -241,12 +241,14 @@ class TestPresence:
 
 
 class TestDeliveryVerdict:
-    def test_asleep_is_queued_and_says_nothing_will_wake_it(self, store: StateStore) -> None:
+    def test_asleep_is_queued_and_carries_the_wake_failure(self, store: StateStore) -> None:
+        """Mail wakes a sleeper, so asleep after a send means the wake failed."""
         store.create_sleeper(_record())
+        store.send_message("tester", "agent-nap", "hello")  # the test fixture refuses tmux
         delivered, why = store.delivery_verdict("agent-nap")
         assert not delivered
-        assert "ASLEEP" in why
-        assert "not built yet" in why
+        assert "ASLEEP and did not wake" in why
+        assert "tests do not launch tmux" in why
 
     def test_awake_with_a_live_runner_is_delivered(self, store: StateStore) -> None:
         store.create_sleeper(_record())

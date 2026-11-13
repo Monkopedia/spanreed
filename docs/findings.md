@@ -512,3 +512,37 @@ harmless `sleep`/`echo` only, and logging hooks on `Stop`, `StopFailure`,
 Not measured: `background_tasks` in a resumed session; option 2; `session_crons`
 with a cron set. Cleanup: `/exit`, deregister, no `m3-` rows or `sr-m3-` sessions
 left.
+
+## Test 12: Does a sleeper wake on mail, replay it, and sleep again? (2026-11-13)
+
+The first end-to-end run of the stage-2 code (branch `feat/sleepers-readcheck`).
+Claude Code 2.1.283, kaladin, tmux 3.8, an isolated state root, sleeper `sltest`
+created with `--permission-mode acceptEdits` in a scratch directory Claude Code had
+never opened.
+
+- **Mail woke it.** `spanreed send` to the asleep sleeper launched the runner in
+  `spanreed-sltest-1`; the runner launched Claude with `--session-id`.
+- **The first launch in a never-trusted folder stops at the trust dialog.** "Quick
+  safety check: Is this a project you created or one you trust?", default "No,
+  exit". Nothing reached Claude until the dialog was accepted by hand (`Down`,
+  `Enter` through `tmux send-keys`). After that the replaying Monitor delivered the
+  message as an event and Claude answered it.
+- **SIGTERM to Claude put it to sleep cleanly.** The runner saw the exit, found the
+  message delivered in the transcript, wrote `state=asleep` and `read_through`
+  line 1, and exited; the tmux session ended with it.
+- **Mail sent while asleep was delivered on the next wake, one event each.** Two
+  messages, sent back to back; the first woke it (`spanreed-sltest-2`, `--resume`).
+  The Monitor replayed both at the 3 s pace and they arrived as two separate events
+  and two turns. Asked about the first message of the earlier wake, Claude
+  answered correctly: the resume restored the conversation.
+- **A second SIGTERM** left it asleep with `read_through` line 3, the whole inbox.
+- **The woken session ran Sonnet 4.6**, the `model` in `~/.claude/settings.json`,
+  not the model the owner's own sessions pass with `--model`. Hence `create
+  --model`.
+- **The banner warned "Your login expires in 1 day".** That is the failure the
+  design expects to take every wake down at once on this machine (see "An expired
+  login" under "Not verified yet").
+
+Not measured: the batching window (3 s was wide enough for two short messages, and
+nothing narrower was tried); a long backlog; macOS.
+

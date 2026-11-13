@@ -254,8 +254,14 @@ class InboxScan:
     """1-based line number of the first unread line, or ``None`` if all are read."""
     end: InboxPosition
     """The inbox's last line, as of this scan."""
+    first_unread_id: str | None
+    """``msg_id`` on line ``first_unread``, when it has one."""
+    read_through: InboxPosition
+    """The line before ``first_unread`` (or ``end`` when all are read): everything
+    up to it is read, so it is what a record's ``read_through`` becomes."""
     rewritten: bool = False
-    """``read_through`` no longer matched the inbox, so the scan started at line 1."""
+    """The given ``read_through`` no longer matched the inbox, so the scan started
+    at line 1."""
 
 
 def scan_inbox(inbox: Path, read_through: InboxPosition, delivered: set[str]) -> InboxScan:
@@ -287,5 +293,31 @@ def scan_inbox(inbox: Path, read_through: InboxPosition, delivered: set[str]) ->
         (n for n in range(start + 1, len(lines) + 1) if lines[n - 1] not in delivered),
         None,
     )
-    end = InboxPosition(line=len(lines), msg_id=lines[-1] if lines else None)
-    return InboxScan(first_unread=first_unread, end=end, rewritten=rewritten)
+
+    def position(line: int) -> InboxPosition:
+        return InboxPosition(line=line, msg_id=lines[line - 1] if line > 0 else None)
+
+    end = position(len(lines))
+    read_through = end if first_unread is None else position(first_unread - 1)
+    first_unread_id = lines[first_unread - 1] if first_unread is not None else None
+    return InboxScan(first_unread, end, first_unread_id, read_through, rewritten)
+
+
+def unread_lines(inbox: Path, after: InboxPosition, delivered: set[str]) -> tuple[list[str], int]:
+    """Every raw line after ``after.line`` without a delivered record, and the
+    number of lines read. What a replaying Monitor hands to Claude."""
+    unread: list[str] = []
+    count = 0
+    if not inbox.exists():
+        return unread, count
+    with inbox.open(encoding="utf-8", errors="replace") as f:
+        for count, raw in enumerate(f, start=1):
+            if count <= after.line:
+                continue
+            try:
+                parsed: object = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if _get(parsed, "msg_id") not in delivered:
+                unread.append(raw.rstrip("\n"))
+    return unread, count
