@@ -742,9 +742,12 @@ character preview of the message, not its whole body. The full body is always on
 **The transcript is not a promised API, so the check fails safe.** The hooks are
 documented to hand over `transcript_path`, but the record format inside is
 Claude Code's internal format and could change in any release. Whenever the
-transcript is **missing, unreadable, or contains none of the record kinds above**
-(as if the format had changed under us), every line after `read_through` counts as
-**unread**. The cost is a replay, so mail may be seen twice. The runner also sets
+transcript is **missing, unreadable, or holds no `user` or `assistant` record of
+the known shape** (as if the format had changed under us), every line after
+`read_through` counts as **unread**. (The test is the record shape, not "none of
+the three delivered kinds": a sleeper that has never received mail has none of
+those, and its transcript is fine. A transcript that is missing *before the first
+launch* is expected, not a fault.) The cost is a replay, so mail may be seen twice. The runner also sets
 `needs_input` with the reason, so the owner learns the check stopped working
 rather than finding out through duplicates. **In this fail-safe mode, step 4 does
 not relaunch and the poison bound does not count.** The agent sleeps with
