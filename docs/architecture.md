@@ -445,10 +445,14 @@ Resolved since:
 
 ## Sleepers: agents that sleep and wake on mail
 
-**Status: design, not built.** The resume mechanics it rests on are measured in
+**Status: being built, in stages.** Built so far (stage 1): the record, `create`,
+`list` and `retire`, and presence from the record at every liveness site. Not built:
+waking on mail (stage 2), the runner and the sleep transition (stage 3), and the
+hooks and `request_sleep` (stage 4). Until stage 2 lands, nothing launches a
+sleeper's Claude, and mail to one waits in its inbox; the delivery verdict says so.
+The resume mechanics are measured in
 [findings.md](findings.md#test-6-can-a-claude-session-in-tmux-be-exited-and-resumed-by-session-id-2026-11-13).
-Everything else here is the plan. Anything not measured is listed under "Not
-verified yet" rather than stated as fact.
+Anything not measured is listed under "Not verified yet" rather than stated as fact.
 
 A **sleeper** is a Claude Code session spanreed manages inside tmux. You create it
 with a name and a directory. When it goes idle, or asks to, its Claude process exits
@@ -988,8 +992,21 @@ spanreed sleeper retire X     # exits it if awake, deletes the record, removes t
 ```
 
 `create` refuses a name already held by a live agent or an existing sleeper (the
-same rule as #80). `retire` leaves the inbox file in place as history. Mail
-addressed to a retired sleeper is refused, like mail to any unknown agent.
+same rule as #80). "Held" covers a present agent's **display name** as well as its
+id, since a send by name would otherwise be ambiguous between them. `retire` leaves
+the inbox file in place as history. Mail addressed to a retired sleeper is refused,
+like mail to any unknown agent.
+
+Settled while building stage 1 (the author's calls, listed for the owner to see):
+- **`create` launches nothing.** The sleeper starts `asleep`; the first mail, or
+  `sleeper wake`, is its first launch (with `--session-id`).
+- **`--permission-mode` may be omitted.** The record then holds `null` and no flag
+  is passed, so each launch gets whatever Claude Code's settings make the default.
+  A given mode must be one `claude --help` lists (checked at create, since a typo
+  would otherwise fail every wake).
+- **An asleep sleeper's row carries `pid` 0**, which is never alive.
+- **`retire` refuses an awake or sleeping sleeper** until the runner exists to end
+  one.
 
 ### Compatibility
 

@@ -86,7 +86,7 @@ from spanreed.codex_client import (
     TurnResult,
 )
 from spanreed.protocol import Agent, Message, Status, validate_agent_id
-from spanreed.store import AgentIdHeld, StateStore, default_state_root, is_stale
+from spanreed.store import AgentIdHeld, StateStore, default_state_root
 
 AUTH_TOKENS_REFRESH = "account/chatgptAuthTokens/refresh"
 """Server request sent when Codex got a ``401`` and wants the *client* to supply
@@ -646,11 +646,20 @@ class CodexWorker:
         deregistering, and restarting it is exactly what should work.
         """
         holder = self._holder()
-        if holder is None or holder.pid == os.getpid() or is_stale(holder):
+        if holder is None or holder.pid == os.getpid() or not self.store.is_present(holder):
             return
         raise self._name_in_use(holder)
 
     def _name_in_use(self, holder: Agent) -> NameInUse:
+        if holder.sleeper is not None:
+            reason = (
+                f"--name {self.config.name!r} belongs to a sleeper (registry id "
+                f"{self.config.agent_id}, {holder.sleeper}). A sleeper holds its name "
+                f"while asleep, and a worker on it would take the sleeper's mail. "
+                f"Pick a different --name, or `spanreed sleeper retire {self.config.name}`."
+            )
+            self.log.write(f"[codex-worker] REFUSING TO START: {reason}")
+            return NameInUse(reason)
         reason = (
             f"--name {self.config.name!r} is already in use by a running worker "
             f"(registry id {self.config.agent_id}, pid {holder.pid}). Two workers on one "

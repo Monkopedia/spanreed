@@ -29,6 +29,7 @@ import os
 import subprocess
 import time
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,7 @@ from spanreed.codex_worker import (
     WorkerLogUnwritable,
 )
 from spanreed.protocol import Message
+from spanreed.sleepers import SleeperRecord
 from spanreed.store import StateStore
 from tests.unit.test_codex_client import Handler, StubServer, child_cmd, server_encode
 from tests.unit.test_codex_worker import (
@@ -919,6 +921,28 @@ class TestOneNameOneWorker:
         held = [a for a in store.list_agents(include_stale=True) if a.agent_id == "agent-reviewer"]
         assert [a.pid for a in held] == [os.getppid()], "the live holder's row was touched"
         assert "REFUSING TO START" in log_of(worker)
+
+    def test_a_sleepers_name_is_refused_though_the_sleeper_has_no_process(
+        self, make_worker: MakeWorker, store: StateStore
+    ) -> None:
+        store.create_sleeper(
+            SleeperRecord(
+                name="reviewer",
+                agent_id="agent-reviewer",
+                cwd="/tmp",
+                session_id="00000000-0000-4000-8000-000000000000",
+                permission_mode=None,
+                claude_path="/usr/bin/claude",
+                spanreed_path="/usr/bin/spanreed",
+                path_env="/usr/bin",
+                created_at=datetime.now(UTC),
+            )
+        )
+        stub, worker = make_worker(start=False)
+        with pytest.raises(NameInUse, match="belongs to a sleeper"):
+            worker.start()
+        assert stub.received == [], stub.received
+        assert store.sleepers.read("reviewer") is not None
 
     def test_a_holder_that_appears_during_thread_start_is_still_refused(
         self,

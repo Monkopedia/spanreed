@@ -19,7 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -27,12 +29,21 @@ from spanreed._fsmode import private_dir, tighten_tree, touch_private, write_pri
 from spanreed.codex_approvals import MODES
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.protocol import Agent, validate_agent_id
+from spanreed.sleepers import (
+    DEFAULT_IDLE_TIMEOUT_S,
+    PERMISSION_MODES,
+    SleeperError,
+    SleeperRecord,
+    parse_duration,
+    sleeper_agent_id,
+)
 from spanreed.store import (
     StateStore,
     default_state_root,
     format_age,
     is_stale,
     peer_link_is_attached,
+    runner_is_alive,
 )
 
 # ---------------------------------------------------------------- commands
@@ -182,8 +193,22 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _presence_label(agent: Agent, records: dict[str, SleeperRecord]) -> str:
+    """How ``spanreed list`` reads an agent's presence. A crashed sleeper never reads
+    as healthy: its record's state is qualified by whether its runner is alive."""
+    record = records.get(agent.agent_id)
+    if record is None:
+        label = "LIVE " if not is_stale(agent) else "STALE"
+        return label + (f" (sleeper, {agent.sleeper})" if agent.sleeper else "")
+    if record.state == "asleep":
+        return "ASLEEP"
+    state = record.state.upper()
+    return state if runner_is_alive(record) else f"{state} (runner dead)"
+
+
 def _print_bus_report(store: StateStore, agents: list[Agent], *, include_stale: bool) -> None:
     """Write the human bus report to stdout."""
+    records = {r.agent_id: r for r in store.sleepers.records()}
     hidden = len(store.list_agents(include_stale=True)) - len(agents)
     print(f"spanreed bus — state root {store.root}")
     print()
@@ -196,11 +221,12 @@ def _print_bus_report(store: StateStore, agents: list[Agent], *, include_stale: 
     if not agents:
         print("  (none)")
     for agent in agents:
-        live = "LIVE " if not is_stale(agent) else "STALE"
+        live = _presence_label(agent, records)
         via = ""
         if "@" in agent.agent_id:
             via = f"  [mirrored from host {agent.agent_id.rpartition('@')[2]} by the bridge]"
-        print(f"  {live}  {agent.agent_id}  ({agent.name})  pid {agent.pid}{via}")
+        pid = "no process" if agent.pid == 0 else f"pid {agent.pid}"
+        print(f"  {live}  {agent.agent_id}  ({agent.name})  {pid}{via}")
         print(f"         working_dir: {agent.working_dir}")
         if agent.focus:
             print(f"         focus:       {agent.focus}")
@@ -795,6 +821,109 @@ def _cmd_session_start(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sleeper(args: argparse.Namespace) -> int:
+    handlers = {
+        "create": _sleeper_create,
+        "list": _sleeper_list,
+        "retire": _sleeper_retire,
+    }
+    try:
+        return handlers[args.sleeper_cmd](args)
+    except SleeperError as exc:
+        print(f"spanreed sleeper {args.sleeper_cmd}: {exc}", file=sys.stderr)
+        return 1
+
+
+def _sleeper_create(args: argparse.Namespace) -> int:
+    """Record a sleeper. It starts asleep; nothing is launched."""
+    name = args.name
+    try:
+        agent_id = validate_agent_id(sleeper_agent_id(name), qualified_ok=False)
+        idle_timeout_s = parse_duration(args.idle_timeout)
+    except ValueError as exc:
+        raise SleeperError(str(exc)) from None
+    cwd = Path(args.cwd).expanduser().resolve()
+    if not cwd.is_dir():
+        raise SleeperError(f"--cwd {args.cwd!r} is not a directory")
+    # Resolved now, from the creator's PATH, and used for every launch: a wake
+    # may be started by a cron job or a conjoin bridge whose PATH finds neither.
+    path_env = os.environ.get("PATH", "")
+    resolved = {tool: shutil.which(tool, path=path_env) for tool in ("claude", "spanreed")}
+    missing = [tool for tool, path in resolved.items() if path is None]
+    if missing:
+        raise SleeperError(
+            f"{' and '.join(missing)} not found on PATH; a sleeper runs both by absolute "
+            f"path, resolved here at create"
+        )
+    record = StateStore().create_sleeper(
+        SleeperRecord(
+            name=name,
+            agent_id=agent_id,
+            cwd=str(cwd),
+            session_id=str(uuid.uuid4()),
+            permission_mode=args.permission_mode,
+            idle_timeout_s=idle_timeout_s,
+            claude_path=str(resolved["claude"]),
+            spanreed_path=str(resolved["spanreed"]),
+            path_env=path_env,
+            created_at=datetime.now(UTC),
+        )
+    )
+    print(
+        f"created sleeper {record.name} ({record.agent_id}), ASLEEP\n"
+        f"  cwd:             {record.cwd}\n"
+        f"  session id:      {record.session_id}\n"
+        f"  permission mode: {record.permission_mode or '(Claude Code default)'}\n"
+        f"  idle timeout:    {record.idle_timeout_s}s\n"
+        f"  inbox read from: line {record.read_through.line + 1} (earlier mail is history)\n"
+        f"It is on the bus now. Waking it is not built yet, so nothing launches Claude."
+    )
+    return 0
+
+
+def _sleeper_list(args: argparse.Namespace) -> int:
+    records = StateStore().sleepers.records()
+    if args.json:
+        json.dump([r.model_dump(mode="json") for r in records], sys.stdout, indent=2)
+        print()
+        return 0
+    if not records:
+        print("no sleepers (create one with `spanreed sleeper create`)")
+        return 0
+    for r in records:
+        state = r.state.upper()
+        if r.state != "asleep" and not runner_is_alive(r):
+            state += " (runner dead)"
+        print(f"{r.name}  {state}  ({r.agent_id})")
+        print(f"  cwd:             {r.cwd}")
+        print(f"  permission mode: {r.permission_mode or '(Claude Code default)'}")
+        print(f"  idle timeout:    {r.idle_timeout_s}s")
+        print(f"  session id:      {r.session_id}  (generation {r.generation})")
+        if r.tmux_session:
+            print(f"  tmux session:    {r.tmux_session}")
+        print(f"  read through:    inbox line {r.read_through.line}")
+        if r.last_wake_failure:
+            print(
+                f"  LAST WAKE FAILED {format_age(r.last_wake_failure.at)}: "
+                f"{r.last_wake_failure.reason}"
+            )
+        for skipped in r.skipped_lines:
+            print(
+                f"  SKIPPED inbox line {skipped.line} ({skipped.msg_id}) "
+                f"{format_age(skipped.at)}: {skipped.why}"
+            )
+    return 0
+
+
+def _sleeper_retire(args: argparse.Namespace) -> int:
+    record = StateStore().retire_sleeper(args.name)
+    print(
+        f"retired sleeper {record.name} ({record.agent_id}). Its inbox is kept as "
+        f"history; mail to it is now refused, as for any unknown agent."
+    )
+    return 0
+
+
 # ---------------------------------------------------------------- argparse
 
 
@@ -980,6 +1109,32 @@ def build_parser() -> argparse.ArgumentParser:
         "15). Raise it if the far side's login is slow. Range 6 to 86400.",
     )
 
+    p_sleeper = sub.add_parser(
+        "sleeper",
+        help="Manage sleepers: Claude Code sessions that sleep when idle and wake on mail",
+    )
+    sleeper_sub = p_sleeper.add_subparsers(dest="sleeper_cmd", required=True)
+    p_create = sleeper_sub.add_parser("create", help="Record a new sleeper (it starts asleep)")
+    p_create.add_argument("--name", required=True, help="Bus name; its agent_id is agent-<name>")
+    p_create.add_argument("--cwd", required=True, help="Directory Claude runs in")
+    p_create.add_argument(
+        "--permission-mode",
+        choices=PERMISSION_MODES,
+        help="Passed on every launch, for the sleeper's whole life (default: none passed, "
+        "so Claude Code's own settings decide)",
+    )
+    p_create.add_argument(
+        "--idle-timeout",
+        default=str(DEFAULT_IDLE_TIMEOUT_S),
+        help="Idle time before it sleeps: seconds, or 15m / 1h (default: 900)",
+    )
+    p_slist = sleeper_sub.add_parser("list", help="Show every sleeper and its record")
+    p_slist.add_argument("--json", action="store_true", help="Emit the records as JSON")
+    p_retire = sleeper_sub.add_parser(
+        "retire", help="Delete an asleep sleeper's record and row (its inbox is kept)"
+    )
+    p_retire.add_argument("name")
+
     return parser
 
 
@@ -1001,6 +1156,7 @@ _DISPATCH = {
     "log": _cmd_log,
     "codex": _cmd_codex,
     "conjoin": _cmd_conjoin,
+    "sleeper": _cmd_sleeper,
 }
 
 

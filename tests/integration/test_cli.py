@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1153,3 +1154,99 @@ class TestSendReportsDelivery:
         assert "has NEVER RECEIVED A REGISTRY SNAPSHOT from 'macbook'" in captured.err
         assert "Traceback" not in captured.err
         assert captured.out == ""
+
+
+class TestSleeperCommands:
+    """``spanreed sleeper create | list | retire`` (stage 1: nothing launches yet)."""
+
+    @pytest.fixture
+    def tools_on_path(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+        """Fake ``claude`` and ``spanreed`` executables, the only things on PATH."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for tool in ("claude", "spanreed"):
+            exe = bin_dir / tool
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir))
+        return bin_dir
+
+    def test_create_resolves_tools_and_records_the_launch_settings(
+        self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        argv = ["sleeper", "create", "--name", "nap", "--cwd", str(cli_env),
+                "--permission-mode", "plan", "--idle-timeout", "20m"]  # fmt: skip
+        assert cli.main(argv) == 0
+        assert "created sleeper nap (agent-nap), ASLEEP" in capsys.readouterr().out
+        record = StateStore().sleepers.read("nap")
+        assert record is not None
+        assert record.claude_path == str(tools_on_path / "claude")
+        assert record.spanreed_path == str(tools_on_path / "spanreed")
+        assert record.path_env == str(tools_on_path)
+        assert (record.permission_mode, record.idle_timeout_s) == ("plan", 1200)
+        assert record.cwd == str(cli_env.resolve())
+
+    def test_create_refuses_when_claude_is_not_on_path(
+        self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tools_on_path / "claude").unlink()
+        assert cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)]) == 1
+        assert "claude not found on PATH" in capsys.readouterr().err
+        assert StateStore().sleepers.read("nap") is None
+
+    def test_create_refuses_a_bad_duration(
+        self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        argv = ["sleeper", "create", "--name", "nap", "--cwd", str(cli_env),
+                "--idle-timeout", "soon"]  # fmt: skip
+        assert cli.main(argv) == 1
+        assert "not a duration" in capsys.readouterr().err
+
+    def test_create_refuses_an_unknown_permission_mode(
+        self, cli_env: Path, tools_on_path: Path
+    ) -> None:
+        argv = ["sleeper", "create", "--name", "nap", "--cwd", str(cli_env),
+                "--permission-mode", "yolo"]  # fmt: skip
+        with pytest.raises(SystemExit):
+            cli.main(argv)
+
+    def test_create_refuses_a_name_that_is_not_a_legal_id(
+        self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert cli.main(["sleeper", "create", "--name", "a/b", "--cwd", str(cli_env)]) == 1
+        assert "is not legal" in capsys.readouterr().err
+
+    def test_list_and_bus_report_show_it_asleep(
+        self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)])
+        capsys.readouterr()
+        assert cli.main(["sleeper", "list"]) == 0
+        assert "nap  ASLEEP  (agent-nap)" in capsys.readouterr().out
+        assert cli.main(["list"]) == 0
+        assert "ASLEEP  agent-nap  (nap)  no process" in capsys.readouterr().out
+
+    def test_list_marks_a_dead_runner(
+        self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)])
+        # PATH holds only the fake tools here, so there is no `true` to reap.
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        store = StateStore()
+        record = store.sleepers.read("nap")
+        assert record is not None
+        store.sleepers.write(record.model_copy(update={"state": "awake", "runner_pid": dead.pid}))
+        capsys.readouterr()
+        cli.main(["sleeper", "list"])
+        assert "nap  AWAKE (runner dead)" in capsys.readouterr().out
+        cli.main(["list"])
+        assert "AWAKE (runner dead)  agent-nap" in capsys.readouterr().out
+
+    def test_retire_removes_it(
+        self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)])
+        assert cli.main(["sleeper", "retire", "nap"]) == 0
+        assert cli.main(["sleeper", "retire", "nap"]) == 1
+        assert "no sleeper named 'nap'" in capsys.readouterr().err

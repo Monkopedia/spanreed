@@ -13,6 +13,10 @@ from typing import Literal
 from pydantic import BaseModel
 
 Status = Literal["idle", "working", "needs_input", "blocked"]
+
+SleeperState = Literal["asleep", "awake", "sleeping"]
+"""A sleeper's state (``docs/architecture.md``, "Sleepers"). ``sleeping`` means
+committed to sleep, with Claude being ended."""
 """Self-reported agent status, ordered by escalating need for a human:
 
 - ``idle`` — registered but not actively working.
@@ -112,6 +116,15 @@ class Agent(BaseModel):
     session isn't ``blocked`` just because the last one was, and a stale status
     would mislead the very fleet view this exists to provide. ``None`` means
     "not reported" (status tracking off, or not yet set this session).
+    """
+
+    sleeper: SleeperState | None = None
+    """Set only on a sleeper's row: its state, taken from the sleeper record.
+
+    ``None`` on every other row. For a local sleeper the record, not this field
+    or ``pid``, decides presence: an asleep sleeper has no process. The field
+    exists so a ``conjoin`` peer, which cannot read the record, can show the
+    state. An older binary ignores it.
     """
 
 
