@@ -306,3 +306,44 @@ behaves when mail arrived while the session was down, and anything on macOS.
 
 **Cleanup:** the spike exited through the same `/exit` path, and its registry row
 (`agent-sleeper-spike`) was deregistered. `spanreed list` shows 0 rows for it.
+
+## Test 7: Idle, the inbox Monitor, and what the transcript records (2026-11-13)
+
+Run to answer three questions the sleepers design depends on. Claude Code
+2.1.283, tmux 3.8, kaladin, `~/git/spanreed`. A tmux session ran `claude
+--session-id <uuid> --permission-mode acceptEdits --settings <file>`, with the file
+registering a logging hook on `SessionStart`, `UserPromptSubmit`, `Stop`,
+`Notification`, `TaskCreated`, `TaskCompleted`, `SubagentStart` and
+`SubagentStop`. The spanreed plugin's inbox Monitor ran as usual
+(`SPANREED_AGENT_NAME=idle-spike`).
+
+**1. Does the always-running inbox Monitor get in the way of idle?** No.
+- `SessionStart` fired with `source: "startup"`.
+- **No `TaskCreated` or `TaskCompleted` fired for the Monitor**, at start or
+  afterwards. The task hooks don't count it as background work.
+- A typed turn fired `UserPromptSubmit`. `Stop` followed 1.5 s after the reply,
+  with the Monitor still running.
+- With nothing else happening, `Notification` with `notification_type:
+  "idle_prompt"` fired **exactly 60.0 s after `Stop`**.
+
+**2. Does a turn the Monitor starts fire `UserPromptSubmit`?** Yes. A real bus
+message (`spanreed send` → `msg-0ba931e3`) made the Monitor start a turn.
+`UserPromptSubmit` fired, and its prompt text began with the Monitor's
+`<task-notification>` (the event text, not a user prompt). `Stop` fired 7.4 s later.
+
+**3. What does the transcript record for a Monitor-delivered message?** Two
+records hold the `msg_id`, in this order:
+1. `queue-operation` / `enqueue` at 20:18:26.991, written before the turn.
+2. `user` at 20:18:27.013, the delivered turn input.
+
+So the id is in the transcript **before** Claude has received the message. A check
+for "read" must look for the delivered record, never just the id anywhere in the
+file. (The review of PR #84 measured the same across 21 local transcripts: 13,144
+Monitor-enqueued ids, every one later delivered, and 9,448 of 10,178 delivered
+events truncated at about 514 characters, with the `msg_id` surviving because it
+is the first field.)
+
+**Not measured by this run:** whether a background shell command or a subagent
+fires `TaskCreated`; whether a session with a pending `enqueue` keeps it across an
+exit; anything about resume. The spike was exited with `/exit` and its registry row
+deregistered.
