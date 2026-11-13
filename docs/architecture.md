@@ -466,8 +466,8 @@ session is down is never surfaced.)
 **Confirmed by the owner** in the spanreed session on 2026-11-13 ("1–5 confirmed, 6
 yes"). The confirmation is relayed verbatim on #85 (comment 6863746710) and was
 checked against the session transcript in the review of PR #84. It is not yet a
-comment from his own account. One rule here is **not** confirmed: what happens
-with background work that never finishes; see "Going to sleep".
+comment from his own account. The background-work rule below was settled the
+same day, as decision 7 on #85.
 
 - **Wake resumes the same conversation** (`claude --resume <session-id>`), never a
   fresh session. *The owner's request:* "Resume, if it doesn't resume there is no
@@ -603,7 +603,15 @@ else does. Two possible sources for "is anything else running":
 
 The dialog is the only source known to be complete, and it is also the fragile UI
 described under "The exit". Which to rely on is decided by measurement in the
-implementation PR, not here. Whether these
+implementation PR, not here.
+
+**Known limitation (owner's call, decision 7 on #85): background work that never
+finishes keeps the agent awake.** Examples are a dev server or a file watcher.
+Any background work other than the inbox Monitor blocks sleep, and that includes
+`request_sleep`. So a never-ending task keeps the sleeper awake, using memory,
+until someone stops the task. There is no cap, and nothing ends the work on the
+agent's behalf. "Let `request_sleep` end it" is deferred, not rejected. The
+owner's words: "That's fine for now, we can just it as a limitation". Whether these
 hooks fire as documented here, including for turns the inbox Monitor starts, is
 **not yet measured**, and idle detection depends on it.
 
