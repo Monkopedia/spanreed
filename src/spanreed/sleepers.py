@@ -98,6 +98,9 @@ class SleeperRecord(BaseModel):
     """Fixed at create and passed on every launch (#85 decision 2: "always keep
     it"). Required: with no flag, each launch would take whatever Claude Code's
     settings said at that moment, so the mode would not be kept."""
+    model: str | None = None
+    """Fixed at create and passed as ``--model`` on every launch, like the
+    permission mode. ``None`` passes no flag: Claude Code's settings decide."""
     idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S
     claude_path: str
     spanreed_path: str

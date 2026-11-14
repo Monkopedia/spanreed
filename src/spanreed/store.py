@@ -134,14 +134,21 @@ SLEEPER_ROW_PID_START = -1
 """``pid_start`` of a sleeper row that has no process: no process has it."""
 
 
-def runner_is_alive(record: SleeperRecord) -> bool:
-    """Whether the runner ``record`` names is still running. The same test as
-    :func:`is_stale`: pid alive, and its start time unchanged when known."""
-    if record.runner_pid is None or not _is_pid_alive(record.runner_pid):
+def process_is_alive(pid: int, pid_start: int | None) -> bool:
+    """The test :func:`is_stale` applies: ``pid`` alive, and its start time
+    unchanged when one was recorded (so a recycled pid reads as dead)."""
+    if not _is_pid_alive(pid):
         return False
-    if record.runner_pid_start is None:
+    if pid_start is None:
         return True
-    return pid_start_time(record.runner_pid) == record.runner_pid_start
+    return pid_start_time(pid) == pid_start
+
+
+def runner_is_alive(record: SleeperRecord) -> bool:
+    """Whether the runner ``record`` names is still running."""
+    return record.runner_pid is not None and process_is_alive(
+        record.runner_pid, record.runner_pid_start
+    )
 
 
 def format_age(ts: datetime | None, *, now: datetime | None = None) -> str:
@@ -295,7 +302,7 @@ class StateStore:
             pid_start=pid_start_time(pid),
             last_seen=datetime.now(UTC),
         )
-        if refuse_live_holder and (record := self._sleeper_for(new_entry.agent_id)):
+        if refuse_live_holder and (record := self.sleeper_for(new_entry.agent_id)):
             # A sleeper holds its id while asleep, with no process to be live.
             raise AgentIdHeld(self._sleeper_row(record, None))
         with self._registry_lock():
@@ -417,7 +424,7 @@ class StateStore:
     def sleeper_ids(self) -> set[str]:
         return {sleeper_agent_id(n) for n in self.sleepers.names()}
 
-    def _sleeper_for(self, agent_id: str) -> SleeperRecord | None:
+    def sleeper_for(self, agent_id: str) -> SleeperRecord | None:
         """The local sleeper record behind ``agent_id``, if it is one."""
         if not agent_id.startswith("agent-") or "@" in agent_id:
             return None
@@ -551,7 +558,7 @@ class StateStore:
 
     # ------------------------------------------------------------------ inboxes
 
-    def _inbox_path(self, agent_id: str) -> Path:
+    def inbox_path(self, agent_id: str) -> Path:
         # Every inbox read and write goes through here, including the bridge
         # delivering a peer's frame verbatim, so this is the one place a
         # traversal in `to_agent` can be stopped (#12).
@@ -742,7 +749,7 @@ class StateStore:
                 f"agent and no bridge attached to it. Nothing will ever read it unless an "
                 f"agent registers under exactly that id."
             )
-        record = self._sleeper_for(agent_id)
+        record = self.sleeper_for(agent_id)
         if record is not None:
             return self._sleeper_verdict(record)
         _, _, host = agent_id.rpartition("@")
@@ -784,34 +791,45 @@ class StateStore:
 
     @staticmethod
     def _sleeper_verdict(record: SleeperRecord) -> tuple[bool, str]:
-        """:meth:`delivery_verdict` for a local sleeper, from its record."""
-        who = f"{record.agent_id} ({record.name}) is a sleeper"
+        """:meth:`delivery_verdict` for a local sleeper, from its record.
+
+        Called after the append, and so after the wake the append triggered:
+        ``asleep`` here means that wake did not happen or did not launch.
+        """
+        who = f"{record.agent_id} ({record.name}), a sleeper,"
+        inbox = f"inboxes/{record.agent_id}.jsonl"
         if record.state == "asleep":
+            failure = record.last_wake_failure
+            why = (
+                f"The wake failed {format_age(failure.at)}: {failure.reason}"
+                if failure is not None
+                else "No wake was launched."
+            )
             return False, (
-                f"QUEUED, NOT DELIVERED: {who} and is ASLEEP, so no session is running "
-                f"for it. The message waits in inboxes/{record.agent_id}.jsonl. Waking a "
-                f"sleeper when mail arrives is not built yet, so nothing will start it "
-                f"for this message: treat it as queued and do not wait for a reply."
+                f"QUEUED, NOT DELIVERED: {who} is ASLEEP and did not wake. {why} The "
+                f"message waits in {inbox} and is delivered at the next wake (the next "
+                f"message, or `spanreed sleeper wake {record.name}`). Treat it as queued "
+                f"and do not wait for a reply."
             )
         if not runner_is_alive(record):
             return False, (
-                f"QUEUED, NOT DELIVERED: {who} whose record says {record.state.upper()}, "
-                f"but its runner (pid {record.runner_pid}) is gone: a crash, a reboot, or "
-                f"its tmux server ending. The message waits in "
-                f"inboxes/{record.agent_id}.jsonl until the sleeper is woken again. Treat "
-                f"it as queued and do not wait for a reply."
+                f"QUEUED, NOT DELIVERED: {who} has a record saying "
+                f"{record.state.upper()}, but its runner (pid {record.runner_pid}) is "
+                f"gone: a crash, a reboot, or its tmux server ending. The message waits "
+                f"in {inbox} until the sleeper is woken again. Treat it as queued and do "
+                f"not wait for a reply."
             )
         if record.state == "sleeping":
             return False, (
-                f"QUEUED, NOT DELIVERED YET: {who} and is GOING TO SLEEP (runner pid "
+                f"QUEUED, NOT DELIVERED YET: {who} is GOING TO SLEEP (runner pid "
                 f"{record.runner_pid}, tmux session {record.tmux_session}). Once Claude "
                 f"has exited, the runner checks the inbox against the transcript and "
                 f"relaunches it if anything is unread, this message included."
             )
         return True, (
-            f"Delivered to {who} and is AWAKE (runner pid {record.runner_pid}, tmux "
-            f"session {record.tmux_session}); its inbox monitor is reading "
-            f"inboxes/{record.agent_id}.jsonl."
+            f"Delivered to {who} which is AWAKE (runner pid {record.runner_pid}, tmux "
+            f"session {record.tmux_session}). If this message woke it, its inbox monitor "
+            f"hands the message over once Claude is up, usually within seconds."
         )
 
     # ------------------------------------------------------------------ sleepers
@@ -887,7 +905,7 @@ class StateStore:
     def _inbox_end(self, agent_id: str) -> InboxPosition:
         """The position after the last line of ``agent_id``'s inbox."""
         position = InboxPosition()
-        inbox = self._inbox_path(agent_id)
+        inbox = self.inbox_path(agent_id)
         if not inbox.exists():
             return position
         with inbox.open() as f:
@@ -929,9 +947,10 @@ class StateStore:
             ts=datetime.now(UTC),
             in_reply_to=in_reply_to,
         )
-        inbox = self._inbox_path(to_agent)
+        inbox = self.inbox_path(to_agent)
         with open_private(inbox) as f:
             f.write(msg.model_dump_json() + "\n")
+        self._wake_after_append(to_agent)
         return msg
 
     def append_message(self, msg: Message) -> None:
@@ -948,9 +967,22 @@ class StateStore:
         """
         if any(existing.msg_id == msg.msg_id for existing in self.recv_messages(msg.to_agent)):
             return
-        inbox = self._inbox_path(msg.to_agent)
+        inbox = self.inbox_path(msg.to_agent)
         with open_private(inbox) as f:
             f.write(msg.model_dump_json() + "\n")
+        self._wake_after_append(msg.to_agent)
+
+    def _wake_after_append(self, agent_id: str) -> None:
+        """Wake ``agent_id`` if it is an asleep sleeper. **Every inbox writer calls this
+        after appending** (``docs/architecture.md``, "Who does what"): a writer that
+        skips it delivers mail that never wakes anyone. Never raises.
+        """
+        if "@" in agent_id or not self.sleepers.names():
+            return
+        # Imported here: the runner module imports this one.
+        from spanreed.sleeper_runner import wake_if_needed
+
+        wake_if_needed(self, agent_id)
 
     def recv_messages(
         self,
@@ -963,7 +995,7 @@ class StateStore:
         cursor isn't found in the inbox (e.g. truncated), fail safe by returning
         everything — better to deliver too much than to silently drop messages.
         """
-        inbox = self._inbox_path(agent_id)
+        inbox = self.inbox_path(agent_id)
         if not inbox.exists():
             return []
         messages: list[Message] = []
