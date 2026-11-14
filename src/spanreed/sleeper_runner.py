@@ -342,6 +342,12 @@ def record_activity(store: StateStore, name: str, hook: dict[str, object]) -> No
     record = store.sleepers.read(name)
     if record is None:
         return
+    session = hook.get("session_id")
+    if isinstance(session, str) and session != record.session_id:
+        # A Claude the sleeper started (`claude -p` from its Bash tool) inherits
+        # SPANREED_SLEEPER and the name, so its hooks land here too. Its Stop is
+        # not the sleeper's: counting it would read the sleeper as idle mid-turn.
+        return
     if event == "Notification":
         if hook.get("notification_type") == "permission_prompt":
             store.set_status(record.agent_id, "needs_input")
@@ -610,6 +616,12 @@ def _after_exit(
             _fail(store, record, reason)
             _say(f"WAKE FAILED: {reason}")
             return None
+        # The relaunch exists to deliver mail. A request to sleep made before it
+        # must not end it: the launch reads as the last Stop, so the request would
+        # fire about REQUEST_QUIET_S after launch, before the Monitor has handed
+        # anything over (review of #91). The agent can ask again once it has
+        # handled the mail.
+        record = record.model_copy(update={"sleep_requested": False})
         store.sleepers.write(record)
         return record
 

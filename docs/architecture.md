@@ -671,6 +671,19 @@ an error rather than doing nothing. `spanreed sleeper sleep X` does the same fro
 shell, and `retire X` uses it on an awake sleeper, waiting up to 60 s for it to
 sleep before removing it.
 
+**A request does not survive a relaunch.** If mail arrives while the agent is
+going to sleep, step 4 relaunches Claude to deliver it, and the request is
+cleared then. Otherwise the relaunch, whose launch reads as the last `Stop`,
+would be ended `REQUEST_QUIET_S` after it started, before the Monitor had handed
+anything over (found in the review of PR #91). The agent can ask again once it
+has handled the mail.
+
+**Only the sleeper's own session reports turns.** A Claude the sleeper starts
+itself (`claude -p` from its Bash tool) inherits `SPANREED_SLEEPER` and the name,
+so its hooks fire too. Hook input carries a `session_id`, and activity from any
+session but the record's is ignored; a child's `Stop` would otherwise read the
+sleeper as idle mid-turn.
+
 **A plugin older than the CLI reports no turns.** The turn hooks live in the
 plugin, which updates separately (`claude plugin update`). Without them the
 runner would see no activity and take the launch as the last `Stop`, which could
