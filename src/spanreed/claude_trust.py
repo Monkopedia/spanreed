@@ -136,12 +136,14 @@ def trust_folder(folder: Path, state_file: Path | None = None) -> None:
         cast(dict[str, object], entry)[TRUST_KEY] = True
 
         tmp = path.with_name(f"{path.name}.spanreed-{os.getpid()}.tmp")
+        created = False
         try:
             fd = os.open(
                 tmp,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 before.st_mode & 0o777,
             )
+            created = True
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 # Claude Code's own layout, so unrelated bytes round-trip unchanged.
                 json.dump(state, f, indent=2, ensure_ascii=False)
@@ -150,7 +152,8 @@ def trust_folder(folder: Path, state_file: Path | None = None) -> None:
                 continue  # a Claude session wrote it meanwhile: start over from its version
             tmp.replace(path)
         except OSError as exc:
-            tmp.unlink(missing_ok=True)
+            if created:  # never remove a file this call did not make
+                tmp.unlink(missing_ok=True)
             raise TrustError(f"cannot write {path}: {exc}") from None
         if folder_is_trusted(folder, path) is not True:
             raise TrustError(

@@ -206,6 +206,25 @@ class TestWriteSafety:
         assert "héllo ✓" in path.read_text(encoding="utf-8")
         assert "\\u" not in path.read_text(encoding="utf-8")
 
+    @pytest.mark.parametrize("kind", ["file", "symlink"])
+    def test_an_existing_entry_at_the_temp_path_is_not_written_through(
+        self, state: Path, tmp_path: Path, kind: str
+    ) -> None:
+        """The temp file is created fresh, never opened over something already there."""
+        other = tmp_path / "other.txt"
+        other.write_text("unchanged")
+        temp = state.with_name(f"{state.name}.spanreed-{os.getpid()}.tmp")
+        if kind == "symlink":
+            temp.symlink_to(other)
+        else:
+            temp.write_text("unchanged")
+        before = state.read_bytes()
+        with pytest.raises(TrustError, match="cannot write"):
+            trust_folder(Path("/srv/new"), state)
+        assert other.read_text() == "unchanged"
+        assert temp.is_symlink() if kind == "symlink" else temp.read_text() == "unchanged"
+        assert state.read_bytes() == before
+
     def test_a_write_failure_is_a_trust_error_and_leaves_no_temp(self, tmp_path: Path) -> None:
         folder = tmp_path / "ro"
         folder.mkdir()
