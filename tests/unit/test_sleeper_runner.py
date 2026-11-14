@@ -6,21 +6,25 @@ replaced, and the runner's Claude is a small script.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from spanreed import cli, sleeper_runner
+from spanreed import cli, mcp_server, sleeper_runner
+from spanreed import store as store_module
 from spanreed.protocol import Message
-from spanreed.sleepers import InboxPosition, SleeperRecord
+from spanreed.sleepers import Activity, InboxPosition, SleeperError, SleeperRecord
 from spanreed.store import StateStore, pid_start_time
 from spanreed.transcript import Deliveries, TranscriptStatus, read_deliveries
 
@@ -462,6 +466,15 @@ class TestAfterClaudeExits:
         assert after_exit(_deliveries(), _deliveries(), 0) is None
 
 
+@pytest.fixture(autouse=True)
+def restore_signals() -> Iterator[None]:
+    """run() ignores SIGINT, SIGQUIT and SIGTSTP for the pane; undo it for pytest."""
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP)}
+    yield
+    for sig, handler in saved.items():
+        signal.signal(sig, handler)
+
+
 def _fake_claude(tmp_path: Path, body: str) -> Path:
     script = tmp_path / "fake-claude"
     script.write_text(f"#!{sys.executable}\nimport sys, os\n{body}\n")
@@ -470,16 +483,6 @@ def _fake_claude(tmp_path: Path, body: str) -> Path:
 
 
 class TestRun:
-    @pytest.fixture(autouse=True)
-    def restore_signals(self) -> Iterator[None]:
-        """run() ignores SIGINT, SIGQUIT and SIGTSTP for the pane; undo it for pytest."""
-        saved = {
-            sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP)
-        }
-        yield
-        for sig, handler in saved.items():
-            signal.signal(sig, handler)
-
     def test_claude_exiting_clean_at_once_with_mail_unread_does_not_spin(
         self, store: StateStore, launches: Launches, tmp_path: Path, config_dir: Path
     ) -> None:
@@ -666,3 +669,471 @@ class TestMonitorReplay:
         printed, argv = watch()
         assert printed == []
         assert argv[:3] == ["tail", "-n", "0"]
+
+
+T0 = datetime(2026, 11, 13, 12, 0, tzinfo=UTC)
+
+
+def _at(seconds: float) -> datetime:
+    return T0 + timedelta(seconds=seconds)
+
+
+class TestSleepReason:
+    """Step 1 of "Committing to sleep"."""
+
+    def test_idle_past_the_timeout_with_nothing_running(self) -> None:
+        stop = Activity(event="Stop", at=_at(10))
+        record = _record(idle_timeout_s=60)
+        assert sleeper_runner.sleep_reason(record, stop, _at(0), _at(69)) is None
+        why = sleeper_runner.sleep_reason(record, stop, _at(0), _at(70))
+        assert why is not None and "idle for 60s" in why
+
+    def test_a_turn_in_progress_never_sleeps(self) -> None:
+        busy_turn = Activity(event="UserPromptSubmit", at=_at(10))
+        record = _record(idle_timeout_s=60, sleep_requested=True)
+        assert sleeper_runner.sleep_reason(record, busy_turn, _at(0), _at(10_000)) is None
+
+    def test_background_work_blocks_the_idle_timeout(self) -> None:
+        """Decision 7: the idle timeout never stops anything."""
+        stop = Activity(event="Stop", at=_at(10), busy=["shell npm run dev"])
+        record = _record(idle_timeout_s=60)
+        assert sleeper_runner.sleep_reason(record, stop, _at(0), _at(10_000)) is None
+
+    def test_a_request_sleeps_after_the_quiet_period_and_stops_work(self) -> None:
+        """Decision 7: request_sleep stops remaining background work."""
+        stop = Activity(event="Stop", at=_at(10), busy=["shell npm run dev"])
+        record = _record(idle_timeout_s=900, sleep_requested=True)
+        assert sleeper_runner.sleep_reason(record, stop, _at(0), _at(14)) is None
+        why = sleeper_runner.sleep_reason(record, stop, _at(0), _at(15))
+        assert why is not None and "stopping shell npm run dev" in why
+
+    def test_activity_from_before_this_launch_is_ignored(self) -> None:
+        """A Stop from the previous launch must not put a fresh launch to sleep."""
+        old_stop = Activity(event="Stop", at=_at(0))
+        record = _record(idle_timeout_s=60)
+        launched = _at(1000)
+        assert sleeper_runner.sleep_reason(record, old_stop, launched, _at(1059)) is None
+        assert sleeper_runner.sleep_reason(record, old_stop, launched, _at(1060)) is not None
+
+    def test_a_launch_with_no_turn_yet_counts_from_the_launch(self) -> None:
+        record = _record(idle_timeout_s=60)
+        assert sleeper_runner.sleep_reason(record, None, _at(0), _at(59)) is None
+        assert sleeper_runner.sleep_reason(record, None, _at(0), _at(60)) is not None
+
+
+class TestRecordActivity:
+    @pytest.fixture
+    def nap(self, store: StateStore) -> StateStore:
+        store.create_sleeper(_record())
+        store.register_agent(name="nap", working_dir="/tmp", pid=os.getpid(), agent_id="agent-nap")
+        return store
+
+    def test_a_stop_lists_running_work_but_not_the_inbox_monitor(self, nap: StateStore) -> None:
+        tasks = [
+            {"id": "1", "type": "shell", "status": "running", "command": "spanreed inbox-watch"},
+            {"id": "2", "type": "shell", "status": "running", "command": "sleep 240"},
+            {"id": "3", "type": "subagent", "status": "running", "agent_type": "general-purpose"},
+            {"id": "4", "type": "shell", "status": "completed", "command": "make"},
+            {"id": "5", "type": "shell", "status": "running", "command": "tail -f x.log"},
+        ]
+        sleeper_runner.record_activity(
+            nap, "nap", {"hook_event_name": "Stop", "background_tasks": tasks}
+        )
+        activity = nap.sleepers.read_activity("nap")
+        assert activity is not None and activity.event == "Stop"
+        assert activity.busy == [
+            "shell sleep 240",
+            "subagent general-purpose",
+            "shell tail -f x.log",
+        ]
+
+    def test_only_the_inbox_monitor_running_is_idle(self, nap: StateStore) -> None:
+        tasks = [{"type": "shell", "status": "running", "command": "spanreed inbox-watch"}]
+        sleeper_runner.record_activity(
+            nap, "nap", {"hook_event_name": "Stop", "background_tasks": tasks}
+        )
+        activity = nap.sleepers.read_activity("nap")
+        assert activity is not None and activity.busy == []
+
+    def test_a_nested_claudes_hooks_are_ignored(self, nap: StateStore) -> None:
+        """Review of #91: a `claude -p` the sleeper starts inherits SPANREED_SLEEPER and
+        the name. Its Stop must not make the sleeper look idle mid-turn."""
+        sleeper_runner.record_activity(
+            nap, "nap", {"hook_event_name": "UserPromptSubmit", "session_id": SID}
+        )
+        sleeper_runner.record_activity(
+            nap, "nap", {"hook_event_name": "Stop", "session_id": "some-child-session"}
+        )
+        activity = nap.sleepers.read_activity("nap")
+        assert activity is not None and activity.event == "UserPromptSubmit"
+
+    def test_a_prompt_records_a_turn_start(self, nap: StateStore) -> None:
+        sleeper_runner.record_activity(nap, "nap", {"hook_event_name": "UserPromptSubmit"})
+        activity = nap.sleepers.read_activity("nap")
+        assert activity is not None and activity.event == "UserPromptSubmit"
+
+    def test_a_permission_prompt_sets_needs_input(self, nap: StateStore) -> None:
+        sleeper_runner.record_activity(
+            nap,
+            "nap",
+            {"hook_event_name": "Notification", "notification_type": "permission_prompt"},
+        )
+        assert [a.status for a in nap.list_agents()] == ["needs_input"]
+        assert nap.sleepers.read_activity("nap") is None, "a notification is not a turn event"
+
+    def test_an_idle_prompt_changes_nothing(self, nap: StateStore) -> None:
+        sleeper_runner.record_activity(
+            nap, "nap", {"hook_event_name": "Notification", "notification_type": "idle_prompt"}
+        )
+        assert [a.status for a in nap.list_agents()] == [None]
+
+    def test_the_cli_hook_does_nothing_outside_a_sleeper(
+        self, nap: StateStore, monkeypatch: pytest.MonkeyPatch, state_root: Path
+    ) -> None:
+        monkeypatch.setenv("SPANREED_STATE_ROOT", str(state_root))
+        monkeypatch.setenv("SPANREED_AGENT_NAME", "nap")
+        monkeypatch.delenv("SPANREED_SLEEPER", raising=False)
+        monkeypatch.setattr("sys.stdin", io.StringIO('{"hook_event_name": "Stop"}'))
+        assert cli.main(["sleeper", "_activity"]) == 0
+        assert nap.sleepers.read_activity("nap") is None
+
+    def test_the_cli_hook_records_in_a_sleeper_and_survives_garbage(
+        self,
+        nap: StateStore,
+        monkeypatch: pytest.MonkeyPatch,
+        state_root: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setenv("SPANREED_STATE_ROOT", str(state_root))
+        monkeypatch.setenv("SPANREED_AGENT_NAME", "nap")
+        monkeypatch.setenv("SPANREED_SLEEPER", "1")
+        monkeypatch.setattr("sys.stdin", io.StringIO('{"hook_event_name": "Stop"}'))
+        assert cli.main(["sleeper", "_activity"]) == 0
+        assert nap.sleepers.read_activity("nap") is not None
+        monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+        assert cli.main(["sleeper", "_activity"]) == 0
+        assert capsys.readouterr().out == "", "a hook's stdout is read by Claude Code"
+
+    def test_the_hook_guard_runs_nothing_outside_a_sleeper(self, tmp_path: Path) -> None:
+        """Every session runs these hooks; outside a sleeper they must not even
+        start Python."""
+        hooks = json.loads(
+            (Path(__file__).parents[2] / "plugins/spanreed/hooks/hooks.json").read_text()
+        )["hooks"]
+        marker = tmp_path / "ran"
+        fake = tmp_path / "spanreed"
+        fake.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        fake.chmod(0o755)
+        for event in ("UserPromptSubmit", "Stop", "Notification"):
+            [entry] = hooks[event]
+            [hook] = entry["hooks"]
+            env = {"PATH": f"{tmp_path}:/usr/bin:/bin"}
+            done = subprocess.run(["sh", "-c", hook["command"]], env=env, check=False)
+            assert done.returncode == 0
+            assert not marker.exists(), event
+            done = subprocess.run(
+                ["sh", "-c", hook["command"]], env={**env, "SPANREED_SLEEPER": "1"}, check=False
+            )
+            assert marker.exists(), event
+            marker.unlink()
+
+
+class TestRequestSleep:
+    def test_sets_the_flag_on_an_awake_sleeper(self, store: StateStore) -> None:
+        store.create_sleeper(_record())
+        _update(store, "nap", state="awake")
+        text = sleeper_runner.request_sleep(store, "nap")
+        assert "Background work still running then is stopped" in text
+        assert _read(store).sleep_requested
+
+    def test_an_asleep_sleeper_is_already_asleep(self, store: StateStore) -> None:
+        store.create_sleeper(_record())
+        assert sleeper_runner.request_sleep(store, "nap") == "already asleep"
+        assert not _read(store).sleep_requested
+
+    def test_unknown(self, store: StateStore) -> None:
+        with pytest.raises(SleeperError):
+            sleeper_runner.request_sleep(store, "ghost")
+
+    def test_a_wake_clears_it(self, store: StateStore, launches: Launches) -> None:
+        store.create_sleeper(_record())
+        _update(store, "nap", sleep_requested=True)
+        sleeper_runner.wake_if_needed(store, "agent-nap")
+        assert not _read(store).sleep_requested
+
+    def test_the_mcp_tool_refuses_a_session_that_is_not_a_sleeper(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SPANREED_SLEEPER", raising=False)
+        with pytest.raises(ValueError, match="only for sleepers"):
+            mcp_server.request_sleep()
+
+    def test_the_mcp_tool_in_a_sleeper(
+        self, store: StateStore, monkeypatch: pytest.MonkeyPatch, state_root: Path
+    ) -> None:
+        store.create_sleeper(_record())
+        _update(store, "nap", state="awake")
+        monkeypatch.setenv("SPANREED_STATE_ROOT", str(state_root))
+        monkeypatch.setenv("SPANREED_SLEEPER", "1")
+        monkeypatch.setenv("SPANREED_AGENT_NAME", "nap")
+        assert "will sleep" in mcp_server.request_sleep()
+        assert _read(store).sleep_requested
+
+
+def _spawn(script: str) -> subprocess.Popen[bytes]:
+    return subprocess.Popen([sys.executable, "-c", script])
+
+
+class TestEndClaude:
+    def test_sigterm_is_enough_for_a_well_behaved_claude(self) -> None:
+        child = _spawn("import time; time.sleep(60)")
+        time.sleep(0.2)
+        assert sleeper_runner.end_claude(child) == -signal.SIGTERM
+
+    def test_sigkill_after_the_grace_period(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(sleeper_runner, "END_GRACE_S", 0.5)
+        child = _spawn(
+            "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "print('ready', flush=True)\ntime.sleep(60)"
+        )
+        time.sleep(0.3)
+        assert sleeper_runner.end_claude(child) == -signal.SIGKILL
+
+    def test_work_left_running_in_its_own_session_is_ended_too(self, tmp_path: Path) -> None:
+        """Follow-up 4 on #88: the inbox Monitor's tail runs in a session of its own,
+        so a process-group kill misses it."""
+        pid_file = tmp_path / "grandchild"
+        child = _spawn(
+            "import subprocess, sys, time\n"
+            "p = subprocess.Popen(['sleep', '60'], start_new_session=True)\n"
+            f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+            "time.sleep(60)"
+        )
+        deadline = time.monotonic() + 5
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        grandchild = int(pid_file.read_text())
+        sleeper_runner.end_claude(child)
+        deadline = time.monotonic() + 5
+        while store_module.process_is_alive(grandchild, None) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(grandchild, os.WNOHANG)
+        assert not store_module.process_is_alive(grandchild, None) or _is_zombie(grandchild)
+
+
+def _is_zombie(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] == "Z"
+    except OSError:
+        return True
+
+
+class TestWatch:
+    @pytest.fixture
+    def awake(self, store: StateStore) -> StateStore:
+        store.create_sleeper(_record(idle_timeout_s=60))
+        _update(store, "nap", state="awake", runner_pid=os.getpid(), generation=1)
+        return store
+
+    def test_ends_claude_when_idle_and_marks_it_sleeping(
+        self, awake: StateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sleeper_runner, "POLL_S", 0.05)
+        child = _spawn("import time; time.sleep(60)")
+        launched = datetime.now(UTC) - timedelta(seconds=120)
+        returncode, ended = sleeper_runner._watch(awake, "nap", child, launched, turns_at_launch=0)  # pyright: ignore[reportPrivateUsage]
+        assert ended and returncode == -signal.SIGTERM
+        assert _read(awake).state == "sleeping"
+
+    def test_a_claude_that_exits_by_itself_is_not_ended(
+        self, awake: StateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sleeper_runner, "POLL_S", 0.05)
+        child = _spawn("import sys; sys.exit(3)")
+        returncode, ended = sleeper_runner._watch(  # pyright: ignore[reportPrivateUsage]
+            awake, "nap", child, datetime.now(UTC), turns_at_launch=0
+        )
+        assert (returncode, ended) == (3, False)
+        assert _read(awake).state == "awake"
+
+    def test_turns_without_hook_reports_never_sleep(
+        self,
+        awake: StateStore,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A plugin older than this spanreed has no turn hooks. The transcript shows
+        turns, so "idle since launch" is a guess that could end Claude mid-turn."""
+        monkeypatch.setattr(sleeper_runner, "POLL_S", 0.05)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+        project = tmp_path / "config" / "projects" / "-tmp"
+        project.mkdir(parents=True)
+        (project / f"{SID}.jsonl").write_text(
+            json.dumps({"type": "assistant", "uuid": "a1", "message": {"model": "m"}}) + "\n"
+        )
+        awake.register_agent(name="nap", working_dir="/tmp", pid=os.getpid(), agent_id="agent-nap")
+        child = _spawn("import time; time.sleep(1.0)")
+        launched = datetime.now(UTC) - timedelta(seconds=120)
+        returncode, ended = sleeper_runner._watch(  # pyright: ignore[reportPrivateUsage]
+            awake, "nap", child, launched, turns_at_launch=0
+        )
+        assert (returncode, ended) == (0, False)
+        assert "turn hooks report nothing" in capsys.readouterr().err
+        assert [a.status for a in awake.list_agents()] == ["needs_input"]
+
+    def test_a_runner_that_is_not_the_records_does_not_commit(self, awake: StateStore) -> None:
+        _update(awake, "nap", runner_pid=os.getppid())
+        assert not sleeper_runner._commit_to_sleep(awake, "nap")  # pyright: ignore[reportPrivateUsage]
+        assert _read(awake).state == "awake"
+
+
+class TestEndedByTheRunner:
+    def test_its_own_signal_is_not_a_failed_wake(
+        self, store: StateStore, launches: Launches, after_exit: AfterExit
+    ) -> None:
+        """A manual wake with no mail: no turn, SIGTERM from the runner. Just sleep."""
+        result = sleeper_runner._after_exit(  # pyright: ignore[reportPrivateUsage]
+            store, "nap", _deliveries(real=2), _deliveries(real=2), -15, ended_by_runner=True
+        )
+        assert result is None
+        record = _read(store)
+        assert record.state == "asleep"
+        assert record.last_wake_failure is None
+
+
+def _run_bounded(store: StateStore, name: str, generation: int, timeout: int = 30) -> int:
+    """run(), with SIGALRM as a deadline, so a regression that loops forever fails
+    instead of hanging the suite. (run() sets signal handlers, so it must stay on
+    the main thread.)"""
+
+    def expired(_signum: int, _frame: object) -> None:
+        raise AssertionError(f"run() still looping after {timeout}s")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(timeout)
+    try:
+        return sleeper_runner.run(store, name, generation)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+# A fake Claude driven by a launch counter. Launch n does what ACTIONS[n] says:
+# "idle" stays up with no turn until ended; "turn" writes a real assistant record
+# (without delivering anything) and a Stop, then stays up; "deliver" waits DELAY
+# seconds, then writes a delivered notification for every inbox line, a real
+# reply, and a Stop.
+_SCRIPTED_CLAUDE = """
+import json, time, pathlib, datetime
+state = pathlib.Path(os.environ["SPANREED_STATE_ROOT"])
+transcript = pathlib.Path({transcript!r})
+counter = pathlib.Path({counter!r})
+n = len(counter.read_text()) if counter.exists() else 0
+counter.write_text("x" * (n + 1))
+actions = {actions!r}
+action = actions[min(n, len(actions) - 1)]
+def stop():
+    now = datetime.datetime.now(datetime.UTC).isoformat()
+    (state / "sleepers" / "nap.activity").write_text(json.dumps({{"event": "Stop", "at": now}}))
+def append(record):
+    with transcript.open("a") as f:
+        f.write(json.dumps(record) + "\\n")
+if action == "turn":
+    append({{"type": "assistant", "uuid": f"t{{n}}", "message": {{"model": "m"}}}})
+    stop()
+elif action == "deliver":
+    time.sleep({delay})
+    inbox = state / "inboxes" / "agent-nap.jsonl"
+    event = "\\n".join(line.strip() for line in inbox.read_text().splitlines())
+    append({{"type": "user", "uuid": f"n{{n}}", "parentUuid": None,
+            "message": {{"content": "<task-notification>\\n<event>" + event + "</event>"}}}})
+    append({{"type": "assistant", "uuid": f"r{{n}}", "parentUuid": f"n{{n}}",
+            "message": {{"model": "m"}}}})
+    stop()
+time.sleep(60)
+"""
+
+
+class TestRunGivesUp:
+    @pytest.fixture
+    def scripted(
+        self, store: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state_root: Path
+    ) -> Callable[..., Path]:
+        monkeypatch.setattr(sleeper_runner, "POLL_S", 0.05)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+        monkeypatch.setenv("SPANREED_STATE_ROOT", str(state_root))
+        project = tmp_path / "config" / "projects" / "-tmp"
+        project.mkdir(parents=True)
+        transcript = project / f"{SID}.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "user", "uuid": "u1", "message": {"content": "hi"}}) + "\n"
+        )
+        counter = tmp_path / "launches"
+
+        def make(actions: list[str], delay: float = 0.0) -> Path:
+            body = _SCRIPTED_CLAUDE.format(
+                transcript=str(transcript), counter=str(counter), actions=actions, delay=delay
+            )
+            return _fake_claude(tmp_path, body)
+
+        return make
+
+    def _launches(self, tmp_path: Path) -> int:
+        return len((tmp_path / "launches").read_text())
+
+    def test_unread_mail_that_never_starts_a_turn_is_given_up_on(
+        self, store: StateStore, launches: Launches, tmp_path: Path, scripted: Callable[..., Path]
+    ) -> None:
+        """Follow-up 3 on #88: a Claude that stays up but never gets a turn (a broken
+        Monitor) is ended for idleness, finds the mail unread, and is relaunched; with
+        no real turn and no error that would repeat once per idle timeout forever.
+        (A Claude that exits by itself like that is a failed wake at once: #90.)"""
+        claude = scripted(["idle"])
+        store.create_sleeper(_record(claude_path=str(claude), idle_timeout_s=1))
+        sleeper_runner.wake_if_needed(store, "agent-nap")
+        store.send_message("tester", "agent-nap", "never delivered")  # awake: no new wake
+        assert _run_bounded(store, "nap", 1) == 1
+        assert self._launches(tmp_path) == 3
+        record = _read(store)
+        assert record.state == "asleep"
+        assert record.last_wake_failure is not None
+        assert "did not start a single turn in 3 launches" in record.last_wake_failure.reason
+        assert record.read_through.line == 0, "the mail stays unread"
+
+    def test_a_real_turn_resets_the_turnless_count(
+        self, store: StateStore, launches: Launches, tmp_path: Path, scripted: Callable[..., Path]
+    ) -> None:
+        """Turnless, a turn, then turnless again: the cap counts consecutive turnless
+        launches, so the turn in between starts the count over."""
+        claude = scripted(["idle", "turn", "idle"])
+        store.create_sleeper(_record(claude_path=str(claude), idle_timeout_s=1))
+        sleeper_runner.wake_if_needed(store, "agent-nap")
+        store.send_message("tester", "agent-nap", "never delivered")
+        assert _run_bounded(store, "nap", 1, timeout=60) == 1
+        assert self._launches(tmp_path) == 5, "1 turnless + 1 turn + 3 turnless"
+
+    def test_a_sleep_request_does_not_end_the_relaunch_that_delivers_mail(
+        self,
+        store: StateStore,
+        launches: Launches,
+        tmp_path: Path,
+        scripted: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Review of #91: sleep_requested survived a relaunch, and the launch reads as
+        the last Stop, so the relaunch was ended REQUEST_QUIET_S in, before its mail
+        was handed over. Scaled down: the quiet period is 0.5 s, and delivery takes
+        2 s from launch."""
+        monkeypatch.setattr(sleeper_runner, "REQUEST_QUIET_S", 0.5)
+        claude = scripted(["idle", "deliver"], delay=2.0)
+        store.create_sleeper(_record(claude_path=str(claude), idle_timeout_s=3))
+        sleeper_runner.wake_if_needed(store, "agent-nap")
+        _update(store, "nap", sleep_requested=True)  # asked during this launch
+        store.send_message("tester", "agent-nap", "arrives after the request")
+        assert _run_bounded(store, "nap", 1, timeout=60) == 0
+        record = _read(store)
+        assert record.last_wake_failure is None
+        assert record.read_through.line == 1, "the mail was delivered before sleeping"
+        assert self._launches(tmp_path) == 2

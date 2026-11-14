@@ -445,14 +445,12 @@ Resolved since:
 
 ## Sleepers: agents that sleep and wake on mail
 
-**Status: being built, in stages.** Built so far: the record, `create`, `list` and
-`retire`, and presence from the record at every liveness site (stage 1); the
-transcript read-check, waking on mail, the runner, and the Monitor's replay
-(stage 2). Not built: idle detection and ending Claude (stage 3), and the hooks
-and `request_sleep` (stage 4). **Until stage 3 lands, a woken sleeper stays awake
-until its Claude exits some other way** (someone attaches and types `/exit`, or
-signals it). When it does, the runner checks the inbox and sleeps or relaunches as
-described below.
+**Status: built, not yet released.** Stage 1: the record, `create`, `list` and
+`retire`, and presence from the record at every liveness site. Stage 2: the
+transcript read-check, waking on mail, the runner, and the Monitor's replay.
+Stage 3: the turn hooks, idle detection, `request_sleep`, and ending Claude.
+Measured end to end in findings Tests 12 and 13. Managing sleepers across
+`conjoin` (#86) is not built.
 The resume mechanics are measured in
 [findings.md](findings.md#test-6-can-a-claude-session-in-tmux-be-exited-and-resumed-by-session-id-2026-11-13).
 Anything not measured is listed under "Not verified yet" rather than stated as fact.
@@ -589,23 +587,31 @@ for any reason.
 
 **A failed wake comes in two forms, and the runner detects both:**
 
-- **Claude exits almost at once** (`claude` missing, a deleted transcript).
-  Precisely: Claude exits by itself, **with any exit status**, without the model
-  having taken a turn, while mail is still unread. A clean exit counts too:
-  relaunching would only repeat it as fast as Claude starts (the review of PR #90
-  measured 443 launches in 5 s before this rule). The same exit with nothing
-  unread is not a failure; the sleeper just sleeps.
+- **Claude can't be launched, or exits by itself without a model turn while
+  mail is unread** (`claude` missing, a deleted transcript), **with any exit
+  status**. A clean exit counts too: relaunching would only repeat it as fast as
+  Claude starts (the review of PR #90 measured 443 launches in 5 s before this
+  rule). The same exit with nothing unread is not a failure; the sleeper just
+  sleeps. An exit the runner caused itself, by ending an idle Claude, is never a
+  failure; that path is bounded separately (below).
 - **Claude stays up but the model can't run.** An expired login or a rate limit
   doesn't make Claude exit. It answers every turn with a synthetic error record
-  (`authentication_failed`, `rate_limit`). The runner watches the transcript for
-  those, and treats a launch whose only assistant records are synthetic errors as
+  (`authentication_failed`, `rate_limit`). The detector keys on the **`error`
+  field**, not on `model == "<synthetic>"`: Claude Code also writes synthetic
+  records with no `error` ("No response requested." after a resume, #88), and
+  those are not failures. A launch with new error records and no new real turn
   failed.
 
 Either way it records `last_wake_failure` with the reason, sets `needs_input`,
-ends Claude if it is still running, sets **`state=asleep`**, and exits. It does
-**not** retry in a loop. The next mail, or `spanreed sleeper wake X`, tries again.
-Mail is never marked read on a failed wake, by the rule in "What counts as read". (That such failures do exit "almost at once" is
-an assumption; see "Not verified yet".)
+sets **`state=asleep`**, and exits. It does **not** retry in a loop. The next mail,
+or `spanreed sleeper wake X`, tries again. Mail is never marked read on a failed
+wake, by the rule in "What counts as read".
+
+**A third case, bounded rather than detected** (#88): unread mail that never
+starts a turn at all, with no error either (a Monitor that cannot read the inbox,
+say). Each launch goes idle, is ended, finds the mail unread, and relaunches, once
+per idle timeout. The runner gives up after 3 consecutive launches with no real
+turn, records the reason, and sleeps with the mail unread.
 
 ### Going to sleep
 
@@ -661,7 +667,34 @@ corrects an earlier misreading of his first reply):
 
 **Asked for.** A new MCP tool, `request_sleep`, sets `sleep_requested`. The runner
 acts on it at the next `Stop`. In a session that is not a sleeper, the tool returns
-an error rather than doing nothing.
+an error rather than doing nothing. `spanreed sleeper sleep X` does the same from a
+shell, and `retire X` uses it on an awake sleeper, waiting up to 60 s for it to
+sleep before removing it.
+
+**A request does not survive a relaunch.** If mail arrives while the agent is
+going to sleep, step 4 relaunches Claude to deliver it, and the request is
+cleared then. Otherwise the relaunch, whose launch reads as the last `Stop`,
+would be ended `REQUEST_QUIET_S` after it started, before the Monitor had handed
+anything over (found in the review of PR #91). The agent can ask again once it
+has handled the mail.
+
+**Only the sleeper's own session reports turns.** A Claude the sleeper starts
+itself (`claude -p` from its Bash tool) inherits `SPANREED_SLEEPER` and the name,
+so its hooks fire too. Hook input carries a `session_id`, and activity from any
+session but the record's is ignored; a child's `Stop` would otherwise read the
+sleeper as idle mid-turn.
+
+**A plugin older than the CLI reports no turns.** The turn hooks live in the
+plugin, which updates separately (`claude plugin update`). Without them the
+runner would see no activity and take the launch as the last `Stop`, which could
+end Claude mid-turn. So before acting on "idle since launch" the runner checks
+the transcript: if real turns have happened since the launch, the hooks are not
+reporting, and the sleeper stays awake with `needs_input` and a message saying
+to update the plugin.
+
+**Hook cost in ordinary sessions.** The plugin's `UserPromptSubmit`, `Stop` and
+`Notification` hooks fire in every session, not just sleepers. Each is a shell
+test of `SPANREED_SLEEPER` that does not start Python unless it is set.
 
 ### What counts as read: a delivered record in the transcript
 
@@ -737,8 +770,15 @@ followed only by a synthetic `rate_limit` record. All must count as unread.
 only partly is replayed once. That covers only a 2 KB preview, or a full list the
 agent read through a separate tool call (a `cat` of the saved output file, say,
 which is a `tool_result` this rule ignores). That is the safe direction: the
-alternative is guessing it was read. It is the only case where "nothing is
+alternative is guessing it was read. It is one of two cases where "nothing is
 redelivered" doesn't hold.
+
+**The second: a compaction can cut a delivered record out of the chain** (#88).
+After a compaction, the records before it are no longer ancestors of later real
+turns, so a message delivered just before a compaction and answered only after it
+can lose its real-turn evidence and be replayed once. The review of PR #84 found
+25 real ids in that position across the fleet's transcripts. Again the safe
+direction.
 
 **This depends on `msg_id` being the first field of every inbox line.** Monitor
 events are truncated at about 514 characters (measured in the review of PR #84:
@@ -884,18 +924,21 @@ Plan:
   conversation. No dialog is involved. As with `/exit`, it stops background work,
   so on the idle-timeout path the "no background work" check must already have
   passed.
-- **Escalation sends SIGKILL to the whole process group**, not just Claude's pid.
-  SIGKILL to the pid alone leaves the inbox Monitor's `tail` orphaned on the
-  inbox (Test 8).
-- **Fallback:** `/exit` plus the dialog.
-- **Either way,** the runner never trusts the keys it sent or the signal it raised.
-  It waits for the child process to exit, and if Claude is still running after a
-  grace period it escalates (dialog, then SIGTERM, then SIGKILL) and records which
-  step was needed.
+- **Escalation is SIGKILL to Claude after 15 s, then to every descendant still
+  running.** Not a process-group kill: the inbox Monitor's `tail` runs in a session
+  and process group of its own, so a group kill misses it (#88), and SIGKILL to
+  the pid alone leaves it orphaned on the inbox (Test 8). The runner lists
+  Claude's descendants (by parent pid, from `ps`) before signalling, and after
+  Claude has exited it kills any of them still alive whose start time is
+  unchanged.
+- **No `/exit` fallback.** SIGTERM has been clean in every measurement, and the
+  dialog would bring back the UI dependence the signal avoids.
+- **Either way,** the runner never trusts the signal it raised. It waits for the
+  child process to exit before checking the inbox.
 
 A signal skips the dialog, and the dialog is also the only complete list of
-background work (see "Going to sleep"). So picking the signal depends on the hooks
-being enough to answer "is anything else running?".
+background work. The hooks answer "is anything else running?" instead
+(`Stop.background_tasks`, measured in Tests 11 and 13).
 
 ### Why no message is lost
 
@@ -1069,7 +1112,6 @@ assumed until measured, and the implementation PR has to measure it:
   it does** (Test 7). So do `Stop` with the Monitor running, and an `idle_prompt`
   notification 60 s after `Stop`.
 - **A `Notification` of type `permission_prompt` reaching a plugin hook.**
-- **`Stop` and `UserPromptSubmit` firing in a resumed session.**
 - ~~Waking on mail, end to end~~: **measured, it works** (findings Test 12). A
   message woke an asleep sleeper, the Monitor replayed it, Claude answered; a
   SIGTERM put it to sleep with `read_through` moved past it; two messages sent
@@ -1101,8 +1143,11 @@ assumed until measured, and the implementation PR has to measure it:
   see "Waking". Still open: how wide the batching window is, so the replay pacing
   can be chosen.
 - ~~Background work other than the Monitor~~: **measured** (Test 11). The `Stop`
-  hook's `background_tasks` lists it; task hooks don't fire. Still open:
-  `background_tasks` in a resumed session.
+  hook's `background_tasks` lists it; task hooks don't fire. ~~In a resumed
+  session~~: **measured, it does too** (Test 13), and it kept a sleeper awake past
+  its idle timeout until `sleeper sleep` stopped it.
+- ~~`Stop` and `UserPromptSubmit` firing in a resumed session~~: **measured, they
+  do** (Test 13).
 - **A Monitor event queued behind the final turn** starting its own turn within the
   quiet period after `request_sleep`. If it doesn't, step 4 still catches the
   message; this only decides whether a sleep is skipped or happens.

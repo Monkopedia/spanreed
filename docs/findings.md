@@ -546,3 +546,31 @@ never opened.
 Not measured: the batching window (3 s was wide enough for two short messages, and
 nothing narrower was tried); a long backlog; macOS.
 
+## Test 13: Does a sleeper go to sleep by itself, and only when it should? (2026-11-13)
+
+The stage-3 code (branch `feat/sleepers-sleep`). Claude Code 2.1.283, kaladin, an
+isolated state root, sleeper `sl3` with `--idle-timeout 30s`. The installed plugin
+was older than the code, so `claude` was a wrapper adding `--settings` with the
+branch's three turn hooks; the user's plugin was not touched.
+
+- **Idle timeout.** One message woke it; Claude answered it and the `Stop` hook
+  wrote `{"event":"Stop","busy":[]}`. About 30 s later the runner SIGTERMed Claude,
+  found the message delivered, and slept with `read_through` past it.
+- **Background work blocks the timeout, in a resumed session.** A prompt typed
+  into the pane started `sleep 300` in the background. The `Stop` hook listed it
+  (`busy: ["shell sleep 300 && echo sl3-bg-done"]`; the inbox Monitor was filtered
+  out). 50 s later, well past the timeout, it was still awake.
+- **`spanreed sleeper sleep` stops it.** It slept within the 5 s quiet period plus
+  a poll, and the `sleep 300` process was gone.
+- **The agent can ask for itself.** Told in the pane to call `request_sleep`, it
+  did, and it slept once its turn ended.
+- **`retire` on an awake sleeper** asked it to sleep, waited, then removed it. No
+  tmux session and no process carrying its session id was left.
+- **A bus message is not an instruction.** Asked by bus message to start the
+  background job, the agent declined, following the disposition policy. Mail
+  cannot make a sleeper start work, only a prompt can; the background-work test
+  therefore used the pane.
+
+Not measured: a permission prompt in a detached sleeper; Claude ignoring SIGTERM
+(the SIGKILL path is only unit-tested); macOS.
+

@@ -86,6 +86,27 @@ class SkippedLine(BaseModel):
     why: str
 
 
+INBOX_MONITOR_COMMAND = "spanreed inbox-watch"
+"""The plugin's inbox Monitor, as ``Stop.background_tasks`` names it. Always running
+in a sleeper, so the one background task that never keeps it awake."""
+
+
+class Activity(BaseModel):
+    """``<name>.activity``: the last turn boundary the sleeper's hooks reported.
+
+    Written by ``spanreed sleeper _activity`` from the plugin's ``UserPromptSubmit``
+    and ``Stop`` hooks; read by the runner to decide idleness.
+    """
+
+    event: str
+    """``UserPromptSubmit`` (a turn started) or ``Stop`` (a turn ended)."""
+    at: datetime
+    busy: list[str] = []
+    """At a ``Stop``: running background work other than the inbox Monitor, from
+    the hook's ``background_tasks``. Anything here keeps the idle timeout from
+    firing. As of the last ``Stop``, so it errs toward busy."""
+
+
 class SleeperRecord(BaseModel):
     """``<state>/sleepers/<name>.json``. The field table in ``docs/architecture.md``."""
 
@@ -169,6 +190,21 @@ class SleeperDir:
 
     def delete(self, name: str) -> None:
         self._record_path(name).unlink(missing_ok=True)
+
+    def write_activity(self, name: str, activity: Activity) -> None:
+        """Replace ``<name>.activity`` atomically. Hooks write it without the lock:
+        a reader sees the previous activity or this one, never a torn file."""
+        private_dir(self.path)
+        target = self.path / f"{name}.activity"
+        tmp = self.path / f"{name}.activity.{os.getpid()}.tmp"
+        write_private_text(tmp, activity.model_dump_json())
+        tmp.replace(target)
+
+    def read_activity(self, name: str) -> Activity | None:
+        try:
+            return Activity.model_validate_json((self.path / f"{name}.activity").read_text())
+        except (FileNotFoundError, ValueError):
+            return None
 
     def names(self) -> list[str]:
         """Every sleeper with a record, sorted. Cheap: a directory listing, no parsing."""

@@ -60,6 +60,7 @@ async def test_mcp_server_registers_its_tool_surface() -> None:
         "set_focus",
         "set_status",
         "request_focus_update",
+        "request_sleep",
     }
 
 

@@ -209,6 +209,48 @@ to find things. See [docs/architecture.md](docs/architecture.md) §"Codex
 workers" for the design and
 [docs/findings.md](docs/findings.md) for what was actually measured.
 
+## Sleepers (experimental)
+
+A **sleeper** is a Claude Code session spanreed runs inside tmux. When it is idle,
+or asks to, its Claude exits and frees its memory, but it stays on the bus by
+name. The next message to it **resumes the same conversation** in tmux and is
+delivered there. Sleepers survive a reboot: the record is a file, and the next
+message wakes it. It needs `tmux`, and the plugin **updated to the version that
+matches** the `spanreed` package (the plugin's turn hooks are how a sleeper knows
+it is idle).
+
+```bash
+spanreed sleeper create --name helper --cwd ~/some/project \
+    --permission-mode acceptEdits --model claude-opus-5-5 --idle-timeout 15m
+spanreed send --to helper --body "..."   # wakes it; it answers in tmux
+spanreed sleeper list                     # state, settings, any wake failures
+spanreed sleeper attach helper            # watch or type into it while awake
+spanreed sleeper sleep helper             # put it to sleep at the end of its turn
+spanreed sleeper retire helper            # remove it (its inbox is kept)
+```
+
+The permission mode and model are fixed at create and passed on every launch.
+Without `--model` it gets the model in your Claude Code settings, which may not
+be the one you usually pass on the command line.
+
+Things to know:
+
+- **The first launch in a folder Claude Code has never trusted stops at its
+  "do you trust this folder?" dialog.** `spanreed sleeper attach <name>` and
+  accept it once, or open `claude` in that folder yourself first.
+- **Idle means no turn running and no background work.** A dev server or a
+  `tail -f` it left running keeps it awake until it stops the work or calls the
+  `request_sleep` tool (which stops it), or you run `spanreed sleeper sleep`.
+- **A wake that fails is never silent.** An expired Claude Code login, a rate
+  limit, or a missing `tmux` leaves it asleep with `needs_input` on the bus and
+  the reason in `spanreed sleeper list`. Its mail stays unread for the next wake.
+- **No ssh agent inside a sleeper.** It starts from a clean environment, so
+  `git push` over ssh from inside one fails.
+
+Mail reaches a sleeper on another host over `conjoin` and wakes it there, but
+creating or managing one remotely is not built yet (#86). Design:
+[docs/architecture.md](docs/architecture.md#sleepers-agents-that-sleep-and-wake-on-mail).
+
 ## Update
 
 The Python package and the plugin update independently:
