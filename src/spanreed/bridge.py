@@ -290,8 +290,14 @@ class Bridge:
                 self._stop.set()
                 self._hello.set()  # unblock run()'s wait so it exits promptly
                 return True
-            self.peer_host = host
-            self._open_link(host)
+            with self._mirror_lock:
+                if self._torn_down:
+                    # run() already gave up on the handshake and returned. A
+                    # peer accepted now would be mirrored by a bridge nobody is
+                    # running, and read as live while nothing is connected.
+                    return True
+                self.peer_host = host
+                self._open_link(host)
             self._hello.set()
         elif kind == "msg":
             self.store.append_message(Message.model_validate(frame["message"]))
@@ -432,6 +438,13 @@ class Bridge:
         reader = threading.Thread(target=self._reader, daemon=True)
         reader.start()
         if not self._hello.wait(timeout=self.hello_timeout):
+            # Final, the way teardown is: the reader checks this flag under the
+            # same lock before accepting a hello, so a hello that lands after
+            # this point opens no peer record and mirrors nothing. One that won
+            # the lock first was accepted in time, and the link proceeds.
+            with self._mirror_lock:
+                self._torn_down = self.peer_host is None
+        if self._torn_down:
             self._stop.set()
             if self.role == "connect":
                 _status(

@@ -434,6 +434,8 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
 - `hello` — the sender's own host label, which becomes the `@host` suffix for every id it owns. Sent once, first, by both ends. **Validated on receipt**: alphanumeric at both ends, `.`/`-`/`_` inside, at most 253 characters. The receiver interpolates this value into a filesystem glob when selecting outbound inboxes, so a metacharacter would be a wildcard rather than a name.
 
   On a label that fails validation the receiver **sends nothing further and closes**. Specifically, it does **not** send a `registry` frame — that frame carries agent ids, display names, absolute working directories, pids and focus text, and a peer whose identity was just rejected must not receive it. `hello` is the only frame a refused peer ever sees, and it was already in flight. The refusal is reported on stderr, naming the rule and the `--label` override; stdout is the pipe and carries nothing but frames.
+
+  A receiver that gives up waiting for `hello` (`--handshake-timeout`) has ended that attempt, and the decision is **final**: a `hello` that arrives afterwards is ignored, so it opens no peer record and the `registry` frame behind it mirrors nothing. Otherwise the late peer's agents would be mirrored, and its link recorded as attached, under the pid of a `conjoin` that is alive but no longer connected, and both would read as live (issue #83). A `hello` the receiver accepted before giving up counts as arriving in time, and the link proceeds normally.
 - `ping` — keepalive; lets each side detect a dead pipe and lets `connect` trigger reconnect.
 
 ### Address rewriting (done by the sending bridge)
