@@ -517,6 +517,32 @@ class TestRun:
         record = _read(store)
         assert (record.state, record.claude_pid) == ("asleep", None)
 
+    @pytest.mark.parametrize("trusted", [False, True])
+    def test_a_launch_into_an_untrusted_folder_sets_needs_input(
+        self,
+        store: StateStore,
+        launches: Launches,
+        tmp_path: Path,
+        config_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+        trusted: bool,
+    ) -> None:
+        """Nobody sees a detached pane stuck at the trust dialog: say so on the bus."""
+        (config_dir / ".claude.json").write_text(
+            json.dumps({"projects": {"/tmp": {"hasTrustDialogAccepted": trusted}}})
+        )
+        (config_dir / "projects" / "-tmp" / f"{SID}.jsonl").write_text(
+            json.dumps({"type": "assistant", "uuid": "a", "message": {"model": "m"}}) + "\n"
+        )
+        claude = _fake_claude(tmp_path, "sys.exit(0)")
+        store.create_sleeper(_record(claude_path=str(claude)))
+        store.register_agent(name="nap", working_dir="/tmp", pid=os.getpid(), agent_id="agent-nap")
+        sleeper_runner.wake_if_needed(store, "agent-nap")
+        assert sleeper_runner.run(store, "nap", 1) == 0
+        [row] = store.list_agents()
+        warned = "has not trusted /tmp" in capsys.readouterr().err
+        assert (warned, row.status) == ((False, None) if trusted else (True, "needs_input"))
+
     def test_a_missing_claude_is_a_failed_wake(
         self, store: StateStore, launches: Launches, tmp_path: Path, config_dir: Path
     ) -> None:

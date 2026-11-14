@@ -1042,7 +1042,7 @@ part of the first implementation. Mail already wakes a remote sleeper without it
 ### Commands
 
 ```
-spanreed sleeper create --name X --cwd DIR --permission-mode MODE [--model M] [--idle-timeout 15m]
+spanreed sleeper create --name X --cwd DIR --permission-mode MODE [--model M] [--idle-timeout 15m] [--trust]
 spanreed sleeper list
 spanreed sleeper attach X     # tmux attach to the current session-name generation
 spanreed sleeper wake X       # by hand; the same path a message takes
@@ -1072,13 +1072,39 @@ Settled while building stage 1 (the author's calls, listed for the owner to see)
   mode. Without it a sleeper gets the model in Claude Code's settings, which need
   not be the one the owner's own sessions run (they pass `--model`).
 
-**Open, for the owner: a folder Claude Code has never trusted.** The first launch
-in such a directory stops at Claude Code's "do you trust this folder?" dialog
-(measured, findings Test 12). A woken sleeper sitting at that dialog never takes a
-turn and never sleeps. Today someone has to `spanreed sleeper attach X` and
-accept it once; after that every launch goes straight in. Options: refuse
-`create` for an untrusted directory (reading Claude Code's own state to tell,
-which is another internal format), warn at create, or leave it to `attach`.
+**A folder Claude Code has never trusted: `create --trust`, and warnings.** The
+first launch in such a directory stops at Claude Code's "do you trust this
+folder?" dialog (measured, findings Test 12). A woken sleeper sitting at that
+dialog never takes a turn and never sleeps. *The owner's decision* (2026-11-14,
+asked "Could we have a flag that approves?", then "Sure" to this design):
+
+- **`create --trust`** marks the folder trusted the way accepting the dialog
+  does: it sets `projects.<cwd>.hasTrustDialogAccepted` in Claude Code's state
+  file (`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`) and reads it back.
+  It runs before the record is written, so a failure creates nothing. Claude Code
+  has no flag of its own for this; its dialog is skipped only in `-p` mode.
+- **The home folder and anything above it are refused.** Trust is inherited, so
+  a grant there would cover nearly everything, and Claude Code itself never saves
+  home-folder trust (review of PR #93). Use a project folder.
+- **Running sessions rewrite that file, and nothing locks it against them.** The
+  write sets the one key on a fresh read and replaces the file only if its inode,
+  size, mtime and ctime are unchanged since, retrying up to 5 times. That narrows
+  the window without closing it: a session write landing between the last check
+  and the rename is lost (the review of PR #93 measured 2 of 3,383 against a
+  1 kHz writer; the file was never damaged).
+- **A symlinked state file is written through**, next to its real target, so a
+  dotfile manager's link stays a link. Non-ASCII is kept as-is, so unrelated
+  bytes round-trip unchanged.
+- **Without `--trust`**, `create` and `sleeper list` warn when the folder is not
+  trusted, and the runner sets `needs_input` at a launch into one, since nobody
+  sees a detached pane. Trust is inherited from parent folders **up to the
+  enclosing git repository's root, not past it** (measured, findings Test 14),
+  and the check follows exactly that.
+- **The file is Claude Code's internal format**, so this fails toward "not
+  trusted". An unreadable file reads as unknown, with its own warning, and the
+  worst case of any failure is the dialog, exactly as without `--trust`.
+- Driving the dialog itself from the runner was considered and declined: it
+  depends on the dialog's wording and choice order, which any release can change.
 
 ### Compatibility
 

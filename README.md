@@ -221,7 +221,7 @@ it is idle).
 
 ```bash
 spanreed sleeper create --name helper --cwd ~/some/project \
-    --permission-mode acceptEdits --model claude-opus-5-5 --idle-timeout 15m
+    --permission-mode acceptEdits --model claude-opus-5-5 --idle-timeout 15m --trust
 spanreed send --to helper --body "..."   # wakes it; it answers in tmux
 spanreed sleeper list                     # state, settings, any wake failures
 spanreed sleeper attach helper            # watch or type into it while awake
@@ -236,8 +236,10 @@ be the one you usually pass on the command line.
 Things to know:
 
 - **The first launch in a folder Claude Code has never trusted stops at its
-  "do you trust this folder?" dialog.** `spanreed sleeper attach <name>` and
-  accept it once, or open `claude` in that folder yourself first.
+  "do you trust this folder?" dialog.** Pass `--trust` to `create` to mark the
+  folder trusted up front, as accepting the dialog would (it writes that one key
+  to `~/.claude.json`). Without it, `create` and `sleeper list` warn, and you can
+  `spanreed sleeper attach <name>` and accept it once.
 - **Idle means no turn running and no background work.** A dev server or a
   `tail -f` it left running keeps it awake until it stops the work or calls the
   `request_sleep` tool (which stops it), or you run `spanreed sleeper sleep`.
