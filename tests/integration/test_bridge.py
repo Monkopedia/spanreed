@@ -1462,3 +1462,85 @@ def test_a_registry_frame_arriving_after_teardown_does_not_resurrect_mirrors(
         peer.flush()
         time.sleep(0.3)
     assert [a.agent_id for a in store.list_agents(include_stale=True)] == []
+
+
+def _late_peer_frames() -> bytes:
+    agent = {
+        "agent_id": "agent-bob",
+        "name": "bob",
+        "working_dir": "/b",
+        "pid": os.getpid(),
+        "pid_start": None,
+        "last_seen": "2026-01-01T00:00:00Z",
+    }
+    return (
+        json.dumps({"kind": "hello", "host": "hostB"})
+        + "\n"
+        + json.dumps({"kind": "registry", "agents": [agent]})
+        + "\n"
+    ).encode()
+
+
+def test_a_hello_arriving_after_the_handshake_timeout_mirrors_nothing(
+    tmp_path: Path,
+) -> None:
+    """Issue #83: #81's race, on the handshake-timeout exit.
+
+    run() gives up on the hello and returns, but the reader thread is still
+    alive. Before the fix it accepted a late hello, opened an attached peer
+    record, and mirrored the registry that followed, so a peer that never
+    connected read as LIVE until `conjoin`'s next attempt. Made deterministic
+    by sending the late frames after run() returns.
+    """
+    store = StateStore(root=tmp_path / "a")
+    peer_r, peer_w = os.pipe()
+    conn = Bridge(os.fdopen(peer_r, "rb"), io.BytesIO(), "hostA", store, hello_timeout=0.2)
+    with os.fdopen(peer_w, "wb") as peer:
+        conn.run()  # returns on the timeout; the reader is still alive
+        peer.write(_late_peer_frames())
+        peer.flush()
+        time.sleep(0.3)
+    assert store.list_agents(include_stale=True) == []
+    assert store.read_peer_link("hostB") is None
+
+
+def test_a_hello_that_wins_the_race_with_the_handshake_timeout_connects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other side of #83's guard: a hello accepted before run() gave up.
+
+    The wait can expire after the reader has already accepted the hello. That
+    peer was accepted in time, so the link proceeds rather than leaving an
+    accepted peer neither connected nor torn down. Forced deterministically by
+    a wait that reports a timeout only once the hello has been handled.
+    """
+
+    class _LateEvent(threading.Event):
+        def wait(self, timeout: float | None = None) -> bool:
+            super().wait()
+            return False
+
+    store = StateStore(root=tmp_path / "a")
+    peer_r, peer_w = os.pipe()
+    conn = Bridge(
+        os.fdopen(peer_r, "rb"),
+        io.BytesIO(),
+        "hostA",
+        store,
+        poll_interval=0.05,
+        sync_interval=10,
+        recv_timeout=60,
+    )
+    monkeypatch.setattr(conn, "_hello", _LateEvent())
+    runner = threading.Thread(target=conn.run, daemon=True)
+    runner.start()
+    with os.fdopen(peer_w, "wb") as peer:
+        peer.write(_late_peer_frames())
+        peer.flush()
+        _wait(lambda: any(a.agent_id == "agent-bob@hostB" for a in store.list_agents()))
+        conn.stop()
+        runner.join(timeout=5.0)
+    assert not runner.is_alive()
+    assert store.list_agents(include_stale=True) == []  # torn down normally
+    link = store.read_peer_link("hostB")
+    assert link is not None and link.detached_at is not None
