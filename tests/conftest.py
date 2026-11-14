@@ -38,3 +38,14 @@ def no_real_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
         raise sleeper_runner.LaunchError("tests do not launch tmux")
 
     monkeypatch.setattr(sleeper_runner, "_launch_runner", refuse)
+
+
+@pytest.fixture(autouse=True)
+def no_real_claude_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No test reads or writes the developer's Claude Code state.
+
+    ``sleeper create --trust`` writes ``~/.claude.json``, and transcript lookups
+    read ``~/.claude/projects``. Both follow ``CLAUDE_CONFIG_DIR``, so it points at
+    an empty per-test directory unless a test sets its own.
+    """
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config-isolated"))

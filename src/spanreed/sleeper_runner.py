@@ -21,8 +21,10 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import cast
 
+from spanreed.claude_trust import folder_is_trusted
 from spanreed.sleepers import (
     INBOX_MONITOR_COMMAND,
     Activity,
@@ -293,6 +295,14 @@ def run(store: StateStore, name: str, generation: int) -> int:
                     )
                 )
         _say(f"Claude started (pid {child.pid}, {'resume' if resume else 'first launch'})")
+        if folder_is_trusted(Path(record.cwd)) is False:
+            # Nobody sees a detached pane: say so on the bus.
+            _say(
+                f"WARNING: Claude Code has not trusted {record.cwd}; this launch is stopped "
+                f"at its trust dialog until someone runs `spanreed sleeper attach "
+                f"{record.name}` and accepts it"
+            )
+            store.set_status(record.agent_id, "needs_input")
         returncode, ended_by_runner = _watch(
             store, name, child, started, turns_at_launch=before.real_turns
         )

@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from spanreed._fsmode import private_dir, tighten_tree, touch_private, write_private_text
+from spanreed.claude_trust import TrustError, claude_state_file, folder_is_trusted, trust_folder
 from spanreed.codex_approvals import MODES
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.protocol import Agent, validate_agent_id
@@ -909,6 +910,12 @@ def _sleeper_create(args: argparse.Namespace) -> int:
             f"{' and '.join(missing)} not found on PATH; a sleeper runs both by absolute "
             f"path, resolved here at create"
         )
+    if args.trust:
+        # Before the record exists, so a failure leaves nothing half made.
+        try:
+            trust_folder(cwd)
+        except TrustError as exc:
+            raise SleeperError(f"--trust: {exc}") from None
     record = StateStore().create_sleeper(
         SleeperRecord(
             name=name,
@@ -935,7 +942,31 @@ def _sleeper_create(args: argparse.Namespace) -> int:
         f"It is on the bus now. The first message to it, or `spanreed sleeper wake "
         f"{record.name}`, launches it."
     )
+    if args.trust:
+        print(f"Marked {cwd} trusted in {claude_state_file()}, as accepting the dialog would.")
+    else:
+        warning = _trust_warning(record)
+        if warning:
+            print(f"WARNING: {warning}")
     return 0
+
+
+def _trust_warning(record: SleeperRecord) -> str | None:
+    """Why this sleeper's first launch would stop at the trust dialog, if it would."""
+    trusted = folder_is_trusted(Path(record.cwd))
+    if trusted is True:
+        return None
+    if trusted is None:
+        return (
+            f"could not read {claude_state_file()} to tell whether Claude Code trusts "
+            f"{record.cwd}. If it does not, the first launch stops at its trust dialog."
+        )
+    return (
+        f"Claude Code has not trusted {record.cwd}, so the first launch will stop at its "
+        f'"do you trust this folder?" dialog and the sleeper will not take a turn. '
+        f"Accept it once with `spanreed sleeper attach {record.name}`, or retire and "
+        f"re-create with --trust."
+    )
 
 
 def _sleeper_list(args: argparse.Namespace) -> int:
@@ -960,6 +991,9 @@ def _sleeper_list(args: argparse.Namespace) -> int:
         if r.tmux_session:
             print(f"  tmux session:    {r.tmux_session}")
         print(f"  read through:    inbox line {r.read_through.line}")
+        warning = _trust_warning(r)
+        if warning:
+            print(f"  WARNING: {warning}")
         if r.last_wake_failure:
             print(
                 f"  LAST WAKE FAILED {format_age(r.last_wake_failure.at)}: "
@@ -1241,6 +1275,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=PERMISSION_MODES,
         help="Passed on every launch, for the sleeper's whole life",
+    )
+    p_create.add_argument(
+        "--trust",
+        action="store_true",
+        help="Mark --cwd trusted in Claude Code's state file, as accepting its "
+        '"do you trust this folder?" dialog would, so the first launch is not stopped by it',
     )
     p_create.add_argument(
         "--model",

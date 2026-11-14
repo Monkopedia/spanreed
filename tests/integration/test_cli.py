@@ -1318,3 +1318,67 @@ class TestSleeperCommands:
         assert cli.main(["sleeper", "retire", "nap"]) == 0
         assert cli.main(["sleeper", "retire", "nap"]) == 1
         assert "no sleeper named 'nap'" in capsys.readouterr().err
+
+
+class TestSleeperTrust:
+    """``sleeper create --trust``, and the warnings without it (findings Tests 12, 14)."""
+
+    @pytest.fixture
+    def claude_state(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+        config = tmp_path / "claude-config"
+        config.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        state = config / ".claude.json"
+        state.write_text(json.dumps({"projects": {}}))
+        return state
+
+    @pytest.fixture
+    def tools(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for tool in ("claude", "spanreed"):
+            exe = bin_dir / tool
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir))
+
+    def _create(self, cwd: Path, *extra: str) -> int:
+        argv = ["sleeper", "create", "--name", "nap", "--cwd", str(cwd),
+                "--permission-mode", "plan", *extra]  # fmt: skip
+        return cli.main(argv)
+
+    def test_trust_marks_the_folder_and_says_so(
+        self, cli_env: Path, tools: None, claude_state: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert self._create(cli_env, "--trust") == 0
+        out = capsys.readouterr().out
+        assert "trusted" in out and "WARNING" not in out
+        projects = json.loads(claude_state.read_text())["projects"]
+        assert projects[str(cli_env.resolve())]["hasTrustDialogAccepted"] is True
+
+    def test_without_trust_an_untrusted_folder_is_warned_about(
+        self, cli_env: Path, tools: None, claude_state: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert self._create(cli_env) == 0
+        assert "WARNING: Claude Code has not trusted" in capsys.readouterr().out
+        assert cli.main(["sleeper", "list"]) == 0
+        assert "WARNING: Claude Code has not trusted" in capsys.readouterr().out
+        assert json.loads(claude_state.read_text()) == {"projects": {}}, "nothing written"
+
+    def test_a_folder_under_a_trusted_one_gets_no_warning(
+        self, cli_env: Path, tools: None, claude_state: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        parent = str(cli_env.resolve().parent)
+        claude_state.write_text(
+            json.dumps({"projects": {parent: {"hasTrustDialogAccepted": True}}})
+        )
+        assert self._create(cli_env) == 0
+        assert "WARNING" not in capsys.readouterr().out
+
+    def test_a_trust_failure_creates_nothing(
+        self, cli_env: Path, tools: None, claude_state: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        claude_state.unlink()
+        assert self._create(cli_env, "--trust") == 1
+        assert "--trust:" in capsys.readouterr().err
+        assert StateStore().sleepers.read("nap") is None

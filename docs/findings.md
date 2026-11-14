@@ -574,3 +574,23 @@ branch's three turn hooks; the user's plugin was not touched.
 Not measured: a permission prompt in a detached sleeper; Claude ignoring SIGTERM
 (the SIGKILL path is only unit-tested); macOS.
 
+## Test 14: Where does Claude Code keep folder trust, and is it inherited? (2026-11-14)
+
+For `sleeper create --trust`. Claude Code 2.1.283, kaladin.
+
+- **Accepting the trust dialog writes `projects.<dir>.hasTrustDialogAccepted:
+  true`** in `~/.claude.json`. That key appeared for the scratch folder accepted
+  by hand in Test 12. `claude --help` offers no flag for it: the dialog is
+  skipped only in `-p` (non-interactive) mode.
+- **Trust is inherited.** `claude` in a new subfolder of the trusted
+  `/home/jmonk/git/spanreed` opened with no dialog, and wrote no entry for the
+  subfolder.
+- **`--trust` works end to end.** `sleeper create --trust` on a never-opened
+  scratch folder set the key in the real `~/.claude.json` (backed up first). The
+  first launch went straight into a turn: no dialog. Compared with the backup,
+  the file's top-level keys were unchanged and the only project added was that
+  folder.
+
+Not measured: a session rewriting the file at the same moment (unit-tested only,
+by simulating the write); `CLAUDE_CONFIG_DIR`; macOS.
+
