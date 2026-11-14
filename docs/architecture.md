@@ -1083,13 +1083,23 @@ asked "Could we have a flag that approves?", then "Sure" to this design):
   file (`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`) and reads it back.
   It runs before the record is written, so a failure creates nothing. Claude Code
   has no flag of its own for this; its dialog is skipped only in `-p` mode.
-- **Running sessions rewrite that file**, so the write must not undo theirs: it
-  sets the one key on a fresh read and replaces the file only if its mtime and
-  size are unchanged since, retrying up to 5 times otherwise.
+- **The home folder and anything above it are refused.** Trust is inherited, so
+  a grant there would cover nearly everything, and Claude Code itself never saves
+  home-folder trust (review of PR #93). Use a project folder.
+- **Running sessions rewrite that file, and nothing locks it against them.** The
+  write sets the one key on a fresh read and replaces the file only if its inode,
+  size, mtime and ctime are unchanged since, retrying up to 5 times. That narrows
+  the window without closing it: a session write landing between the last check
+  and the rename is lost (the review of PR #93 measured 2 of 3,383 against a
+  1 kHz writer; the file was never damaged).
+- **A symlinked state file is written through**, next to its real target, so a
+  dotfile manager's link stays a link. Non-ASCII is kept as-is, so unrelated
+  bytes round-trip unchanged.
 - **Without `--trust`**, `create` and `sleeper list` warn when the folder is not
   trusted, and the runner sets `needs_input` at a launch into one, since nobody
-  sees a detached pane. Trust is inherited from parent folders (measured,
-  findings Test 14), and the check follows that.
+  sees a detached pane. Trust is inherited from parent folders **up to the
+  enclosing git repository's root, not past it** (measured, findings Test 14),
+  and the check follows exactly that.
 - **The file is Claude Code's internal format**, so this fails toward "not
   trusted". An unreadable file reads as unknown, with its own warning, and the
   worst case of any failure is the dialog, exactly as without `--trust`.

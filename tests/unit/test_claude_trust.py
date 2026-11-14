@@ -126,3 +126,101 @@ class TestTrustFolder:
         with pytest.raises(TrustError, match="kept changing"):
             trust_folder(Path("/srv/new"), state)
         assert "/srv/new" not in json.loads(state.read_text())["projects"]
+
+
+class TestTrustScope:
+    """Measured (findings Test 14): inheritance stops at the enclosing git root."""
+
+    @pytest.fixture
+    def tree(self, tmp_path: Path) -> tuple[Path, Path]:
+        parent = tmp_path / "trusted"
+        (parent / "plain" / "deep").mkdir(parents=True)
+        (parent / "repo" / ".git").mkdir(parents=True)
+        (parent / "repo" / "sub").mkdir()
+        state = tmp_path / ".claude.json"
+        state.write_text(json.dumps({"projects": {str(parent): {"hasTrustDialogAccepted": True}}}))
+        return parent, state
+
+    def test_a_plain_subfolder_inherits(self, tree: tuple[Path, Path]) -> None:
+        parent, state = tree
+        assert folder_is_trusted(parent / "plain" / "deep", state) is True
+
+    def test_a_repository_under_a_trusted_folder_does_not(self, tree: tuple[Path, Path]) -> None:
+        parent, state = tree
+        assert folder_is_trusted(parent / "repo", state) is False
+        assert folder_is_trusted(parent / "repo" / "sub", state) is False
+
+    def test_inside_a_trusted_repository_it_does(self, tree: tuple[Path, Path]) -> None:
+        parent, state = tree
+        trust_folder(parent / "repo", state)
+        assert folder_is_trusted(parent / "repo" / "sub", state) is True
+
+
+class TestBroadFolders:
+    """Trust is inherited, so a grant on the home folder or above covers nearly
+    everything, and Claude Code never saves home-folder trust itself."""
+
+    @pytest.mark.parametrize("folder", ["/", "/home", "HOME"])
+    def test_refused(self, folder: str, tmp_path: Path) -> None:
+        home = tmp_path / "home" / "u"
+        home.mkdir(parents=True)
+        target = home if folder == "HOME" else Path(folder)
+        if folder == "/home":
+            target = tmp_path / "home"
+        with pytest.raises(TrustError, match="home folder or above"):
+            claude_trust.refuse_broad_folder(target, home)
+
+    def test_a_folder_under_home_is_allowed(self, tmp_path: Path) -> None:
+        home = tmp_path / "u"
+        (home / "proj").mkdir(parents=True)
+        claude_trust.refuse_broad_folder(home / "proj", home)
+
+    @pytest.mark.parametrize("folder", [Path("/"), Path.home()])
+    def test_trust_folder_refuses_and_writes_nothing(self, state: Path, folder: Path) -> None:
+        before = state.read_bytes()
+        with pytest.raises(TrustError, match="home folder or above"):
+            trust_folder(folder, state)
+        assert state.read_bytes() == before
+
+
+class TestWriteSafety:
+    def test_a_symlinked_state_file_stays_a_link(self, state: Path, tmp_path: Path) -> None:
+        """A dotfile manager's link: write through it, never replace it."""
+        link = tmp_path / "linked.json"
+        link.symlink_to(state)
+        trust_folder(Path("/srv/new"), link)
+        assert link.is_symlink()
+        assert folder_is_trusted(Path("/srv/new"), state) is True
+
+    def test_non_ascii_round_trips_unescaped(self, tmp_path: Path) -> None:
+        path = tmp_path / ".claude.json"
+        path.write_text(
+            json.dumps(
+                {"projects": {"/x/café": {"lastSessionFirstPrompt": "héllo ✓"}}},
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        trust_folder(Path("/srv/new"), path)
+        assert "héllo ✓" in path.read_text(encoding="utf-8")
+        assert "\\u" not in path.read_text(encoding="utf-8")
+
+    def test_a_write_failure_is_a_trust_error_and_leaves_no_temp(self, tmp_path: Path) -> None:
+        folder = tmp_path / "ro"
+        folder.mkdir()
+        path = folder / ".claude.json"
+        path.write_text(json.dumps({"projects": {}}))
+        folder.chmod(0o500)
+        try:
+            with pytest.raises(TrustError, match="cannot write"):
+                trust_folder(Path("/srv/new"), path)
+        finally:
+            folder.chmod(0o700)
+        assert [p.name for p in folder.iterdir()] == [".claude.json"]
+
+
+def test_tests_never_see_the_real_claude_state() -> None:
+    """The conftest guard: CLAUDE_CONFIG_DIR points away from the real home."""
+    assert not claude_state_file().is_relative_to(Path.home() / ".claude.json")
+    assert claude_state_file() != Path.home() / ".claude.json"

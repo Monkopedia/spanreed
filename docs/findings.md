@@ -582,9 +582,12 @@ For `sleeper create --trust`. Claude Code 2.1.283, kaladin.
   true`** in `~/.claude.json`. That key appeared for the scratch folder accepted
   by hand in Test 12. `claude --help` offers no flag for it: the dialog is
   skipped only in `-p` (non-interactive) mode.
-- **Trust is inherited.** `claude` in a new subfolder of the trusted
-  `/home/jmonk/git/spanreed` opened with no dialog, and wrote no entry for the
-  subfolder.
+- **Trust is inherited, up to the git root.** `claude` in a new subfolder of the
+  trusted `/home/jmonk/git/spanreed` opened with no dialog, and wrote no entry for
+  the subfolder. Under a trusted folder that is *not* a repository, a plain
+  subfolder opened with no dialog, but a `git init`ed subfolder, and a folder
+  inside it, both showed the dialog: inheritance stops at the enclosing
+  repository's root.
 - **`--trust` works end to end.** `sleeper create --trust` on a never-opened
   scratch folder set the key in the real `~/.claude.json` (backed up first). The
   first launch went straight into a turn: no dialog. Compared with the backup,
