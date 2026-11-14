@@ -349,6 +349,18 @@ def _after_exit(
             store.sleepers.write(record)
             _say(f"asleep; inbox read through line {record.read_through.line}")
             return None
+        if not model_ran:
+            # Claude exited by itself, with mail unread, without the model taking
+            # a single turn: relaunching would only do the same again, as fast as
+            # Claude can start (review of #90 measured 443 launches in 5 s). A
+            # failed wake, whatever the exit status.
+            reason = (
+                f"Claude exited ({returncode}) without taking a turn while inbox line "
+                f"{record.undelivered_line} was unread (mail stays unread for the next wake)"
+            )
+            _fail(store, record, reason)
+            _say(f"WAKE FAILED: {reason}")
+            return None
         store.sleepers.write(record)
         return record
 

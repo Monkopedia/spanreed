@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from spanreed import cli, sleeper_runner
 from spanreed.protocol import Message
 from spanreed.sleepers import InboxPosition, SleeperRecord
 from spanreed.store import StateStore, pid_start_time
-from spanreed.transcript import Deliveries, TranscriptStatus
+from spanreed.transcript import Deliveries, TranscriptStatus, read_deliveries
 
 SID = "00000000-0000-4000-8000-0000000000aa"
 
@@ -396,6 +397,63 @@ class TestAfterClaudeExits:
         assert record.skipped_lines == []
         assert record.undelivered_attempts == 0
 
+    def test_a_turnless_clean_exit_with_unread_mail_is_a_failed_wake(
+        self, store: StateStore, launches: Launches, after_exit: AfterExit
+    ) -> None:
+        """Review of #90: exit 0, no model turn, no error, mail unread. Relaunching
+        would only repeat it, as fast as Claude starts."""
+        _mail(store, "one")
+        assert after_exit(_deliveries(real=7), _deliveries(real=7), 0) is None
+        record = _read(store)
+        assert record.state == "asleep"
+        assert record.last_wake_failure is not None
+        assert "without taking a turn" in record.last_wake_failure.reason
+        assert record.read_through.line == 0
+
+    def test_a_turnless_exit_with_nothing_unread_just_sleeps(
+        self, store: StateStore, launches: Launches, after_exit: AfterExit
+    ) -> None:
+        """A manual wake with no mail, then /exit: nothing went wrong."""
+        assert after_exit(_deliveries(real=7), _deliveries(real=7), 0) is None
+        record = _read(store)
+        assert (record.state, record.last_wake_failure) == ("asleep", None)
+
+    def test_a_no_error_synthetic_is_not_a_failed_wake(
+        self, store: StateStore, launches: Launches, after_exit: AfterExit, tmp_path: Path
+    ) -> None:
+        """Design rule: a failed wake keys on `error`, not on is-synthetic. A resume
+        after SIGTERM writes a "No response requested." synthetic with no error."""
+        transcript = tmp_path / "s.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "assistant", "uuid": "a", "message": {"model": "<synthetic>"}})
+            + "\n"
+        )
+        after = read_deliveries(transcript)
+        assert after.error_turns == {} and after.real_turns == 0
+        assert after_exit(_deliveries(real=0), after, 0) is None
+        assert _read(store).last_wake_failure is None
+
+    def test_the_poison_counter_resets_when_the_line_moves_on(
+        self, store: StateStore, launches: Launches, after_exit: AfterExit
+    ) -> None:
+        ids = _mail(store, "one", "two")
+        after_exit(_deliveries(real=1), _deliveries(real=2), 0)
+        after_exit(_deliveries(real=2), _deliveries(real=3), 0)
+        assert (_read(store).undelivered_line, _read(store).undelivered_attempts) == (1, 2)
+        after_exit(_deliveries(real=3), _deliveries(ids[0], real=4), 0)
+        record = _read(store)
+        assert (record.undelivered_line, record.undelivered_attempts) == (2, 1)
+
+    def test_skipped_lines_accumulate_and_are_never_overwritten(
+        self, store: StateStore, launches: Launches, after_exit: AfterExit
+    ) -> None:
+        ids = _mail(store, "poison-1", "poison-2")
+        for real in range(6):
+            if after_exit(_deliveries(real=real), _deliveries(real=real + 1), 0) is None:
+                break
+        record = _read(store)
+        assert [(s.line, s.msg_id) for s in record.skipped_lines] == [(1, ids[0]), (2, ids[1])]
+
     def test_a_retired_sleeper_stops_the_runner(
         self, store: StateStore, after_exit: AfterExit
     ) -> None:
@@ -412,6 +470,33 @@ def _fake_claude(tmp_path: Path, body: str) -> Path:
 
 
 class TestRun:
+    @pytest.fixture(autouse=True)
+    def restore_signals(self) -> Iterator[None]:
+        """run() ignores SIGINT, SIGQUIT and SIGTSTP for the pane; undo it for pytest."""
+        saved = {
+            sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP)
+        }
+        yield
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+
+    def test_claude_exiting_clean_at_once_with_mail_unread_does_not_spin(
+        self, store: StateStore, launches: Launches, tmp_path: Path, config_dir: Path
+    ) -> None:
+        """Review of #90's probe: 443 launches in 5 s before this guard."""
+        count = tmp_path / "launches"
+        claude = _fake_claude(tmp_path, f"open({str(count)!r}, 'a').write('x')\nsys.exit(0)")
+        (config_dir / "projects" / "-tmp" / f"{SID}.jsonl").write_text(
+            json.dumps({"type": "user", "uuid": "u1", "message": {"content": "hi"}}) + "\n"
+        )
+        store.create_sleeper(_record(claude_path=str(claude)))
+        sleeper_runner.wake_if_needed(store, "agent-nap")
+        store.send_message("tester", "agent-nap", "unread")  # awake already: no new wake
+        assert sleeper_runner.run(store, "nap", 1) == 0
+        assert count.read_text() == "x", "exactly one launch"
+        failure = _read(store).last_wake_failure
+        assert failure is not None and "without taking a turn" in failure.reason
+
     @pytest.fixture
     def config_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         config = tmp_path / "claude-config"
@@ -548,6 +633,28 @@ class TestMonitorReplay:
         ids = [store.send_message("tester", "agent-nap", b).msg_id for b in ("a", "b")]
         printed, _ = watch()  # no transcript at all
         assert [json.loads(p)["msg_id"] for p in printed] == ids
+
+    def test_the_shipped_pace_is_long_enough_to_separate_events(self) -> None:
+        """Every other replay test sets the pace to 0; this pins the real one."""
+        assert cli.REPLAY_PACE_S >= 1
+
+    def test_a_backlog_is_paced_one_line_at_a_time(
+        self,
+        store: StateStore,
+        monkeypatch: pytest.MonkeyPatch,
+        watch: Callable[[], tuple[list[str], list[str]]],
+    ) -> None:
+        """The Monitor batches lines that arrive together and cuts a batch at ~3 KB
+        (findings Test 9), so the replay pauses between lines."""
+        monkeypatch.setattr(cli, "REPLAY_PACE_S", 2.5)
+        pauses: list[float] = []
+        monkeypatch.setattr(cli.time, "sleep", pauses.append)
+        store.create_sleeper(_record())
+        for body in ("a", "b", "c"):
+            store.send_message("tester", "agent-nap", body)
+        printed, _ = watch()
+        assert len(printed) == 3
+        assert pauses == [2.5, 2.5]
 
     def test_an_ordinary_session_still_tails_from_the_end(
         self,

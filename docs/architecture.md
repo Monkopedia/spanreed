@@ -590,6 +590,11 @@ for any reason.
 **A failed wake comes in two forms, and the runner detects both:**
 
 - **Claude exits almost at once** (`claude` missing, a deleted transcript).
+  Precisely: Claude exits by itself, **with any exit status**, without the model
+  having taken a turn, while mail is still unread. A clean exit counts too:
+  relaunching would only repeat it as fast as Claude starts (the review of PR #90
+  measured 443 launches in 5 s before this rule). The same exit with nothing
+  unread is not a failure; the sleeper just sleeps.
 - **Claude stays up but the model can't run.** An expired login or a rate limit
   doesn't make Claude exit. It answers every turn with a synthetic error record
   (`authentication_failed`, `rate_limit`). The runner watches the transcript for

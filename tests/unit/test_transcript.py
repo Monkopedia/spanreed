@@ -279,6 +279,33 @@ class TestNegativeControls:
         t.records[-1]["parentUuid"] = branch_point
         assert delivered(t, tmp_path) == set()
 
+    def test_a_notification_answered_only_by_a_no_error_synthetic(
+        self, t: Transcript, tmp_path: Path
+    ) -> None:
+        """The "No response requested." record after a SIGTERM resume: no error, and
+        the model never ran. Unread, and not a real turn."""
+        t.notification(line("msg-1"))
+        t.synthetic(None)
+        before = read_deliveries(tmp_path / "none.jsonl").real_turns
+        result = read_deliveries(t.write(tmp_path / "s.jsonl"))
+        assert result.delivered == set()
+        assert result.real_turns == 1 + before, "only the fixture's opening reply"
+        assert result.error_turns == {}
+
+    def test_a_model_record_carrying_an_error_is_not_a_real_turn(
+        self, t: Transcript, tmp_path: Path
+    ) -> None:
+        t.notification(line("msg-1"))
+        t.other(
+            {
+                "type": "assistant",
+                "error": "server_error",
+                "isApiErrorMessage": True,
+                "message": {"model": "claude-opus-5-5", "content": []},
+            }
+        )
+        assert delivered(t, tmp_path) == set()
+
     def test_an_id_quoted_in_a_subagent_result(self, t: Transcript, tmp_path: Path) -> None:
         """Only <event> sections are read; a subagent's <result> is not a delivery."""
         t.notification(line("msg-1"), tag="result")
