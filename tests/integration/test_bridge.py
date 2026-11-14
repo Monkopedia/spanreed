@@ -1559,7 +1559,7 @@ def test_an_asleep_sleeper_is_advertised_and_addressable_from_the_peer(tmp_path:
             agent_id="agent-nap",
             cwd="/tmp",
             session_id="00000000-0000-4000-8000-000000000000",
-            permission_mode=None,
+            permission_mode="plan",
             claude_path="/usr/bin/claude",
             spanreed_path="/usr/bin/spanreed",
             path_env="/usr/bin",

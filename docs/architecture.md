@@ -983,7 +983,7 @@ part of the first implementation. Mail already wakes a remote sleeper without it
 ### Commands
 
 ```
-spanreed sleeper create --name X --cwd DIR [--permission-mode MODE] [--idle-timeout 15m]
+spanreed sleeper create --name X --cwd DIR --permission-mode MODE [--idle-timeout 15m]
 spanreed sleeper list
 spanreed sleeper attach X     # tmux attach to the current session-name generation
 spanreed sleeper wake X       # by hand; the same path a message takes
@@ -1000,11 +1000,14 @@ like mail to any unknown agent.
 Settled while building stage 1 (the author's calls, listed for the owner to see):
 - **`create` launches nothing.** The sleeper starts `asleep`; the first mail, or
   `sleeper wake`, is its first launch (with `--session-id`).
-- **`--permission-mode` may be omitted.** The record then holds `null` and no flag
-  is passed, so each launch gets whatever Claude Code's settings make the default.
-  A given mode must be one `claude --help` lists (checked at create, since a typo
-  would otherwise fail every wake).
-- **An asleep sleeper's row carries `pid` 0**, which is never alive.
+- **`--permission-mode` is required**, and must be one `claude --help` lists
+  (checked at create, since a typo would otherwise fail every wake). Leaving it
+  optional was considered and dropped in the review of PR #89: with no flag,
+  each launch takes whatever Claude Code's settings say at that moment, so the
+  mode would not be "kept" (decision 2), and resume without the flag was never
+  measured.
+- **An asleep sleeper's row carries `pid` 0 and `pid_start` -1**, which no
+  process has (see "Compatibility").
 - **`retire` refuses an awake or sleeping sleeper** until the runner exists to end
   one.
 
@@ -1017,7 +1020,13 @@ older binary ignores the new field when reading.
 
 Older binaries still hurt sleepers in two ways:
 - An older binary decides liveness by pid, so sleepers disappear from its `list`
-  while asleep.
+  while asleep, and it treats mail to one as queued for a stopped session. That
+  depends on the row's `pid_start` being **`-1`**, which no process has. An older
+  binary reads pid 0 as alive (`kill(0, 0)` signals its own process group), and
+  with `pid_start: null` it would trust that: it would list an asleep sleeper as
+  LIVE and tell senders "Delivered", the #55 failure (measured in the review of
+  PR #89). With `-1` it sees a start time that does not match and reads the row
+  as stale.
 - **An older binary that rewrites the registry on the same host** (`set_status`,
   `prune`) **drops the marker or prunes the row.**
 

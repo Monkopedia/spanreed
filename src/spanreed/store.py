@@ -130,6 +130,10 @@ def is_stale(agent: Agent) -> bool:
     return pid_start_time(agent.pid) != agent.pid_start
 
 
+SLEEPER_ROW_PID_START = -1
+"""``pid_start`` of a sleeper row that has no process: no process has it."""
+
+
 def runner_is_alive(record: SleeperRecord) -> bool:
     """Whether the runner ``record`` names is still running. The same test as
     :func:`is_stale`: pid alive, and its start time unchanged when known."""
@@ -199,7 +203,12 @@ class AgentIdHeld(RuntimeError):
     """``register_agent(refuse_live_holder=True)`` found a live row it would take over."""
 
     def __init__(self, holder: Agent) -> None:
-        super().__init__(f"{holder.agent_id} is held by live pid {holder.pid}")
+        held_by = (
+            f"sleeper {holder.name} ({holder.sleeper})"
+            if holder.sleeper is not None
+            else f"live pid {holder.pid}"
+        )
+        super().__init__(f"{holder.agent_id} is held by {held_by}")
         self.holder = holder
 
 
@@ -402,10 +411,10 @@ class StateStore:
         ``sleeper_ids`` saves a directory listing when checking many rows.
         """
         if sleeper_ids is None:
-            sleeper_ids = self._sleeper_ids()
+            sleeper_ids = self.sleeper_ids()
         return agent.agent_id in sleeper_ids or not is_stale(agent)
 
-    def _sleeper_ids(self) -> set[str]:
+    def sleeper_ids(self) -> set[str]:
         return {sleeper_agent_id(n) for n in self.sleepers.names()}
 
     def _sleeper_for(self, agent_id: str) -> SleeperRecord | None:
@@ -424,6 +433,13 @@ class StateStore:
             name=record.name,
             working_dir=record.cwd,
             pid=0,
+            # Never a real start time. An older spanreed reads pid 0 as alive
+            # (kill(0, 0) signals its own process group) and, with pid_start
+            # null, would trust that: it would list an asleep sleeper as LIVE
+            # and tell senders "Delivered". A start time that cannot match
+            # makes it read the row as stale instead, which is the truth to
+            # a binary that cannot wake it.
+            pid_start=SLEEPER_ROW_PID_START,
             last_seen=record.created_at,
             sleeper=record.state,
         )
@@ -433,7 +449,7 @@ class StateStore:
 
         Never removes a local sleeper's row: it is present while its record is.
         """
-        sleeper_ids = self._sleeper_ids()
+        sleeper_ids = self.sleeper_ids()
         with self._registry_lock():
             agents = self._read_registry_unlocked()
             live = [a for a in agents if self.is_present(a, sleeper_ids)]
@@ -573,7 +589,7 @@ class StateStore:
         if any(a.agent_id == to_agent for a in agents):
             return to_agent
         by_name = [a for a in agents if a.name == to_agent]
-        sleeper_ids = self._sleeper_ids()
+        sleeper_ids = self.sleeper_ids()
         live_by_name = [a for a in by_name if self.is_present(a, sleeper_ids)]
         if len(live_by_name) == 1:
             return live_by_name[0].agent_id
@@ -830,9 +846,20 @@ class StateStore:
             self.sleepers.write(record)
             row = self._sleeper_row(record, None)
             with self._registry_lock():
-                agents = [
-                    a for a in self._read_registry_unlocked() if a.agent_id != record.agent_id
-                ]
+                rows = self._read_registry_unlocked()
+                # Again under the registry lock: a holder that registered since
+                # the check above (a Codex worker on the same name) must not be
+                # silently replaced. Its row is live, so this one is refused.
+                taken = next(
+                    (a for a in rows if a.agent_id == record.agent_id and not is_stale(a)), None
+                )
+                if taken is not None:
+                    self.sleepers.delete(record.name)
+                    raise SleeperError(
+                        f"{record.name!r} was taken by {taken.agent_id} (pid {taken.pid}) "
+                        f"while the sleeper was being created; nothing was created"
+                    )
+                agents = [a for a in rows if a.agent_id != record.agent_id]
                 self._write_registry_unlocked([*agents, row])
         return record
 

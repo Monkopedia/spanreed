@@ -13,10 +13,6 @@ from typing import Literal
 from pydantic import BaseModel
 
 Status = Literal["idle", "working", "needs_input", "blocked"]
-
-SleeperState = Literal["asleep", "awake", "sleeping"]
-"""A sleeper's state (``docs/architecture.md``, "Sleepers"). ``sleeping`` means
-committed to sleep, with Claude being ended."""
 """Self-reported agent status, ordered by escalating need for a human:
 
 - ``idle`` — registered but not actively working.
@@ -28,6 +24,10 @@ The "needs a human" set is ``{needs_input, blocked}`` — a peer or dashboard
 partitions on that. ``idle`` is best-effort: an agent stops running exactly when
 it goes idle, so it can't always report the transition (there's no Stop hook).
 """
+
+SleeperState = Literal["asleep", "awake", "sleeping"]
+"""A sleeper's state (``docs/architecture.md``, "Sleepers"). ``sleeping`` means
+committed to sleep, with Claude being ended."""
 
 
 _ID_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")

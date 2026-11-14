@@ -1190,7 +1190,21 @@ class TestSleeperCommands:
         self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         (tools_on_path / "claude").unlink()
-        assert cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)]) == 1
+        assert (
+            cli.main(
+                [
+                    "sleeper",
+                    "create",
+                    "--name",
+                    "nap",
+                    "--cwd",
+                    str(cli_env),
+                    "--permission-mode",
+                    "plan",
+                ]
+            )
+            == 1
+        )
         assert "claude not found on PATH" in capsys.readouterr().err
         assert StateStore().sleepers.read("nap") is None
 
@@ -1198,7 +1212,7 @@ class TestSleeperCommands:
         self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         argv = ["sleeper", "create", "--name", "nap", "--cwd", str(cli_env),
-                "--idle-timeout", "soon"]  # fmt: skip
+                "--permission-mode", "plan", "--idle-timeout", "soon"]  # fmt: skip
         assert cli.main(argv) == 1
         assert "not a duration" in capsys.readouterr().err
 
@@ -1210,16 +1224,48 @@ class TestSleeperCommands:
         with pytest.raises(SystemExit):
             cli.main(argv)
 
+    def test_create_requires_a_permission_mode(self, cli_env: Path, tools_on_path: Path) -> None:
+        """#85 decision 2: the mode is chosen at create and always kept. With no flag,
+        each launch would take whatever Claude Code's settings said at the time."""
+        with pytest.raises(SystemExit):
+            cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)])
+        assert StateStore().sleepers.read("nap") is None
+
     def test_create_refuses_a_name_that_is_not_a_legal_id(
         self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        assert cli.main(["sleeper", "create", "--name", "a/b", "--cwd", str(cli_env)]) == 1
+        assert (
+            cli.main(
+                [
+                    "sleeper",
+                    "create",
+                    "--name",
+                    "a/b",
+                    "--cwd",
+                    str(cli_env),
+                    "--permission-mode",
+                    "plan",
+                ]
+            )
+            == 1
+        )
         assert "is not legal" in capsys.readouterr().err
 
     def test_list_and_bus_report_show_it_asleep(
         self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)])
+        cli.main(
+            [
+                "sleeper",
+                "create",
+                "--name",
+                "nap",
+                "--cwd",
+                str(cli_env),
+                "--permission-mode",
+                "plan",
+            ]
+        )
         capsys.readouterr()
         assert cli.main(["sleeper", "list"]) == 0
         assert "nap  ASLEEP  (agent-nap)" in capsys.readouterr().out
@@ -1229,7 +1275,18 @@ class TestSleeperCommands:
     def test_list_marks_a_dead_runner(
         self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)])
+        cli.main(
+            [
+                "sleeper",
+                "create",
+                "--name",
+                "nap",
+                "--cwd",
+                str(cli_env),
+                "--permission-mode",
+                "plan",
+            ]
+        )
         # PATH holds only the fake tools here, so there is no `true` to reap.
         dead = subprocess.Popen([sys.executable, "-c", ""])
         dead.wait()
@@ -1246,7 +1303,18 @@ class TestSleeperCommands:
     def test_retire_removes_it(
         self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)])
+        cli.main(
+            [
+                "sleeper",
+                "create",
+                "--name",
+                "nap",
+                "--cwd",
+                str(cli_env),
+                "--permission-mode",
+                "plan",
+            ]
+        )
         assert cli.main(["sleeper", "retire", "nap"]) == 0
         assert cli.main(["sleeper", "retire", "nap"]) == 1
         assert "no sleeper named 'nap'" in capsys.readouterr().err

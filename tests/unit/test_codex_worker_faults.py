@@ -931,7 +931,7 @@ class TestOneNameOneWorker:
                 agent_id="agent-reviewer",
                 cwd="/tmp",
                 session_id="00000000-0000-4000-8000-000000000000",
-                permission_mode=None,
+                permission_mode="plan",
                 claude_path="/usr/bin/claude",
                 spanreed_path="/usr/bin/spanreed",
                 path_env="/usr/bin",

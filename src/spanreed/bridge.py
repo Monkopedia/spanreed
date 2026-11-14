@@ -404,7 +404,8 @@ class Bridge:
         rows = [a for a in self.store.list_agents(include_stale=True) if "@" not in a.agent_id]
         # Asleep sleepers are advertised too, with their `sleeper` state, so a
         # peer can mail them: the mail is what wakes them.
-        live = [a for a in rows if self.store.is_present(a)]
+        sleeper_ids = self.store.sleeper_ids()
+        live = [a for a in rows if self.store.is_present(a, sleeper_ids)]
         return self._send(
             {
                 "kind": "registry",

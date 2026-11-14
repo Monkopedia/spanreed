@@ -94,9 +94,10 @@ class SleeperRecord(BaseModel):
     cwd: str
     session_id: str
     """Chosen at create: ``--session-id`` on the first launch, ``--resume`` after."""
-    permission_mode: str | None
-    """Fixed at create and passed on every launch. ``None`` passes no flag, so
-    each launch gets whatever Claude Code's own settings make the default."""
+    permission_mode: str
+    """Fixed at create and passed on every launch (#85 decision 2: "always keep
+    it"). Required: with no flag, each launch would take whatever Claude Code's
+    settings said at that moment, so the mode would not be kept."""
     idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S
     claude_path: str
     spanreed_path: str

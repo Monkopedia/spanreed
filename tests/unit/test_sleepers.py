@@ -6,6 +6,7 @@ not its pid, at every site that used to ask ``is_stale``.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -71,6 +72,7 @@ class TestCreate:
         assert record.state == "asleep"
         [row] = store.list_agents()
         assert (row.agent_id, row.pid, row.sleeper) == ("agent-nap", 0, "asleep")
+        assert row.pid_start == -1
 
     def test_record_is_owner_only(self, store: StateStore) -> None:
         store.create_sleeper(_record())
@@ -113,6 +115,24 @@ class TestCreate:
         with pytest.raises(SleeperError, match="agent-zz"):
             store.create_sleeper(_record())
 
+    def test_a_holder_that_registers_during_create_is_not_replaced(
+        self, store: StateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review of #89: create checks first and writes second; a Codex worker
+        registering in between must keep its row, and nothing is created."""
+        real_end = store._inbox_end  # pyright: ignore[reportPrivateUsage]
+
+        def register_meanwhile(agent_id: str) -> object:
+            store.register_agent(name="w", working_dir="/", pid=os.getpid(), agent_id="agent-nap")
+            return real_end(agent_id)
+
+        monkeypatch.setattr(store, "_inbox_end", register_meanwhile)
+        with pytest.raises(SleeperError, match="was taken by agent-nap"):
+            store.create_sleeper(_record())
+        assert store.sleepers.read("nap") is None
+        [row] = store.list_agents()
+        assert (row.name, row.pid, row.sleeper) == ("w", os.getpid(), None)
+
     def test_a_stale_row_on_the_id_is_replaced(self, store: StateStore) -> None:
         store.register_agent(name="old", working_dir="/x", pid=_dead_pid(), agent_id="agent-nap")
         store.create_sleeper(_record())
@@ -126,6 +146,32 @@ class TestPresence:
         assert not store_module._is_pid_alive(0)  # pyright: ignore[reportPrivateUsage]
         row = Agent(agent_id="x", name="x", working_dir="/", pid=0, last_seen=datetime.now(UTC))
         assert store_module.is_stale(row)
+
+    def test_an_older_binary_reads_the_asleep_row_as_stale(self, store: StateStore) -> None:
+        """Review of #89: main's liveness test, verbatim, on the row as written to disk.
+
+        kill(0, 0) succeeds, so with pid_start null an older spanreed would list an
+        asleep sleeper as LIVE and tell senders "Delivered". The row's pid_start
+        can never match, so it reads as stale: true for a binary that cannot wake it.
+        """
+        store.create_sleeper(_record())
+
+        def old_is_stale(agent: Agent) -> bool:  # src/spanreed/store.py at 0a4a1e5
+            try:
+                os.kill(agent.pid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                pass
+            if agent.pid_start is None:
+                return False
+            return store_module.pid_start_time(agent.pid) != agent.pid_start
+
+        raw = json.loads((store.root / "registry.json").read_text())["agents"]
+        [row] = [Agent.model_validate(a) for a in raw]
+        assert (row.pid, row.pid_start) == (0, -1)
+        assert old_is_stale(row)
+        assert store.list_agents() != [], "new code still lists it, from the record"
 
     def test_an_asleep_sleeper_is_listed_though_it_has_no_process(self, store: StateStore) -> None:
         store.create_sleeper(_record())
@@ -161,7 +207,7 @@ class TestPresence:
     def test_a_sleeper_holds_its_id_against_refuse_live_holder(self, store: StateStore) -> None:
         """A Codex worker registers with refuse_live_holder; an asleep sleeper has no pid."""
         store.create_sleeper(_record())
-        with pytest.raises(AgentIdHeld):
+        with pytest.raises(AgentIdHeld, match="held by sleeper nap"):
             store.register_agent(
                 name="nap",
                 working_dir="/",

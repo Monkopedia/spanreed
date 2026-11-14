@@ -873,7 +873,7 @@ def _sleeper_create(args: argparse.Namespace) -> int:
         f"created sleeper {record.name} ({record.agent_id}), ASLEEP\n"
         f"  cwd:             {record.cwd}\n"
         f"  session id:      {record.session_id}\n"
-        f"  permission mode: {record.permission_mode or '(Claude Code default)'}\n"
+        f"  permission mode: {record.permission_mode}\n"
         f"  idle timeout:    {record.idle_timeout_s}s\n"
         f"  inbox read from: line {record.read_through.line + 1} (earlier mail is history)\n"
         f"It is on the bus now. Waking it is not built yet, so nothing launches Claude."
@@ -896,7 +896,7 @@ def _sleeper_list(args: argparse.Namespace) -> int:
             state += " (runner dead)"
         print(f"{r.name}  {state}  ({r.agent_id})")
         print(f"  cwd:             {r.cwd}")
-        print(f"  permission mode: {r.permission_mode or '(Claude Code default)'}")
+        print(f"  permission mode: {r.permission_mode}")
         print(f"  idle timeout:    {r.idle_timeout_s}s")
         print(f"  session id:      {r.session_id}  (generation {r.generation})")
         if r.tmux_session:
@@ -1119,9 +1119,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--cwd", required=True, help="Directory Claude runs in")
     p_create.add_argument(
         "--permission-mode",
+        required=True,
         choices=PERMISSION_MODES,
-        help="Passed on every launch, for the sleeper's whole life (default: none passed, "
-        "so Claude Code's own settings decide)",
+        help="Passed on every launch, for the sleeper's whole life",
     )
     p_create.add_argument(
         "--idle-timeout",
