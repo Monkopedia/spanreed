@@ -17,7 +17,14 @@ config.json             bus-wide flags (status_tracking, activity_log)
 activity-log.jsonl      append-only focus/status transition log (opt-in)
 codex/<name>.log        per-Codex-worker log: startup config, every turn, every
                         approval decision (both outcomes). Never a credential.
+sleepers/<name>.json    one record per sleeper: the source of truth for its presence
+sleepers/<name>.lock    that sleeper's flock; never deleted, not even by retire
 ```
+
+`sleepers/<name>.json` is the record whose fields `architecture.md` lists under "The sleeper
+record". It is written atomically (temp file, then rename) under `<name>.lock`. Its lock file
+outlives a `retire`: a process blocked on the old file would otherwise go on to act on a sleeper
+that a new `create` had locked through a new one.
 
 `codex/<name>.log` is written only by `spanreed codex` (see
 [`architecture.md`](architecture.md#codex-workers)). It is append-only, plain text, one timestamped
@@ -52,7 +59,8 @@ has to create a missing ancestor itself, it creates it `0700`.
       "pid_start": 8675309,
       "last_seen": "2026-05-17T15:00:00Z",
       "focus": "...",
-      "status": "working"
+      "status": "working",
+      "sleeper": null
     }
   ]
 }
@@ -60,7 +68,19 @@ has to create a missing ancestor itself, it creates it `0700`.
 
 Rewritten atomically on every change. `focus` and `status` are omitted/`null` when unset.
 
-**Liveness / staleness.** An agent is *present* iff its `pid` is alive **and** that PID's start-time still matches the `pid_start` captured at registration. Stale entries (PID dead, or PID recycled onto an unrelated process so the start-time no longer matches) get filtered on read and pruned by `prune_stale`. `pid_start` is the process start-time (Linux: clock ticks since boot, from `/proc/<pid>/stat` field 22); it's the guard against PID reuse. When it can't be read (no `/proc`, e.g. macOS) it is `null`, and liveness falls back to a bare PID-alive check.
+`sleeper` is `null` except on a sleeper's row, where it is `asleep`, `awake` or `sleeping`. For a
+**local** sleeper it is overwritten from the sleeper record on every read, so what is on disk is
+only what the last writer saw. The record decides.
+
+**A local sleeper is present while its record exists, whatever its `pid`.** An asleep sleeper has
+no process; its row carries `pid` 0, which is never alive (`kill(0, 0)` would signal our own
+process group, so pid 0 is special-cased rather than probed), and `pid_start` -1, which no process
+has, so an older spanreed reads the row as stale rather than live. `list_agents` lists it,
+`prune_stale` never removes it, a display name resolves to it, and `register_agent(...,
+refuse_live_holder=True)` treats its id as held. If its row is missing (an older binary pruned it),
+`list_agents` builds one from the record without writing it back.
+
+**Liveness / staleness.** Apart from a local sleeper (above), an agent is *present* iff its `pid` is alive **and** that PID's start-time still matches the `pid_start` captured at registration. Stale entries (PID dead, or PID recycled onto an unrelated process so the start-time no longer matches) get filtered on read and pruned by `prune_stale`. `pid_start` is the process start-time (Linux: clock ticks since boot, from `/proc/<pid>/stat` field 22); it's the guard against PID reuse. When it can't be read (no `/proc`, e.g. macOS) it is `null`, and liveness falls back to a bare PID-alive check.
 
 There is **no `last_seen` TTL**: agents do not heartbeat on a timer (wasteful wakeups), so a live-but-quiet agent is never flagged stale. `last_seen` is retained as informational metadata (when the agent last registered/renewed), not as a liveness signal.
 
@@ -346,6 +366,9 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed activity-log [on\|off]` | Enable/disable bus-wide activity logging, or show the setting |
 | `spanreed log [--since AGE] [--agent ID\|NAME]` | Dump the activity log as JSON lines |
 | `spanreed codex --name N --cwd DIR [--model M] [--effort E] [--mode MODE] [--instructions TEXT]` | Run a Codex worker: a headless bus agent that turns inbound mail into `codex` turns. `--cwd` is required and has no default. |
+| `spanreed sleeper create --name N --cwd DIR --permission-mode MODE [--idle-timeout T]` | Record a sleeper. It starts asleep and nothing is launched. Resolves `claude` and `spanreed` on the caller's PATH, for every later launch. Refuses a name held by a present agent's id or display name, or by an existing sleeper |
+| `spanreed sleeper list [--json]` | Every sleeper's record: state (`ASLEEP`, `AWAKE`, `SLEEPING`, with `(runner dead)` when its runner is gone), settings, last wake failure, skipped lines |
+| `spanreed sleeper retire N` | Delete an asleep sleeper's record and row. Its inbox is kept |
 | `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
 
 ## Cross-host bridge wire-format
@@ -376,9 +399,14 @@ For each live agent on the peer, the bridge writes a registry entry on the local
   "pid": <bridge's own pid>,
   "pid_start": <bridge's own start-time>,
   "focus": "...",
-  "status": "..."
+  "status": "...",
+  "sleeper": "asleep"
 }
 ```
+
+`sleeper` is carried through as the peer advertised it. A peer advertises its asleep sleepers
+along with its live agents, since mail is what wakes them. A mirrored sleeper is present exactly
+while the bridge is, like any mirrored row: this host has no record for it.
 
 Both self-set presence fields are carried through: `focus` and `status` are mirrored from the peer's entry as-is, so a remote agent's `needs_input`/`blocked` is visible to a local `list_agents` scan. They inherit the same bounded staleness as everything else in the snapshot — a change on the peer (including the `status` reset on re-registration) reaches the mirror on the next registry sync.
 

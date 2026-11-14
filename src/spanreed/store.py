@@ -6,6 +6,7 @@ State lives under ``~/.claude/spanreed/`` by default:
 - ``inboxes/<id>.jsonl`` — per-agent append-only message log.
 - ``cursors/<id>``       — per-session "last-seen msg_id" markers.
 - ``peers/<host>.json``  — one record per cross-host bridge (see :class:`PeerLink`).
+- ``sleepers/<name>.json`` — one record per sleeper (see :mod:`spanreed.sleepers`).
 
 Concurrency model: all registry mutations take an exclusive ``fcntl`` lock on
 ``registry.lock``. Inbox appends are single small JSON lines; POSIX guarantees
@@ -37,6 +38,13 @@ from spanreed.protocol import (
     Status,
     validate_agent_id,
 )
+from spanreed.sleepers import (
+    InboxPosition,
+    SleeperDir,
+    SleeperError,
+    SleeperRecord,
+    sleeper_agent_id,
+)
 
 
 class _RegistryDoc(BaseModel):
@@ -62,6 +70,10 @@ def _new_id(prefix: str) -> str:
 
 def _is_pid_alive(pid: int) -> bool:
     """True iff a process with the given PID currently exists."""
+    if pid <= 0:
+        # kill(0, 0) signals our own process group and kill(-n, 0) a group, so
+        # both "succeed". A sleeper's row carries pid 0 while it has no process.
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -116,6 +128,20 @@ def is_stale(agent: Agent) -> bool:
     if agent.pid_start is None:
         return False
     return pid_start_time(agent.pid) != agent.pid_start
+
+
+SLEEPER_ROW_PID_START = -1
+"""``pid_start`` of a sleeper row that has no process: no process has it."""
+
+
+def runner_is_alive(record: SleeperRecord) -> bool:
+    """Whether the runner ``record`` names is still running. The same test as
+    :func:`is_stale`: pid alive, and its start time unchanged when known."""
+    if record.runner_pid is None or not _is_pid_alive(record.runner_pid):
+        return False
+    if record.runner_pid_start is None:
+        return True
+    return pid_start_time(record.runner_pid) == record.runner_pid_start
 
 
 def format_age(ts: datetime | None, *, now: datetime | None = None) -> str:
@@ -177,7 +203,12 @@ class AgentIdHeld(RuntimeError):
     """``register_agent(refuse_live_holder=True)`` found a live row it would take over."""
 
     def __init__(self, holder: Agent) -> None:
-        super().__init__(f"{holder.agent_id} is held by live pid {holder.pid}")
+        held_by = (
+            f"sleeper {holder.name} ({holder.sleeper})"
+            if holder.sleeper is not None
+            else f"live pid {holder.pid}"
+        )
+        super().__init__(f"{holder.agent_id} is held by {held_by}")
         self.holder = holder
 
 
@@ -193,6 +224,7 @@ class StateStore:
         private_dir(self._inboxes_dir)
         private_dir(self._cursors_dir)
         private_dir(self._peers_dir)
+        self.sleepers = SleeperDir(self.root / "sleepers")
         self._registry_path = self.root / "registry.json"
         self._registry_lock_path = self.root / "registry.lock"
         self._config_path = self.root / "config.json"
@@ -263,6 +295,9 @@ class StateStore:
             pid_start=pid_start_time(pid),
             last_seen=datetime.now(UTC),
         )
+        if refuse_live_holder and (record := self._sleeper_for(new_entry.agent_id)):
+            # A sleeper holds its id while asleep, with no process to be live.
+            raise AgentIdHeld(self._sleeper_row(record, None))
         with self._registry_lock():
             agents = self._read_registry_unlocked()
             for i, existing in enumerate(agents):
@@ -346,18 +381,78 @@ class StateStore:
                 self._write_registry_unlocked(kept)
 
     def list_agents(self, *, include_stale: bool = False) -> list[Agent]:
-        """Return registered agents. By default filters out stale entries."""
+        """Return registered agents. By default filters out ones not present.
+
+        Every local sleeper is in the result, its ``sleeper`` field taken from
+        its record. A sleeper whose row is missing (an older binary pruned it)
+        gets a row built from the record, so it stays addressable. That row is
+        not written back; the registry on disk is left as it was.
+        """
         with self._registry_lock():
             agents = self._read_registry_unlocked()
+        records = {r.agent_id: r for r in self.sleepers.records()}
+        agents = [
+            self._sleeper_row(records[a.agent_id], a) if a.agent_id in records else a
+            for a in agents
+        ]
+        seen = {a.agent_id for a in agents}
+        agents += [self._sleeper_row(r, None) for r in records.values() if r.agent_id not in seen]
         if include_stale:
             return agents
-        return [a for a in agents if not is_stale(a)]
+        return [a for a in agents if self.is_present(a, set(records))]
+
+    def is_present(self, agent: Agent, sleeper_ids: set[str] | None = None) -> bool:
+        """Whether ``agent`` is on the bus. The one liveness test; :func:`is_stale`
+        alone is wrong for a sleeper.
+
+        A local sleeper is present for as long as its record exists, asleep or
+        not: its record decides, not its pid. Every other row, including a
+        mirrored sleeper from a peer, is present while its pid is live.
+        ``sleeper_ids`` saves a directory listing when checking many rows.
+        """
+        if sleeper_ids is None:
+            sleeper_ids = self.sleeper_ids()
+        return agent.agent_id in sleeper_ids or not is_stale(agent)
+
+    def sleeper_ids(self) -> set[str]:
+        return {sleeper_agent_id(n) for n in self.sleepers.names()}
+
+    def _sleeper_for(self, agent_id: str) -> SleeperRecord | None:
+        """The local sleeper record behind ``agent_id``, if it is one."""
+        if not agent_id.startswith("agent-") or "@" in agent_id:
+            return None
+        return self.sleepers.read(agent_id.removeprefix("agent-"))
+
+    @staticmethod
+    def _sleeper_row(record: SleeperRecord, row: Agent | None) -> Agent:
+        """``row`` with its ``sleeper`` state from ``record``, or a row built from it."""
+        if row is not None:
+            return row.model_copy(update={"sleeper": record.state})
+        return Agent(
+            agent_id=record.agent_id,
+            name=record.name,
+            working_dir=record.cwd,
+            pid=0,
+            # Never a real start time. An older spanreed reads pid 0 as alive
+            # (kill(0, 0) signals its own process group) and, with pid_start
+            # null, would trust that: it would list an asleep sleeper as LIVE
+            # and tell senders "Delivered". A start time that cannot match
+            # makes it read the row as stale instead, which is the truth to
+            # a binary that cannot wake it.
+            pid_start=SLEEPER_ROW_PID_START,
+            last_seen=record.created_at,
+            sleeper=record.state,
+        )
 
     def prune_stale(self) -> int:
-        """Permanently remove stale agents from the registry. Returns count removed."""
+        """Permanently remove stale agents from the registry. Returns count removed.
+
+        Never removes a local sleeper's row: it is present while its record is.
+        """
+        sleeper_ids = self.sleeper_ids()
         with self._registry_lock():
             agents = self._read_registry_unlocked()
-            live = [a for a in agents if not is_stale(a)]
+            live = [a for a in agents if self.is_present(a, sleeper_ids)]
             removed = len(agents) - len(live)
             if removed:
                 self._write_registry_unlocked(live)
@@ -395,6 +490,7 @@ class StateStore:
                 last_seen=now,
                 focus=a.focus,
                 status=a.status,
+                sleeper=a.sleeper,
             )
             for a in remote_agents
         ]
@@ -493,7 +589,8 @@ class StateStore:
         if any(a.agent_id == to_agent for a in agents):
             return to_agent
         by_name = [a for a in agents if a.name == to_agent]
-        live_by_name = [a for a in by_name if not is_stale(a)]
+        sleeper_ids = self.sleeper_ids()
+        live_by_name = [a for a in by_name if self.is_present(a, sleeper_ids)]
         if len(live_by_name) == 1:
             return live_by_name[0].agent_id
         if len(live_by_name) > 1:
@@ -645,6 +742,9 @@ class StateStore:
                 f"agent and no bridge attached to it. Nothing will ever read it unless an "
                 f"agent registers under exactly that id."
             )
+        record = self._sleeper_for(agent_id)
+        if record is not None:
+            return self._sleeper_verdict(record)
         _, _, host = agent_id.rpartition("@")
         if "@" in agent_id:
             link = self.read_peer_link(host) if _HOST_FILENAME_RE.fullmatch(host) else None
@@ -681,6 +781,123 @@ class StateStore:
             f"(pid {entry.pid}) and whose inbox monitor is tailing "
             f"inboxes/{agent_id}.jsonl."
         )
+
+    @staticmethod
+    def _sleeper_verdict(record: SleeperRecord) -> tuple[bool, str]:
+        """:meth:`delivery_verdict` for a local sleeper, from its record."""
+        who = f"{record.agent_id} ({record.name}) is a sleeper"
+        if record.state == "asleep":
+            return False, (
+                f"QUEUED, NOT DELIVERED: {who} and is ASLEEP, so no session is running "
+                f"for it. The message waits in inboxes/{record.agent_id}.jsonl. Waking a "
+                f"sleeper when mail arrives is not built yet, so nothing will start it "
+                f"for this message: treat it as queued and do not wait for a reply."
+            )
+        if not runner_is_alive(record):
+            return False, (
+                f"QUEUED, NOT DELIVERED: {who} whose record says {record.state.upper()}, "
+                f"but its runner (pid {record.runner_pid}) is gone: a crash, a reboot, or "
+                f"its tmux server ending. The message waits in "
+                f"inboxes/{record.agent_id}.jsonl until the sleeper is woken again. Treat "
+                f"it as queued and do not wait for a reply."
+            )
+        if record.state == "sleeping":
+            return False, (
+                f"QUEUED, NOT DELIVERED YET: {who} and is GOING TO SLEEP (runner pid "
+                f"{record.runner_pid}, tmux session {record.tmux_session}). Once Claude "
+                f"has exited, the runner checks the inbox against the transcript and "
+                f"relaunches it if anything is unread, this message included."
+            )
+        return True, (
+            f"Delivered to {who} and is AWAKE (runner pid {record.runner_pid}, tmux "
+            f"session {record.tmux_session}); its inbox monitor is reading "
+            f"inboxes/{record.agent_id}.jsonl."
+        )
+
+    # ------------------------------------------------------------------ sleepers
+
+    def create_sleeper(self, record: SleeperRecord) -> SleeperRecord:
+        """Record a new, asleep sleeper and give it a registry row.
+
+        Refuses (:class:`SleeperError`) a name that already has a record, or
+        whose id or display name a present agent holds: the same rule as #80,
+        since two holders of a name split its mail. ``read_through`` is set to
+        the end of the inbox, so a sleeper re-created under a retired one's name
+        (``retire`` keeps the inbox) does not replay that history.
+
+        The record is written before the row. A crash between the two leaves a
+        record without a row, which :meth:`list_agents` covers.
+        """
+        with self.sleepers.lock(record.name):
+            if self.sleepers.read(record.name) is not None:
+                raise SleeperError(
+                    f"a sleeper named {record.name!r} already exists; `spanreed sleeper "
+                    f"list` shows it, and `spanreed sleeper retire {record.name}` removes it"
+                )
+            for agent in self.list_agents():
+                if agent.agent_id == record.agent_id or agent.name == record.name:
+                    raise SleeperError(
+                        f"{record.name!r} is held by a running agent: {agent.agent_id} "
+                        f"({agent.name}, pid {agent.pid}). A sleeper sharing its id or "
+                        f"display name would split its mail. Pick another name, or stop "
+                        f"that agent first."
+                    )
+            record = record.model_copy(update={"read_through": self._inbox_end(record.agent_id)})
+            self.sleepers.write(record)
+            row = self._sleeper_row(record, None)
+            with self._registry_lock():
+                rows = self._read_registry_unlocked()
+                # Again under the registry lock: a holder that registered since
+                # the check above (a Codex worker on the same name) must not be
+                # silently replaced. Its row is live, so this one is refused.
+                taken = next(
+                    (a for a in rows if a.agent_id == record.agent_id and not is_stale(a)), None
+                )
+                if taken is not None:
+                    self.sleepers.delete(record.name)
+                    raise SleeperError(
+                        f"{record.name!r} was taken by {taken.agent_id} (pid {taken.pid}) "
+                        f"while the sleeper was being created; nothing was created"
+                    )
+                agents = [a for a in rows if a.agent_id != record.agent_id]
+                self._write_registry_unlocked([*agents, row])
+        return record
+
+    def retire_sleeper(self, name: str) -> SleeperRecord:
+        """Delete sleeper ``name``'s record and registry row. Its inbox is kept.
+
+        Only an asleep sleeper can be retired: ending an awake one needs the
+        runner, which is not built yet. The record goes first, so a crash
+        between the two leaves only a pid-0 row, which is stale and pruned.
+        """
+        with self.sleepers.lock(name):
+            record = self.sleepers.read(name)
+            if record is None:
+                raise SleeperError(f"there is no sleeper named {name!r}")
+            if record.state != "asleep":
+                raise SleeperError(
+                    f"sleeper {name!r} is {record.state} (runner pid {record.runner_pid}, "
+                    f"tmux session {record.tmux_session}); only an asleep sleeper can be "
+                    f"retired yet"
+                )
+            self.sleepers.delete(name)
+            self.deregister_agent(record.agent_id)
+        return record
+
+    def _inbox_end(self, agent_id: str) -> InboxPosition:
+        """The position after the last line of ``agent_id``'s inbox."""
+        position = InboxPosition()
+        inbox = self._inbox_path(agent_id)
+        if not inbox.exists():
+            return position
+        with inbox.open() as f:
+            for number, line in enumerate(f, start=1):
+                try:
+                    msg_id = json.loads(line).get("msg_id")
+                except (json.JSONDecodeError, AttributeError):
+                    msg_id = None
+                position = InboxPosition(line=number, msg_id=msg_id)
+        return position
 
     def send_message(
         self,

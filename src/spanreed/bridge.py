@@ -43,7 +43,7 @@ from datetime import UTC, datetime, timedelta
 from typing import IO, Literal, cast
 
 from spanreed.protocol import Agent, Message, PeerLink
-from spanreed.store import StateStore, is_stale, pid_start_time
+from spanreed.store import StateStore, pid_start_time
 
 
 def _status(text: str) -> None:
@@ -402,7 +402,10 @@ class Bridge:
         the fork issue #55 had no way to take.
         """
         rows = [a for a in self.store.list_agents(include_stale=True) if "@" not in a.agent_id]
-        live = [a for a in rows if not is_stale(a)]
+        # Asleep sleepers are advertised too, with their `sleeper` state, so a
+        # peer can mail them: the mail is what wakes them.
+        sleeper_ids = self.store.sleeper_ids()
+        live = [a for a in rows if self.store.is_present(a, sleeper_ids)]
         return self._send(
             {
                 "kind": "registry",

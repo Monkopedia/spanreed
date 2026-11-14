@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Generator
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import IO, cast
@@ -24,6 +25,7 @@ import pytest
 
 from spanreed import bridge
 from spanreed.bridge import Bridge, reconnect_loop
+from spanreed.sleepers import SleeperRecord
 from spanreed.store import StateStore
 
 # Aliased once so the private stays private — same pattern as test_cli.py's
@@ -1544,3 +1546,29 @@ def test_a_hello_that_wins_the_race_with_the_handshake_timeout_connects(
     assert store.list_agents(include_stale=True) == []  # torn down normally
     link = store.read_peer_link("hostB")
     assert link is not None and link.detached_at is not None
+
+
+def test_an_asleep_sleeper_is_advertised_and_addressable_from_the_peer(tmp_path: Path) -> None:
+    """A peer must see an asleep sleeper, or nothing remote can send the mail that
+    wakes it. Its pid is 0, so a pid check alone would withhold it."""
+    store_a, store_b, bridge_a, bridge_b = _pair(tmp_path)
+    _register_live(store_a, "agent-alice", "alice")
+    store_b.create_sleeper(
+        SleeperRecord(
+            name="nap",
+            agent_id="agent-nap",
+            cwd="/tmp",
+            session_id="00000000-0000-4000-8000-000000000000",
+            permission_mode="plan",
+            claude_path="/usr/bin/claude",
+            spanreed_path="/usr/bin/spanreed",
+            path_env="/usr/bin",
+            created_at=datetime.now(UTC),
+        )
+    )
+    with _running(bridge_a, bridge_b):
+        _wait(lambda: _synced(store_a, "hostB"))
+        [row] = [a for a in store_a.list_agents() if a.agent_id == "agent-nap@hostB"]
+        assert row.sleeper == "asleep"
+        store_a.send_message(from_agent="agent-alice", to_agent="agent-nap@hostB", body="wake")
+        _wait(lambda: [m.body for m in store_b.recv_messages("agent-nap")] == ["wake"])
