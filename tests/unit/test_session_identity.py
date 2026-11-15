@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
+from spanreed.sleepers import SleeperRecord
 from spanreed.store import StateStore, is_stale
 
 
@@ -104,23 +106,42 @@ class TestFallsBackWhereItShould:
 
         assert session_agent_identity(wd) == (*derive_agent_identity(wd), None)
 
-    # No "0" here, deliberately, and the reason is a defect rather than a
-    # tidy-up. `session_agent_identity` guards with `.isdigit()` alone
-    # (identity.py:89) and has no `> 0` check, so "0" would NOT exercise
-    # validation — it passes the digit test, reaches the registry lookup, finds
-    # nothing, and exits through the already-covered no-match branch. It would
-    # read as guard coverage and be none.
-    #
-    # A case that DID discriminate cannot be written, because the behaviour it
-    # would assert is wrong: a pid-0 entry has pid_start=None, so is_stale() is
-    # False forever, and this function adopts it. Tracked as #50; the guard in
-    # session_pid() is one layer of two.
-    @pytest.mark.parametrize("junk", ["", "not-a-pid", "12x", "-1"])
+    # "0" on its own does not discriminate here — with no pid-0 row it reaches
+    # the lookup, finds nothing and falls through anyway. The sleeper case
+    # below is the one that does. "²" does: it passes `.isdigit()` and `int()`
+    # rejects it, so under the old guard it raised instead of falling back.
+    @pytest.mark.parametrize("junk", ["", "not-a-pid", "12x", "-1", "0", "²"])
     def test_unusable_claude_pid_uses_the_directory(
         self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, junk: str
     ) -> None:
         monkeypatch.setenv("CLAUDE_PID", junk)
         wd = tmp_path / "somewhere"
+        wd.mkdir()
+
+        assert session_agent_identity(wd) == (*derive_agent_identity(wd), None)
+
+    def test_claude_pid_zero_does_not_adopt_a_sleeper(
+        self, bus: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#50: an asleep sleeper's row carries pid 0 by design, and it is listed
+        because it has a sleeper record. A session whose anchor is 0 must not
+        match it — that would adopt the sleeper's identity from anywhere."""
+        bus.create_sleeper(
+            SleeperRecord(
+                name="sl",
+                agent_id="agent-sl",
+                cwd="/tmp",
+                session_id="00000000-0000-4000-8000-000000000000",
+                permission_mode="acceptEdits",
+                claude_path="/usr/bin/claude",
+                spanreed_path="/usr/bin/spanreed",
+                path_env="/usr/bin",
+                created_at=datetime.now(UTC),
+            )
+        )
+        assert [(a.agent_id, a.pid) for a in bus.list_agents()] == [("agent-sl", 0)]
+        monkeypatch.setenv("CLAUDE_PID", "0")
+        wd = tmp_path / "elsewhere"
         wd.mkdir()
 
         assert session_agent_identity(wd) == (*derive_agent_identity(wd), None)
@@ -413,7 +434,7 @@ class TestSessionPid:
     # rather than probing a process, so an entry recorded with pid 0 reads live
     # forever — and nothing tested it. A guard whose rationale is written down
     # and whose rationale is untested is the shape this repo keeps finding.
-    @pytest.mark.parametrize("junk", ["0", "", "not-a-pid", "12x", "-1", " 5"])
+    @pytest.mark.parametrize("junk", ["0", "", "not-a-pid", "12x", "-1", " 5", "²"])
     def test_unusable_claude_pid_falls_back(
         self, monkeypatch: pytest.MonkeyPatch, junk: str
     ) -> None:

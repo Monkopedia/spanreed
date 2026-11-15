@@ -88,7 +88,11 @@ def session_agent_identity(
     derived_id, derived_name = derive_agent_identity(working_dir)
 
     claude_pid = os.environ.get("CLAUDE_PID")
-    if not claude_pid or not claude_pid.isdigit():
+    # A non-positive anchor matches nothing. The registry does hold pid-0 rows
+    # on purpose — an asleep sleeper's, which has no process — so "0" reaching
+    # the lookup below would adopt that sleeper's identity. ``isdecimal``, not
+    # ``isdigit``: "²" is a digit that ``int()`` rejects.
+    if not claude_pid or not claude_pid.isdecimal() or int(claude_pid) <= 0:
         return derived_id, derived_name, None
 
     # Imported here, not at module scope: the SessionStart hook and the Monitor
@@ -181,10 +185,10 @@ def session_pid() -> int:
     Reading ``$CLAUDE_PID`` removes the dependency rather than documenting it.
     """
     claude_pid = os.environ.get("CLAUDE_PID")
-    # `> 0` matters: pid 0 passes isdigit(), and `os.kill(0, 0)` signals the whole
+    # `> 0` matters: pid 0 passes isdecimal(), and `os.kill(0, 0)` signals the whole
     # process group rather than probing a process — so an entry recorded with
     # pid 0 reads live forever, which is the fail-open shape this rule exists to
     # prevent. Reject it rather than record an unfalsifiable liveness claim.
-    if claude_pid and claude_pid.isdigit() and int(claude_pid) > 0:
+    if claude_pid and claude_pid.isdecimal() and int(claude_pid) > 0:
         return int(claude_pid)
     return os.getppid()
