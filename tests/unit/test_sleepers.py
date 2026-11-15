@@ -147,6 +147,15 @@ class TestPresence:
         row = Agent(agent_id="x", name="x", working_dir="/", pid=0, last_seen=datetime.now(UTC))
         assert store_module.is_stale(row)
 
+    def test_an_oversized_pid_is_not_alive_and_does_not_break_the_listing(
+        self, store: StateStore
+    ) -> None:
+        """#50: os.kill raises OverflowError past the C pid_t, which escaped
+        list_agents and broke it for every agent, not just the bad row."""
+        assert not store_module._is_pid_alive(10**30)  # pyright: ignore[reportPrivateUsage]
+        store.register_agent(name="big", working_dir="/", pid=10**30, agent_id="agent-big")
+        assert store.list_agents() == []
+
     def test_an_older_binary_reads_the_asleep_row_as_stale(self, store: StateStore) -> None:
         """Review of #89: main's liveness test, verbatim, on the row as written to disk.
 

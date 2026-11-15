@@ -81,6 +81,10 @@ def _is_pid_alive(pid: int) -> bool:
     except PermissionError:
         # Process exists but owned by another user.
         return True
+    except OverflowError:
+        # Beyond the C pid_t, so no process has it; raising here would break
+        # list_agents for every agent, not just the one bad row.
+        return False
     return True
 
 
