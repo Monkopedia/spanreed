@@ -582,7 +582,9 @@ class TestWaitForReply:
         )
         assert result == reply
 
-    def test_ignores_unrelated_messages(self, store: StateStore, ab_registered: StateStore) -> None:
+    def test_a_non_reply_does_not_satisfy_the_wait(
+        self, store: StateStore, ab_registered: StateStore
+    ) -> None:
         m1 = store.send_message(from_agent="A", to_agent="B", body="ping")
         result_holder: list[object] = []
 
@@ -603,6 +605,38 @@ class TestWaitForReply:
         store.send_message(from_agent="C", to_agent="A", body="unrelated")
         t.join(timeout=1.0)
         assert result_holder == [None]
+
+    def test_a_reply_to_another_message_does_not_satisfy_the_wait(
+        self, store: StateStore, ab_registered: StateStore
+    ) -> None:
+        """Two outstanding requests share one inbox; each wait must see only its own reply."""
+        m1 = store.send_message(from_agent="A", to_agent="B", body="first")
+        m2 = store.send_message(from_agent="A", to_agent="B", body="second")
+        store.send_message(from_agent="B", to_agent="A", body="re: second", in_reply_to=m2.msg_id)
+        result = store.wait_for_reply(
+            agent_id="A",
+            in_reply_to=m1.msg_id,
+            timeout_s=0.2,
+            poll_interval_s=0.05,
+        )
+        assert result is None
+
+    def test_returns_the_matching_reply_past_another_threads_reply(
+        self, store: StateStore, ab_registered: StateStore
+    ) -> None:
+        m1 = store.send_message(from_agent="A", to_agent="B", body="first")
+        m2 = store.send_message(from_agent="A", to_agent="B", body="second")
+        store.send_message(from_agent="B", to_agent="A", body="re: second", in_reply_to=m2.msg_id)
+        reply = store.send_message(
+            from_agent="B", to_agent="A", body="re: first", in_reply_to=m1.msg_id
+        )
+        result = store.wait_for_reply(
+            agent_id="A",
+            in_reply_to=m1.msg_id,
+            timeout_s=0.2,
+            poll_interval_s=0.05,
+        )
+        assert result == reply
 
 
 # ----------------------------------------------------------- recipient validation
