@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.4.0
+
+**Upgrading:** update **both** the package and the plugin, and on every host. The plugin now
+carries the turn hooks sleepers depend on. With an older plugin a sleeper wakes but never goes
+back to sleep by itself; it says so with `needs_input`. Every host should run 0.4.0: an older
+spanreed on the same machine can drop a sleeper's registry row (the sleeper record restores it),
+and it reads an asleep sleeper as stopped. Ordinary sessions see one new MCP tool,
+`request_sleep`, and three new hooks that start no Python outside a sleeper.
+
+### Sleepers: agents that sleep when idle and wake on mail
+
+A **sleeper** is a Claude Code session spanreed runs in tmux. When it has been idle for its
+timeout, or asks to with the new `request_sleep` tool, its Claude exits and frees its memory.
+It stays on the bus by name, and the next message to it **resumes the same conversation** and
+delivers the mail there. Sleepers survive a reboot. (#85; design #84; built in #89, #90, #91, #93)
+
+```bash
+spanreed sleeper create --name helper --cwd ~/some/project \
+    --permission-mode acceptEdits --model claude-opus-5-5 --idle-timeout 15m --trust
+spanreed sleeper list | attach | wake | sleep | retire
+```
+
+- **Mail is never lost silently.** Whether Claude received a message is read from the
+  session's own transcript, so mail it already has isn't sent again. The exceptions are a message it only
+  partly saw, one cut by a compaction, or any message when the transcript can't be read:
+  those are delivered again rather than risked. Mail that arrives while the agent is going
+  to sleep is delivered before it sleeps. A line that still isn't delivered after 3 launches
+  in which Claude ran (a corrupt line, say) is skipped so the rest can be. It is recorded
+  for good, shown in `sleeper list`, and the sleeper is flagged `needs_input`.
+- **Background work keeps it awake.** A shell or subagent it left running blocks the idle
+  timeout. `request_sleep` (or `spanreed sleeper sleep`) stops that work and sleeps.
+- **A failed wake is never silent.** An expired login, a rate limit, a missing `tmux`, or a
+  Claude that exits at once leaves the sleeper asleep. It is flagged `needs_input` on the bus,
+  the reason shows in `sleeper list`, and its mail stays unread for the next wake.
+- **`--permission-mode` is required** and is passed on every launch, as is `--model` when
+  given. `--trust` marks the folder trusted in Claude Code's own state, so the first launch
+  doesn't stop at the "do you trust this folder?" dialog. It refuses your home folder and
+  anything above it.
+- It needs `tmux`. A woken sleeper starts from a clean environment, so it has no ssh agent.
+  Managing sleepers on another host over `conjoin` is not built yet (#86); mail to one does
+  wake it there.
+
+### Fixes
+
+- **A Codex worker refuses a `--name` that a running worker already holds.** Before, two
+  workers on one name both ran every message. (#80)
+- **`conjoin` no longer leaves a peer's agents looking live when nothing is connected.** A
+  registry frame arriving just after a working link dropped (#81), or a peer hello arriving
+  just after `--handshake-timeout` on a connect that never came up (#83, #92), used to
+  mirror the peer's agents anyway.
+- **A `CLAUDE_PID` of 0 or garbage no longer adopts another agent's identity**, including an
+  asleep sleeper's. A registry row with an impossibly large pid no longer breaks
+  `spanreed list`. (#50, #94)
+- **Codex v2 exec approvals are logged under the method actually received**, not the v1 name.
+  (#67, #96)
+
 ## 0.3.2
 
 **Upgrading:** both machines in a `conjoin` pair should be on 0.3.2 before you pass `--timeout`
