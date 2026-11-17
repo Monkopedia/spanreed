@@ -54,35 +54,71 @@ class SleeperError(RuntimeError):
     """A sleeper command refused, with the reason a human should read."""
 
 
-RESERVED_CLAUDE_ARGS = (
-    "--session-id",
-    "--resume",
-    "-r",
-    "--continue",
-    "-c",
-    "--fork-session",
-    "--print",
-    "-p",
-    "--permission-mode",
-    "--dangerously-skip-permissions",
-    "--model",
-)
-"""``claude`` flags spanreed sets on every launch, or that would break a sleeper:
-which conversation it is, that it is interactive, and its kept permission mode
-and model. Refused in ``claude_args``; a second copy would fight spanreed's."""
+ALLOWED_CLAUDE_ARGS: dict[str, str] = {
+    "--mcp-config": "values",
+    "--strict-mcp-config": "flag",
+    "--append-system-prompt": "value",
+    "--append-system-prompt-file": "value",
+    "--system-prompt": "value",
+    "--disallowed-tools": "values",
+    "--disallowedTools": "values",
+    "--effort": "value",
+    "--fallback-model": "value",
+    "--verbose": "flag",
+    "--debug-file": "value",
+    "--name": "value",
+    "-n": "value",
+}
+"""The ``claude`` flags a sleeper may be given after ``--``, and what each takes:
+``flag`` (nothing), ``value`` (exactly one), ``values`` (one or more, up to the
+next flag).
+
+An **allowlist**, by the owner's decision (2026-11-17): the use case is a
+sleeper's own MCP servers and prompt text, and nothing here can widen what the
+sleeper may do beyond the permission mode fixed at create (#85 decision 2).
+Flags that could (``--allowedTools``, ``--add-dir``, ``--settings``,
+``--allow-dangerously-skip-permissions``, ``--permission-prompt-tool``,
+``--agent``/``--agents``, ``--plugin-dir``, ...) are refused, as are those
+spanreed sets itself and a bare positional (which ``claude`` reads as a first
+prompt). A flag Claude Code adds later is refused until it is added here
+deliberately; a denylist would let it through."""
 
 
 def check_claude_args(args: list[str]) -> list[str]:
-    """``args`` if none is reserved, else raise :class:`SleeperError` naming it."""
-    for arg in args:
-        flag = arg.split("=", 1)[0]
-        if flag in RESERVED_CLAUDE_ARGS:
-            raise SleeperError(
-                f"{arg!r} is set by spanreed on every launch (or would stop the sleeper "
-                f"being an interactive, resumable session), so it can't be passed after "
-                f"`--`. Use spanreed's own option instead where there is one "
-                f"(--permission-mode, --model)."
+    """``args`` if every flag is allowed and takes the values it is given, else
+    raise :class:`SleeperError` saying why."""
+    allowed = ", ".join(sorted(ALLOWED_CLAUDE_ARGS))
+    i = 0
+    while i < len(args):
+        token = args[i]
+        flag, has_inline, _ = token.partition("=")
+        kind = ALLOWED_CLAUDE_ARGS.get(flag) if token.startswith("-") else None
+        if kind is None:
+            what = (
+                f"{token!r} is not a flag; claude would take it as a first prompt"
+                if not token.startswith("-")
+                else f"{flag!r} is not one of the claude flags a sleeper accepts"
             )
+            raise SleeperError(
+                f"{what}. Allowed after `--`: {allowed}. The list is deliberately short: "
+                f"nothing on it can widen the sleeper's permissions beyond "
+                f"--permission-mode, or change which conversation it resumes."
+            )
+        i += 1
+        if has_inline:
+            if kind == "flag":
+                raise SleeperError(f"{flag!r} takes no value")
+            continue
+        if kind == "value":
+            if i >= len(args):
+                raise SleeperError(f"{flag!r} needs a value")
+            i += 1
+        elif kind == "values":
+            start = i
+            while i < len(args) and not args[i].startswith("-"):
+                i += 1
+            if i == start:
+                raise SleeperError(f"{flag!r} needs at least one value")
     return args
 
 

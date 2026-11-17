@@ -354,38 +354,79 @@ def test_records_survive_a_new_store_instance(state_root: Path) -> None:
 
 
 class TestClaudeArgs:
-    def test_ordinary_flags_pass(self) -> None:
-        args = ["--mcp-config", "/x.json", "--append-system-prompt-file", "/p.md", "--verbose"]
+    """An allowlist (owner's decision, 2026-11-17): a sleeper's own MCP servers and
+    prompt text, and nothing that widens its permissions past --permission-mode."""
+
+    def test_the_owners_use_case_passes(self) -> None:
+        args = [
+            "--mcp-config",
+            "/a.json",
+            "/b.json",
+            "--strict-mcp-config",
+            "--append-system-prompt-file",
+            "/p.md",
+            "--append-system-prompt",
+            "never use -p",
+            "--disallowed-tools",
+            "Bash",
+            "WebFetch",
+            "--effort=high",
+            "--verbose",
+        ]
         assert check_claude_args(args) == args
 
     @pytest.mark.parametrize(
-        "arg",
+        "args",
         [
-            "--session-id",
-            "--resume",
-            "-r",
-            "--continue",
-            "-c",
-            "--fork-session",
-            "--print",
-            "-p",
-            "--permission-mode",
-            "--permission-mode=plan",
-            "--dangerously-skip-permissions",
-            "--model",
-            "--model=opus",
+            # Widen permissions past the mode fixed at create (review of #100).
+            ["--allow-dangerously-skip-permissions"],
+            ["--allowedTools", "Bash"],
+            ["--allowed-tools", "Bash(*)"],
+            ["--settings", "/x.json"],
+            ["--permission-prompts", "none"],
+            ["--permission-prompt-tool", "t"],
+            ["--add-dir", "/"],
+            ["--agent", "a"],
+            ["--agents", "{}"],
+            ["--plugin-dir", "/p"],
+            # Spanreed's own, or would stop it being an interactive, resumable session.
+            ["--session-id", "x"],
+            ["--resume", "x"],
+            ["-r", "x"],
+            ["--continue"],
+            ["-c"],
+            ["--fork-session"],
+            ["--print"],
+            ["-p"],
+            ["-pc"],
+            ["--permission-mode", "plan"],
+            ["--permission-mode=plan"],
+            ["--dangerously-skip-permissions"],
+            ["--model", "opus"],
+            ["--model=opus"],
+            # A bare word is a first prompt to claude.
+            ["hello"],
+            ["--verbose", "hello"],
+            # Something Claude Code adds tomorrow.
+            ["--some-future-flag"],
         ],
     )
-    def test_flags_spanreed_sets_are_refused(self, arg: str) -> None:
-        with pytest.raises(SleeperError, match="set by spanreed"):
-            check_claude_args(["--verbose", arg])
+    def test_anything_else_is_refused(self, args: list[str]) -> None:
+        with pytest.raises(SleeperError, match=r"not one of the claude flags|first prompt"):
+            check_claude_args(args)
 
-    def test_a_reserved_word_as_a_value_is_not_mistaken_for_a_flag(self) -> None:
-        """Only an argument that IS a reserved flag is refused; a value naming one is fine."""
-        assert check_claude_args(["--append-system-prompt", "never use -p"]) == [
-            "--append-system-prompt",
-            "never use -p",
-        ]
+    @pytest.mark.parametrize(
+        ("args", "why"),
+        [
+            (["--verbose=yes"], "takes no value"),
+            (["--effort"], "needs a value"),
+            (["--mcp-config"], "needs at least one value"),
+            (["--mcp-config", "--verbose"], "needs at least one value"),
+        ],
+    )
+    def test_values_must_match_the_flag(self, args: list[str], why: str) -> None:
+        with pytest.raises(SleeperError, match=why):
+            check_claude_args(args)
 
     def test_an_older_record_without_the_field_reads_as_none(self, store: StateStore) -> None:
         store.create_sleeper(_record())

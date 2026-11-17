@@ -1279,7 +1279,7 @@ class TestSleeperCommands:
             "other",
         ]
         assert cli.main(argv) == 1
-        assert "set by spanreed" in capsys.readouterr().err
+        assert "not one of the claude flags" in capsys.readouterr().err
         assert StateStore().sleepers.read("nap") is None
 
     def test_create_refuses_a_name_that_is_not_a_legal_id(
