@@ -357,8 +357,10 @@ Two rules follow, and they are not negotiable in the way the table above is:
    would have scoped every worker to the entire home directory.
 2. **Approvals are logged, both outcomes,** to `~/.claude/spanreed/codex/<name>.log` (under
    `$SPANREED_STATE_ROOT` when set — it is bus state, so it lives with the rest of it). Every
-   `execCommandApproval` and `applyPatchApproval`, the command or path, and whether it was approved
-   or declined for being outside `--cwd`. Per rule 7, verbose and legible: the owner wants to *see*
+   command and file-change approval (`execCommandApproval` / `item/commandExecution/requestApproval`,
+   `applyPatchApproval` / `item/fileChange/requestApproval`), under the method name actually
+   received, the command or path, and whether it was approved or declined for being outside
+   `--cwd`. Per rule 7, verbose and legible: the owner wants to *see*
    what a Codex agent did on their behalf, and an auto-approved command that appears nowhere is the
    one that cannot be reviewed. The same file carries startup config, every turn, every non-delta
    notification, and the auth refreshes — **never a credential**. A worker whose log **cannot be

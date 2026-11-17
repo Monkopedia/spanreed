@@ -230,7 +230,7 @@ def decide(root: Path, method: str, params: object) -> Decision:
     if not root.is_absolute():
         raise ValueError(f"root must be absolute; got {root!r}")
     if method in (EXEC_COMMAND_APPROVAL, EXEC_COMMAND_APPROVAL_V2):
-        return _decide_exec(root, params)
+        return _decide_exec(root, params, method)
     if method in (APPLY_PATCH_APPROVAL, APPLY_PATCH_APPROVAL_V2):
         return _decide_patch(root, params, method)
     if method == ELICITATION_REQUEST:
@@ -261,8 +261,8 @@ def decide(root: Path, method: str, params: object) -> Decision:
     )
 
 
-def _decide_exec(root: Path, params: object) -> Decision:
-    """``execCommandApproval``: check the cwd, log the command, claim nothing more.
+def _decide_exec(root: Path, params: object, method: str) -> Decision:
+    """A command approval (v1 or v2): check the cwd, log the command, claim nothing more.
 
     The cwd is the only checkable thing here. The command's effects are not
     bounded by this decision at all — see the module docstring — so the reason
@@ -270,7 +270,7 @@ def _decide_exec(root: Path, params: object) -> Decision:
     """
     fields = _as_mapping(params)
     if fields is None:
-        return _malformed(EXEC_COMMAND_APPROVAL)
+        return _malformed(method)
     command = _render_command(fields.get("command"))
     if command is None:
         # Approving a command we cannot render is approving something that
@@ -278,7 +278,7 @@ def _decide_exec(root: Path, params: object) -> Decision:
         # rule exists to prevent.
         return Decision(
             approved=False,
-            method=EXEC_COMMAND_APPROVAL,
+            method=method,
             subject="(no command in params)",
             reason="params carried no readable command, so an approval could not be logged legibly",
         )
@@ -286,21 +286,21 @@ def _decide_exec(root: Path, params: object) -> Decision:
     if not isinstance(cwd, str) or not cwd.strip():
         return Decision(
             approved=False,
-            method=EXEC_COMMAND_APPROVAL,
+            method=method,
             subject=command,
             reason="params carried no cwd, so containment in --cwd could not be checked",
         )
     if not contains(root, Path(cwd)):
         return Decision(
             approved=False,
-            method=EXEC_COMMAND_APPROVAL,
+            method=method,
             subject=command,
             reason=f"cwd {cwd} is outside --cwd {root}",
             paths=(cwd,),
         )
     return Decision(
         approved=True,
-        method=EXEC_COMMAND_APPROVAL,
+        method=method,
         subject=command,
         reason=f"cwd {cwd} is inside --cwd {root}; the command's effects are bounded by Codex's sandboxPolicy, not by this check",
         paths=(cwd,),
