@@ -122,6 +122,44 @@ class TestRegistry:
 # ----------------------------------------------------------------- focus
 
 
+class TestPidOneIsUnknown:
+    """Pid 1 is init/launchd: it never dies and its start time never changes, so a
+    row a reparented ``getppid()`` fallback wrote with it read live forever."""
+
+    def test_pid_one_with_no_start_time_is_stale_and_unlisted(
+        self, store: StateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The macOS shape: no /proc, so ``pid_start`` is None and only kill(1, 0) is asked."""
+
+        def no_proc(_pid: int) -> int | None:
+            return None
+
+        with monkeypatch.context() as m:
+            m.setattr(store_module, "pid_start_time", no_proc)
+            row = store.register_agent(name="orphan", working_dir="/", pid=1)
+        assert (row.pid, row.pid_start) == (1, None)
+        assert store_module.is_stale(row)
+        assert store.list_agents() == []
+
+    def test_pid_one_with_its_real_start_time_is_stale_and_unlisted(
+        self, store: StateStore
+    ) -> None:
+        """The Linux shape: init's start time is captured and matches forever."""
+        start = store_module.pid_start_time(1)
+        if start is None:
+            pytest.skip("pid 1's start time is unreadable here (no /proc)")
+        row = store.register_agent(name="orphan", working_dir="/", pid=1)
+        assert (row.pid, row.pid_start) == (1, start)
+        assert store_module.is_stale(row)
+        assert store.list_agents() == []
+
+    def test_every_liveness_reader_treats_pid_one_as_dead(self) -> None:
+        start = store_module.pid_start_time(1)
+        assert not store_module.process_is_alive(1, None)
+        assert not store_module.process_is_alive(1, start)
+        assert not peer_link_is_attached(_peer_link("adolin", bridge_pid=1, bridge_pid_start=None))
+
+
 class TestFocus:
     def test_set_focus_returns_updated_agent(self, store: StateStore) -> None:
         agent = store.register_agent(

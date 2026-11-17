@@ -69,8 +69,16 @@ def _new_id(prefix: str) -> str:
 
 
 def _is_pid_alive(pid: int) -> bool:
-    """True iff a process with the given PID currently exists."""
-    if pid <= 0:
+    """True iff a process with the given PID currently exists.
+
+    Pid 1 is treated as unknown, so never alive. It is init (Linux) or launchd
+    (macOS): it never exits and its start time never changes, so a row that
+    recorded it would read live forever, ``pid_start`` or not. Such rows come
+    from a ``getppid()`` fallback whose parent had already exited, so the
+    process was reparented to pid 1. The cost is that a Claude running as pid 1
+    (in a container) reads as stale; ``docs/protocol.md`` records that.
+    """
+    if pid <= 1:
         # kill(0, 0) signals our own process group and kill(-n, 0) a group, so
         # both "succeed". A sleeper's row carries pid 0 while it has no process.
         return False
