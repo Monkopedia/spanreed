@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import sys
 import time
@@ -45,6 +46,7 @@ from spanreed.sleepers import (
     InboxPosition,
     SleeperError,
     SleeperRecord,
+    check_claude_args,
     parse_duration,
     sleeper_agent_id,
 )
@@ -900,6 +902,7 @@ def _sleeper_create(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).expanduser().resolve()
     if not cwd.is_dir():
         raise SleeperError(f"--cwd {args.cwd!r} is not a directory")
+    claude_args = check_claude_args(list(args.claude_args))
     # Resolved now, from the creator's PATH, and used for every launch: a wake
     # may be started by a cron job or a conjoin bridge whose PATH finds neither.
     path_env = os.environ.get("PATH", "")
@@ -924,6 +927,7 @@ def _sleeper_create(args: argparse.Namespace) -> int:
             session_id=str(uuid.uuid4()),
             permission_mode=args.permission_mode,
             model=args.model,
+            claude_args=claude_args,
             idle_timeout_s=idle_timeout_s,
             claude_path=str(resolved["claude"]),
             spanreed_path=str(resolved["spanreed"]),
@@ -937,6 +941,7 @@ def _sleeper_create(args: argparse.Namespace) -> int:
         f"  session id:      {record.session_id}\n"
         f"  permission mode: {record.permission_mode}\n"
         f"  model:           {record.model or '(Claude Code default)'}\n"
+        f"  claude args:     {shlex.join(record.claude_args) or '(none)'}\n"
         f"  idle timeout:    {record.idle_timeout_s}s\n"
         f"  inbox read from: line {record.read_through.line + 1} (earlier mail is history)\n"
         f"It is on the bus now. The first message to it, or `spanreed sleeper wake "
@@ -986,6 +991,8 @@ def _sleeper_list(args: argparse.Namespace) -> int:
         print(f"  cwd:             {r.cwd}")
         print(f"  permission mode: {r.permission_mode}")
         print(f"  model:           {r.model or '(Claude Code default)'}")
+        if r.claude_args:
+            print(f"  claude args:     {shlex.join(r.claude_args)}")
         print(f"  idle timeout:    {r.idle_timeout_s}s")
         print(f"  session id:      {r.session_id}  (generation {r.generation})")
         if r.tmux_session:
@@ -1275,6 +1282,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=PERMISSION_MODES,
         help="Passed on every launch, for the sleeper's whole life",
+    )
+    p_create.add_argument(
+        "claude_args",
+        nargs="*",
+        metavar="-- CLAUDE_ARG",
+        help="Extra arguments for claude, after `--`, passed verbatim on every launch "
+        "(e.g. -- --mcp-config /abs/servers.json --append-system-prompt-file /abs/p.md). "
+        "Relative paths resolve against --cwd. Flags spanreed sets itself are refused.",
     )
     p_create.add_argument(
         "--trust",

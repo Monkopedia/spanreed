@@ -516,6 +516,7 @@ source of truth, and it survives a reboot:
 | `cwd` | the directory Claude runs in |
 | `session_id` | a UUID chosen at create; `--session-id` on the first launch, `--resume` after that |
 | `permission_mode` | fixed at create; passed on every launch |
+| `model`, `claude_args` | fixed at create; `--model` and the extra `claude` arguments given after `--`, passed on every launch after spanreed's own flags |
 | `idle_timeout_s` | default 900 (15 min), set per sleeper |
 | `claude_path`, `spanreed_path`, `path_env` | resolved at create and used for every launch; see "Environment" |
 | `state` | `asleep`, `awake`, or `sleeping` (committed to sleep, Claude being ended) |
@@ -1044,7 +1045,7 @@ part of the first implementation. Mail already wakes a remote sleeper without it
 ### Commands
 
 ```
-spanreed sleeper create --name X --cwd DIR --permission-mode MODE [--model M] [--idle-timeout 15m] [--trust]
+spanreed sleeper create --name X --cwd DIR --permission-mode MODE [--model M] [--idle-timeout 15m] [--trust] [-- CLAUDE_ARGS...]
 spanreed sleeper list
 spanreed sleeper attach X     # tmux attach to the current session-name generation
 spanreed sleeper wake X       # by hand; the same path a message takes
@@ -1070,6 +1071,27 @@ Settled while building stage 1 (the author's calls, listed for the owner to see)
 - **An asleep sleeper's row carries `pid` 0 and `pid_start` -1**, which no
   process has (see "Compatibility").
 - **`retire` refuses an awake or sleeping sleeper** until stage 3 can end one.
+- **Extra `claude` arguments, after `--`, are fixed at create and passed verbatim
+  on every launch**, after spanreed's own: the first `--session-id` launch and
+  each `--resume`. This is the owner's feature request (2026-11-17): a tool
+  managing sleepers gives each its own MCP servers or system-prompt text
+  (`--mcp-config`, `--append-system-prompt-file`) without writing files into the
+  sleeper's directory, which may be someone's git worktree. The workaround it
+  replaces, a wrapper named `claude` first on PATH, left the wrapper's folder on
+  the sleeper's PATH for everything it ran. **Only an allowlist of flags is
+  accepted** (the owner's decision, 2026-11-17, after the review of PR #100
+  showed a denylist let `--allowedTools`, `--add-dir`, `--settings` and
+  `--allow-dangerously-skip-permissions` through): `--mcp-config`,
+  `--strict-mcp-config`, `--append-system-prompt[-file]`, `--system-prompt`,
+  `--disallowed-tools`, `--effort`, `--fallback-model`, `--verbose`,
+  `--debug-file`, `--name`. Nothing on it can widen a sleeper's permissions past
+  the mode fixed at create (decision 2), change which conversation it resumes,
+  or make it non-interactive; a bare word, which `claude` would read as a first
+  prompt, is refused too. A flag Claude Code adds later is refused until it is
+  added deliberately. **Arguments are not rewritten** (the author's call): a
+  relative path resolves against `--cwd`, so absolute paths are the safe
+  choice. They are stored in
+  the record as `claude_args`, shown by `create` and `sleeper list`.
 - **`--model` is fixed at create and passed on every launch**, like the permission
   mode. Without it a sleeper gets the model in Claude Code's settings, which need
   not be the one the owner's own sessions run (they pass `--model`).

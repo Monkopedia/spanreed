@@ -1231,6 +1231,57 @@ class TestSleeperCommands:
             cli.main(["sleeper", "create", "--name", "nap", "--cwd", str(cli_env)])
         assert StateStore().sleepers.read("nap") is None
 
+    def test_create_stores_claude_args_after_the_separator(
+        self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        argv = [
+            "sleeper",
+            "create",
+            "--name",
+            "nap",
+            "--cwd",
+            str(cli_env),
+            "--permission-mode",
+            "plan",
+            "--",
+            "--mcp-config",
+            "/abs/servers.json",
+            "--append-system-prompt-file",
+            "/a b.md",
+        ]
+        assert cli.main(argv) == 0
+        assert "claude args:     --mcp-config /abs/servers.json" in capsys.readouterr().out
+        record = StateStore().sleepers.read("nap")
+        assert record is not None
+        assert record.claude_args == [
+            "--mcp-config",
+            "/abs/servers.json",
+            "--append-system-prompt-file",
+            "/a b.md",
+        ]
+        cli.main(["sleeper", "list"])
+        assert "'/a b.md'" in capsys.readouterr().out, "shown shell-quoted"
+
+    def test_create_refuses_a_reserved_claude_arg(
+        self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        argv = [
+            "sleeper",
+            "create",
+            "--name",
+            "nap",
+            "--cwd",
+            str(cli_env),
+            "--permission-mode",
+            "plan",
+            "--",
+            "--resume",
+            "other",
+        ]
+        assert cli.main(argv) == 1
+        assert "not one of the claude flags" in capsys.readouterr().err
+        assert StateStore().sleepers.read("nap") is None
+
     def test_create_refuses_a_name_that_is_not_a_legal_id(
         self, cli_env: Path, tools_on_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

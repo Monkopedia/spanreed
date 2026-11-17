@@ -17,7 +17,7 @@ import pytest
 
 from spanreed import store as store_module
 from spanreed.protocol import Agent
-from spanreed.sleepers import SleeperError, SleeperRecord, parse_duration
+from spanreed.sleepers import SleeperError, SleeperRecord, check_claude_args, parse_duration
 from spanreed.store import AgentIdHeld, StateStore, runner_is_alive
 
 
@@ -351,3 +351,87 @@ def test_records_survive_a_new_store_instance(state_root: Path) -> None:
     StateStore(root=state_root).create_sleeper(_record())
     [row] = StateStore(root=state_root).list_agents()
     assert row.sleeper == "asleep"
+
+
+class TestClaudeArgs:
+    """An allowlist (owner's decision, 2026-11-17): a sleeper's own MCP servers and
+    prompt text, and nothing that widens its permissions past --permission-mode."""
+
+    def test_the_owners_use_case_passes(self) -> None:
+        args = [
+            "--mcp-config",
+            "/a.json",
+            "/b.json",
+            "--strict-mcp-config",
+            "--append-system-prompt-file",
+            "/p.md",
+            "--append-system-prompt",
+            "never use -p",
+            "--disallowed-tools",
+            "Bash",
+            "WebFetch",
+            "--effort=high",
+            "--verbose",
+        ]
+        assert check_claude_args(args) == args
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            # Widen permissions past the mode fixed at create (review of #100).
+            ["--allow-dangerously-skip-permissions"],
+            ["--allowedTools", "Bash"],
+            ["--allowed-tools", "Bash(*)"],
+            ["--settings", "/x.json"],
+            ["--permission-prompts", "none"],
+            ["--permission-prompt-tool", "t"],
+            ["--add-dir", "/"],
+            ["--agent", "a"],
+            ["--agents", "{}"],
+            ["--plugin-dir", "/p"],
+            # Spanreed's own, or would stop it being an interactive, resumable session.
+            ["--session-id", "x"],
+            ["--resume", "x"],
+            ["-r", "x"],
+            ["--continue"],
+            ["-c"],
+            ["--fork-session"],
+            ["--print"],
+            ["-p"],
+            ["-pc"],
+            ["--permission-mode", "plan"],
+            ["--permission-mode=plan"],
+            ["--dangerously-skip-permissions"],
+            ["--model", "opus"],
+            ["--model=opus"],
+            # A bare word is a first prompt to claude.
+            ["hello"],
+            ["--verbose", "hello"],
+            # Something Claude Code adds tomorrow.
+            ["--some-future-flag"],
+        ],
+    )
+    def test_anything_else_is_refused(self, args: list[str]) -> None:
+        with pytest.raises(SleeperError, match=r"not one of the claude flags|first prompt"):
+            check_claude_args(args)
+
+    @pytest.mark.parametrize(
+        ("args", "why"),
+        [
+            (["--verbose=yes"], "takes no value"),
+            (["--effort"], "needs a value"),
+            (["--mcp-config"], "needs at least one value"),
+            (["--mcp-config", "--verbose"], "needs at least one value"),
+        ],
+    )
+    def test_values_must_match_the_flag(self, args: list[str], why: str) -> None:
+        with pytest.raises(SleeperError, match=why):
+            check_claude_args(args)
+
+    def test_an_older_record_without_the_field_reads_as_none(self, store: StateStore) -> None:
+        store.create_sleeper(_record())
+        raw = json.loads((store.root / "sleepers" / "nap.json").read_text())
+        del raw["claude_args"]
+        (store.root / "sleepers" / "nap.json").write_text(json.dumps(raw))
+        record = store.sleepers.read("nap")
+        assert record is not None and record.claude_args == []
