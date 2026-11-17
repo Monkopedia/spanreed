@@ -231,6 +231,14 @@ class TestLaunchSettings:
             "claude-opus-5-5",
         ]
 
+    def test_extra_claude_args_follow_spanreeds_on_every_launch(self) -> None:
+        extra = ["--mcp-config", "/abs/servers.json", "--append-system-prompt-file", "/a b.md"]
+        record = _record(claude_args=extra)
+        for resume, first in ((False, "--session-id"), (True, "--resume")):
+            argv = sleeper_runner.claude_argv(record, resume=resume)
+            assert argv[1:3] == [first, SID]
+            assert argv[-4:] == extra, "verbatim, last, on the first launch and each resume"
+
     def test_later_launches_resume_and_keep_the_mode(self) -> None:
         argv = sleeper_runner.claude_argv(_record(permission_mode="plan"), resume=True)
         assert argv == ["/usr/bin/claude", "--resume", SID, "--permission-mode", "plan"]

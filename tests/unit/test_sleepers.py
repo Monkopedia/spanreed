@@ -17,7 +17,7 @@ import pytest
 
 from spanreed import store as store_module
 from spanreed.protocol import Agent
-from spanreed.sleepers import SleeperError, SleeperRecord, parse_duration
+from spanreed.sleepers import SleeperError, SleeperRecord, check_claude_args, parse_duration
 from spanreed.store import AgentIdHeld, StateStore, runner_is_alive
 
 
@@ -351,3 +351,46 @@ def test_records_survive_a_new_store_instance(state_root: Path) -> None:
     StateStore(root=state_root).create_sleeper(_record())
     [row] = StateStore(root=state_root).list_agents()
     assert row.sleeper == "asleep"
+
+
+class TestClaudeArgs:
+    def test_ordinary_flags_pass(self) -> None:
+        args = ["--mcp-config", "/x.json", "--append-system-prompt-file", "/p.md", "--verbose"]
+        assert check_claude_args(args) == args
+
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "--session-id",
+            "--resume",
+            "-r",
+            "--continue",
+            "-c",
+            "--fork-session",
+            "--print",
+            "-p",
+            "--permission-mode",
+            "--permission-mode=plan",
+            "--dangerously-skip-permissions",
+            "--model",
+            "--model=opus",
+        ],
+    )
+    def test_flags_spanreed_sets_are_refused(self, arg: str) -> None:
+        with pytest.raises(SleeperError, match="set by spanreed"):
+            check_claude_args(["--verbose", arg])
+
+    def test_a_reserved_word_as_a_value_is_not_mistaken_for_a_flag(self) -> None:
+        """Only an argument that IS a reserved flag is refused; a value naming one is fine."""
+        assert check_claude_args(["--append-system-prompt", "never use -p"]) == [
+            "--append-system-prompt",
+            "never use -p",
+        ]
+
+    def test_an_older_record_without_the_field_reads_as_none(self, store: StateStore) -> None:
+        store.create_sleeper(_record())
+        raw = json.loads((store.root / "sleepers" / "nap.json").read_text())
+        del raw["claude_args"]
+        (store.root / "sleepers" / "nap.json").write_text(json.dumps(raw))
+        record = store.sleepers.read("nap")
+        assert record is not None and record.claude_args == []

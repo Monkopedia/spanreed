@@ -229,7 +229,15 @@ spanreed sleeper sleep helper             # put it to sleep at the end of its tu
 spanreed sleeper retire helper            # remove it (its inbox is kept)
 ```
 
-The permission mode and model are fixed at create and passed on every launch.
+The permission mode and model are fixed at create and passed on every launch. So
+is anything after `--`, verbatim, which is how to give a sleeper its own MCP
+servers or prompt text without writing into its folder (use absolute paths):
+
+```bash
+spanreed sleeper create --name helper --cwd ~/some/worktree --permission-mode acceptEdits \
+    -- --mcp-config ~/sleepers/helper-mcp.json --append-system-prompt-file ~/sleepers/helper.md
+```
+
 Without `--model` it gets the model in your Claude Code settings, which may not
 be the one you usually pass on the command line.
 

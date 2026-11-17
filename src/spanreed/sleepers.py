@@ -54,6 +54,38 @@ class SleeperError(RuntimeError):
     """A sleeper command refused, with the reason a human should read."""
 
 
+RESERVED_CLAUDE_ARGS = (
+    "--session-id",
+    "--resume",
+    "-r",
+    "--continue",
+    "-c",
+    "--fork-session",
+    "--print",
+    "-p",
+    "--permission-mode",
+    "--dangerously-skip-permissions",
+    "--model",
+)
+"""``claude`` flags spanreed sets on every launch, or that would break a sleeper:
+which conversation it is, that it is interactive, and its kept permission mode
+and model. Refused in ``claude_args``; a second copy would fight spanreed's."""
+
+
+def check_claude_args(args: list[str]) -> list[str]:
+    """``args`` if none is reserved, else raise :class:`SleeperError` naming it."""
+    for arg in args:
+        flag = arg.split("=", 1)[0]
+        if flag in RESERVED_CLAUDE_ARGS:
+            raise SleeperError(
+                f"{arg!r} is set by spanreed on every launch (or would stop the sleeper "
+                f"being an interactive, resumable session), so it can't be passed after "
+                f"`--`. Use spanreed's own option instead where there is one "
+                f"(--permission-mode, --model)."
+            )
+    return args
+
+
 def sleeper_agent_id(name: str) -> str:
     """The registry id of sleeper ``name``: ``agent-<name>``, as for any named agent."""
     return f"agent-{name}"
@@ -122,6 +154,11 @@ class SleeperRecord(BaseModel):
     model: str | None = None
     """Fixed at create and passed as ``--model`` on every launch, like the
     permission mode. ``None`` passes no flag: Claude Code's settings decide."""
+    claude_args: list[str] = []
+    """Extra ``claude`` arguments given at create (after ``--``), passed verbatim on
+    every launch after spanreed's own: ``--mcp-config``,
+    ``--append-system-prompt-file`` and the like. Relative paths resolve against
+    ``cwd``, where Claude runs."""
     idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S
     claude_path: str
     spanreed_path: str

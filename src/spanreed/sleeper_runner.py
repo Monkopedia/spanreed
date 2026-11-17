@@ -228,7 +228,7 @@ def claude_argv(record: SleeperRecord, *, resume: bool) -> list[str]:
     argv += ["--permission-mode", record.permission_mode]
     if record.model is not None:
         argv += ["--model", record.model]
-    return argv
+    return argv + record.claude_args
 
 
 def _say(text: str) -> None:
