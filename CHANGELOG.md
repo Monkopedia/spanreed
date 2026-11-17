@@ -22,11 +22,13 @@ spanreed sleeper create --name helper --cwd ~/some/project \
 spanreed sleeper list | attach | wake | sleep | retire
 ```
 
-- **Mail is never lost.** Whether Claude received a message is read from the session's own
-  transcript, so mail it already has isn't sent again. The exceptions are a message it only
+- **Mail is never lost silently.** Whether Claude received a message is read from the
+  session's own transcript, so mail it already has isn't sent again. The exceptions are a message it only
   partly saw, one cut by a compaction, or any message when the transcript can't be read:
   those are delivered again rather than risked. Mail that arrives while the agent is going
-  to sleep is delivered before it sleeps.
+  to sleep is delivered before it sleeps. A line that still isn't delivered after 3 launches
+  in which Claude ran (a corrupt line, say) is skipped so the rest can be. It is recorded
+  for good, shown in `sleeper list`, and the sleeper is flagged `needs_input`.
 - **Background work keeps it awake.** A shell or subagent it left running blocks the idle
   timeout. `request_sleep` (or `spanreed sleeper sleep`) stops that work and sleeps.
 - **A failed wake is never silent.** An expired login, a rate limit, a missing `tmux`, or a
@@ -44,10 +46,10 @@ spanreed sleeper list | attach | wake | sleep | retire
 
 - **A Codex worker refuses a `--name` that a running worker already holds.** Before, two
   workers on one name both ran every message. (#80)
-- **`conjoin` no longer leaves a peer's agents looking live after a failed connect.** A
-  registry frame arriving after teardown (#81), or a peer hello arriving just after
-  `--handshake-timeout` (#83, #92), used to mirror the peer's agents while nothing was
-  connected.
+- **`conjoin` no longer leaves a peer's agents looking live when nothing is connected.** A
+  registry frame arriving just after a working link dropped (#81), or a peer hello arriving
+  just after `--handshake-timeout` on a connect that never came up (#83, #92), used to
+  mirror the peer's agents anyway.
 - **A `CLAUDE_PID` of 0 or garbage no longer adopts another agent's identity**, including an
   asleep sleeper's. A registry row with an impossibly large pid no longer breaks
   `spanreed list`. (#50, #94)
