@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.1
+
+**Upgrading:** update the package and the plugin on every host, as for 0.4.0. Nothing else to
+do: sleepers created with 0.4.0 keep working, with no extra arguments.
+
+### Sleepers: extra `claude` arguments on every launch
+
+Anything after `--` on `sleeper create` is stored with the sleeper and passed to `claude` on
+every launch, after spanreed's own flags. This gives each sleeper its own MCP servers or prompt
+text without writing files into the folder it runs in:
+
+```bash
+spanreed sleeper create --name helper --cwd ~/some/worktree --permission-mode acceptEdits \
+    -- --mcp-config ~/sleepers/helper-mcp.json --append-system-prompt-file ~/sleepers/helper.md
+```
+
+Only an allowlist is accepted: `--mcp-config`, `--strict-mcp-config`,
+`--append-system-prompt[-file]`, `--system-prompt`, `--disallowed-tools`, `--effort`,
+`--fallback-model`, `--verbose`, `--debug-file` and `--name`. Nothing on the list can widen a
+sleeper's permissions past its `--permission-mode` or change which conversation it resumes.
+Anything else is refused, so a flag Claude Code adds later stays refused until it is added on
+purpose. Arguments are passed as given, so use absolute paths. `sleeper list` shows them.
+(#100)
+
+### Fixes
+
+- **Registry rows recording pid 1 now read as stale.** Pid 1 (init on Linux, launchd on macOS)
+  never exits, so such rows, written when a session's parent had already gone, were listed
+  forever. One limitation: a Claude or Codex worker that really runs as pid 1, as a container's
+  entrypoint, now reads as stale. (#98, #99)
+
 ## 0.4.0
 
 **Upgrading:** update **both** the package and the plugin, and on every host. The plugin now
