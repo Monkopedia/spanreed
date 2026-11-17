@@ -456,6 +456,22 @@ class TestV2ApprovalNames:
         d = decide(tmp_path, EXEC_COMMAND_APPROVAL_V2, {"command": ["ls"], "cwd": str(outside)})
         assert not d.approved
 
+    def test_v2_exec_decision_names_the_v2_method(self, tmp_path: Path) -> None:
+        # The approval log line is "<verdict> <method> ...". Naming v1 for a v2
+        # request records a request type that never arrived, so every branch
+        # of the exec decision is checked: approve, and each way to decline.
+        cases: list[object] = [
+            {"command": ["ls"], "cwd": str(tmp_path)},
+            {"command": ["ls"], "cwd": "/"},
+            {"command": ["ls"]},
+            {"cwd": str(tmp_path)},
+            "not a mapping",
+        ]
+        for params in cases:
+            d = decide(tmp_path, EXEC_COMMAND_APPROVAL_V2, params)
+            assert d.method == EXEC_COMMAND_APPROVAL_V2, params
+            assert f" {EXEC_COMMAND_APPROVAL_V2} " in d.log_line(), params
+
     def test_v2_patch_outside_root_is_declined(self, tmp_path: Path) -> None:
         d = decide(tmp_path, APPLY_PATCH_APPROVAL_V2, {"changes": {"/etc/passwd": {}}})
         assert not d.approved
