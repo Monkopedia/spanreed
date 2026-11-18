@@ -17,6 +17,7 @@ from pathlib import Path
 import anyio
 import pytest
 
+from spanreed.identity import derive_agent_identity
 from spanreed.mcp_server import (
     deregister_agent,
     list_agents,
@@ -36,10 +37,35 @@ from spanreed.store import StateStore, pid_start_time
 
 
 @pytest.fixture
-def mcp_env(monkeypatch: pytest.MonkeyPatch, state_root: Path) -> Iterator[None]:
-    """Bind the MCP server tools to a per-test state root."""
+def mcp_env(monkeypatch: pytest.MonkeyPatch, state_root: Path, tmp_path: Path) -> Iterator[None]:
+    """Bind the MCP server tools to a per-test state root and a per-test cwd.
+
+    The self-identity tools (set_focus, set_status, set_name,
+    request_focus_update) resolve "who am I" from the server's cwd. That is the
+    branch every real session takes, since ``SPANREED_AGENT_NAME`` is an opt-in
+    override nothing sets by default, so it is this module's default too (#45).
+    Left inherited, the override from a developer's own session would silently
+    send every test down the other branch. Tests of the override set it
+    themselves.
+    """
     monkeypatch.setenv("SPANREED_STATE_ROOT", str(state_root))
+    monkeypatch.delenv("SPANREED_AGENT_NAME", raising=False)
+    session_cwd = tmp_path / "session-cwd"
+    session_cwd.mkdir()
+    monkeypatch.chdir(session_cwd)
     yield
+
+
+def _register_self(name: str = "alice") -> str:
+    """Register the agent a session rooted at the current cwd would be; return its id.
+
+    The id comes from the cwd derivation, not a hard-coded literal, so a tool
+    that resolves its own identity from anywhere other than its cwd addresses
+    an unregistered id and the test sees it.
+    """
+    agent_id, _ = derive_agent_identity()
+    register_agent(name=name, working_dir=str(Path.cwd()), pid=os.getpid(), agent_id=agent_id)
+    return agent_id
 
 
 @pytest.fixture
@@ -262,80 +288,99 @@ async def test_the_published_description_does_not_contradict_that() -> None:
 
 
 # ----------------------------------------------------------------- focus
+#
+# The tests below run on the cwd branch of identity resolution, the one
+# production uses (see ``mcp_env``). Each tool also keeps exactly one test of
+# the ``SPANREED_AGENT_NAME`` override, so that precedence stays pinned on
+# purpose rather than by every test happening to set it.
 
 
-def test_set_focus_on_self(mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """set_focus uses the derived identity of the calling session."""
-    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
-    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+def test_set_focus_on_self(mcp_env: None) -> None:
+    """set_focus uses the cwd-derived identity of the calling session."""
+    me = _register_self()
     result = set_focus(focus="working on the auth refactor")
     assert result is not None
+    assert result["agent_id"] == me
     assert result["focus"] == "working on the auth refactor"
 
 
-def test_set_focus_appears_in_list_agents(
-    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
-    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+def test_set_focus_appears_in_list_agents(mcp_env: None) -> None:
+    me = _register_self()
     set_focus(focus="the focus")
-    agents = list_agents()
-    matching = [a for a in agents if a["agent_id"] == "agent-alice"]
+    matching = [a for a in list_agents() if a["agent_id"] == me]
     assert matching[0]["focus"] == "the focus"
 
 
-def test_set_focus_returns_none_when_not_registered(
-    mcp_env: None, monkeypatch: pytest.MonkeyPatch
+def test_set_focus_honours_the_name_override(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("SPANREED_AGENT_NAME", "unregistered")
+    """``SPANREED_AGENT_NAME`` outranks the cwd: the override's entry is the one set."""
+    cwd_self = _register_self(name="cwd-self")
+    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
+    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    result = set_focus(focus="overridden")
+    assert result is not None
+    assert result["agent_id"] == "agent-alice"
+    by_id = {a["agent_id"]: a for a in list_agents()}
+    assert by_id["agent-alice"]["focus"] == "overridden"
+    assert by_id[cwd_self]["focus"] is None
+
+
+def test_set_focus_returns_none_when_not_registered(mcp_env: None) -> None:
     assert set_focus(focus="something") is None
 
 
 # ----------------------------------------------------------------- status
 
 
-def test_set_status_on_self(mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_set_status_on_self(mcp_env: None) -> None:
+    me = _register_self()
+    result = set_status(status="blocked")
+    assert result is not None
+    assert result["agent_id"] == me
+    assert result["status"] == "blocked"
+
+
+def test_set_status_appears_in_list_agents(mcp_env: None) -> None:
+    me = _register_self()
+    set_status(status="needs_input")
+    matching = [a for a in list_agents() if a["agent_id"] == me]
+    assert matching[0]["status"] == "needs_input"
+
+
+def test_set_status_honours_the_name_override(
+    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cwd_self = _register_self(name="cwd-self")
     monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
     register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
     result = set_status(status="blocked")
     assert result is not None
-    assert result["status"] == "blocked"
+    assert result["agent_id"] == "agent-alice"
+    by_id = {a["agent_id"]: a for a in list_agents()}
+    assert by_id["agent-alice"]["status"] == "blocked"
+    assert by_id[cwd_self]["status"] != "blocked"
 
 
-def test_set_status_appears_in_list_agents(
-    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
-    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
-    set_status(status="needs_input")
-    matching = [a for a in list_agents() if a["agent_id"] == "agent-alice"]
-    assert matching[0]["status"] == "needs_input"
-
-
-def test_set_status_returns_none_when_not_registered(
-    mcp_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("SPANREED_AGENT_NAME", "unregistered")
+def test_set_status_returns_none_when_not_registered(mcp_env: None) -> None:
     assert set_status(status="working") is None
 
 
-async def test_request_focus_update_returns_reply_body(
-    mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+async def test_request_focus_update_returns_reply_body(mcp_env: None, tmp_path: Path) -> None:
     """Simulate the recipient replying to the focus-update request."""
-    monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
-    register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    me = _register_self()
     register_agent(name="bob", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-bob")
 
     async def respond() -> None:
-        # Wait for the request to land in bob's inbox, then reply to alice.
+        # Wait for the request to land in bob's inbox, then reply to its sender.
         await anyio.sleep(0.1)
         msgs = recv_messages(agent_id="agent-bob")
         # Find the focus-update request (most recent).
         request = msgs[-1]
+        assert request["from_agent"] == me
         send_message(
             from_agent="agent-bob",
-            to_agent="agent-alice",
+            to_agent=me,
             body="refactoring the API gateway",
             in_reply_to=str(request["msg_id"]),
         )
@@ -349,11 +394,37 @@ async def test_request_focus_update_returns_reply_body(
     assert result_holder == ["refactoring the API gateway"]
 
 
-async def test_request_focus_update_times_out(
+async def test_request_focus_update_honours_the_name_override(
     mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """With the override set, the request is sent from, and the reply awaited on, its id."""
+    _register_self(name="cwd-self")
     monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
     register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
+    register_agent(name="bob", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-bob")
+
+    async def respond() -> None:
+        await anyio.sleep(0.1)
+        request = recv_messages(agent_id="agent-bob")[-1]
+        assert request["from_agent"] == "agent-alice"
+        send_message(
+            from_agent="agent-bob",
+            to_agent="agent-alice",
+            body="reply to the override",
+            in_reply_to=str(request["msg_id"]),
+        )
+
+    result_holder: list[str | None] = []
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(respond)
+        result_holder.append(await request_focus_update(agent_id="agent-bob", timeout_s=2.0))
+
+    assert result_holder == ["reply to the override"]
+
+
+async def test_request_focus_update_times_out(mcp_env: None, tmp_path: Path) -> None:
+    _register_self()
     register_agent(name="bob", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-bob")
     result = await request_focus_update(agent_id="agent-bob", timeout_s=0.2)
     assert result is None
@@ -362,20 +433,29 @@ async def test_request_focus_update_times_out(
 # ----------------------------------------------------------------- name
 
 
-def test_set_name_renames_self(
+def test_set_name_renames_self(mcp_env: None) -> None:
+    me = _register_self()
+    result = set_name(name="main-coordinator")
+    assert result is not None
+    assert result["agent_id"] == me
+    assert result["name"] == "main-coordinator"
+
+
+def test_set_name_honours_the_name_override(
     mcp_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    cwd_self = _register_self(name="cwd-self")
     monkeypatch.setenv("SPANREED_AGENT_NAME", "alice")
     register_agent(name="alice", working_dir=str(tmp_path), pid=os.getpid(), agent_id="agent-alice")
     result = set_name(name="main-coordinator")
     assert result is not None
-    assert result["name"] == "main-coordinator"
+    assert result["agent_id"] == "agent-alice"
+    by_id = {a["agent_id"]: a for a in list_agents()}
+    assert by_id["agent-alice"]["name"] == "main-coordinator"
+    assert by_id[cwd_self]["name"] == "cwd-self"
 
 
-def test_set_name_returns_none_when_not_registered(
-    mcp_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("SPANREED_AGENT_NAME", "unregistered")
+def test_set_name_returns_none_when_not_registered(mcp_env: None) -> None:
     assert set_name(name="anything") is None
 
 
