@@ -161,6 +161,13 @@ Implemented in `src/spanreed/mcp_server.py` via the `mcp` SDK's `MCPServer` (`mc
 - `set_name(name) -> Agent | null` — rename the calling session's display name. `agent_id` does NOT change; only the human-readable name does. Persists across re-registration.
 - `request_focus_update(agent_id, timeout_s=30) -> str | null` — send a `[FOCUS_UPDATE_REQUEST]` message to a peer, wait for their reply, return the reply body. Convention: the recipient's policy says to call `set_focus` with their current focus and reply with that text.
 
+**A tool's error reaches the agent in full.** spanreed's errors say what to do next (call
+`list_agents`, start the bridge to a named host, why this session can't sleep), so every tool
+re-raises whatever it raised as a `ToolError` with the original message. Since mcp 2.1 any other
+exception arrives at the client only as "Error executing tool <name>", with the guidance gone
+(found in the review of #103). `tests/integration/test_mcp_transport.py` checks the text over the
+real stdio transport.
+
 ### Recipient resolution
 
 `send_message`'s `to_agent` is resolved against the registry before anything is written. A bare `open(path, "a")` creates an inbox for any string, so an unvalidated recipient means a message lost into a file nothing tails, with success reported to the sender.

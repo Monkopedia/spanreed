@@ -12,12 +12,17 @@ environment variable.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import os
 import traceback
+from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 
 from anyio import to_thread
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from spanreed._fsmode import open_private, private_dir
 from spanreed.identity import derive_agent_identity
@@ -48,7 +53,45 @@ def _log(event: str, **fields: object) -> None:
 mcp_app: MCPServer = MCPServer("spanreed")
 
 
-@mcp_app.tool()
+def _tool[F: Callable[..., Any]](fn: F) -> F:
+    """Register ``fn`` as a tool whose errors reach the calling agent in full.
+
+    Since mcp 2.1 the server replaces the text of any exception that is not a
+    ``ToolError`` with a bare "Error executing tool <name>". spanreed's errors
+    are written to be acted on: an unknown recipient says to call list_agents
+    and names the host whose bridge is missing, and request_sleep explains why
+    this session can't sleep. Losing that text leaves the agent with nothing to
+    do but retry. So every exception a tool raises is re-raised as a
+    ``ToolError`` carrying the original message.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def run_async(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await fn(*args, **kwargs)
+            except ToolError:
+                raise
+            except Exception as exc:
+                raise ToolError(str(exc)) from exc
+
+        mcp_app.tool()(run_async)
+        return fn
+
+    @functools.wraps(fn)
+    def run(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except Exception as exc:
+            raise ToolError(str(exc)) from exc
+
+    mcp_app.tool()(run)
+    return fn
+
+
+@_tool
 def register_agent(
     name: str,
     working_dir: str,
@@ -72,14 +115,14 @@ def register_agent(
     )
 
 
-@mcp_app.tool()
+@_tool
 def deregister_agent(agent_id: str) -> dict[str, object]:
     """Remove an agent from the registry. No-op if not present."""
     StateStore().deregister_agent(agent_id)
     return {"ok": True}
 
 
-@mcp_app.tool()
+@_tool
 def list_agents(include_stale: bool = False) -> list[dict[str, object]]:
     """List agents currently registered on the bus.
 
@@ -103,7 +146,7 @@ def list_agents(include_stale: bool = False) -> list[dict[str, object]]:
     ]
 
 
-@mcp_app.tool()
+@_tool
 def list_peers() -> list[dict[str, object]]:
     """List the cross-host bridges this bus has, and how each one is doing.
 
@@ -131,7 +174,7 @@ def list_peers() -> list[dict[str, object]]:
     return [link.model_dump(mode="json") for link in StateStore().list_peer_links()]
 
 
-@mcp_app.tool()
+@_tool
 def send_message(
     from_agent: str,
     to_agent: str,
@@ -169,7 +212,7 @@ def send_message(
     return {**msg.model_dump(mode="json"), "delivered_to_live_session": live, "delivery": detail}
 
 
-@mcp_app.tool()
+@_tool
 def recv_messages(
     agent_id: str,
     since_msg_id: str | None = None,
@@ -183,7 +226,7 @@ def recv_messages(
     return [m.model_dump(mode="json") for m in msgs]
 
 
-@mcp_app.tool()
+@_tool
 async def wait_for_reply(
     agent_id: str,
     in_reply_to: str,
@@ -210,7 +253,7 @@ async def wait_for_reply(
     return msg.model_dump(mode="json") if msg else None
 
 
-@mcp_app.tool()
+@_tool
 def set_name(name: str) -> dict[str, object] | None:
     """Rename this session's display name on the bus.
 
@@ -227,7 +270,7 @@ def set_name(name: str) -> dict[str, object] | None:
     return agent.model_dump(mode="json") if agent else None
 
 
-@mcp_app.tool()
+@_tool
 def set_focus(focus: str | None = None) -> dict[str, object] | None:
     """Set (or clear) this session's focus on the bus.
 
@@ -244,7 +287,7 @@ def set_focus(focus: str | None = None) -> dict[str, object] | None:
     return agent.model_dump(mode="json") if agent else None
 
 
-@mcp_app.tool()
+@_tool
 def set_status(status: Status) -> dict[str, object] | None:
     """Set this session's status on the bus — how much human attention you need.
 
@@ -264,7 +307,7 @@ def set_status(status: Status) -> dict[str, object] | None:
     return agent.model_dump(mode="json") if agent else None
 
 
-@mcp_app.tool()
+@_tool
 def request_sleep() -> str:
     """Go to sleep at the end of this turn. Only for a sleeper: a session spanreed
     manages in tmux, which sleeps when idle and is woken by its next message.
@@ -296,7 +339,7 @@ current focus. Used by ``request_focus_update`` below.
 """
 
 
-@mcp_app.tool()
+@_tool
 async def request_focus_update(
     agent_id: str,
     timeout_s: float = 30.0,
