@@ -9,8 +9,18 @@ State lives under ``~/.claude/spanreed/`` by default:
 - ``sleepers/<name>.json`` — one record per sleeper (see :mod:`spanreed.sleepers`).
 
 Concurrency model: all registry mutations take an exclusive ``fcntl`` lock on
-``registry.lock``. Inbox appends are single small JSON lines; POSIX guarantees
-atomicity for writes under ``PIPE_BUF``, which is well above our line size.
+``registry.lock``. Inbox (and activity-log) appends take no lock. They are safe
+because the file is opened ``O_APPEND`` (:func:`~spanreed._fsmode.open_private`)
+and each line reaches the kernel as one ``write()``: on a local Linux
+filesystem the seek-to-end and the write happen as one step, and concurrent
+writes to the same file do not interleave, whatever the line length. ``PIPE_BUF``
+is not the guarantee here -- it covers pipes and FIFOs, not regular files, and
+real bus lines run well past it (22 KB lines were measured on the live bus,
+against a ``PIPE_BUF`` of 4096). The property was measured rather than assumed:
+8 concurrent writers appending lines of 30 KB to 1 MB, with no torn or interleaved
+lines. It carries two constraints: a writer that emits one line in more than one
+``write()`` call, or flushes partway through it, loses the guarantee; and it does
+not hold on network filesystems.
 """
 
 from __future__ import annotations
