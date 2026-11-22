@@ -22,13 +22,14 @@ lines. It carries three constraints:
 
 - a writer that emits one line in more than one ``write()`` call, or flushes
   partway through it, loses the guarantee;
-- a **short write** does the same, and is the ordinary way it happens. When the
-  kernel takes only part of a line (the disk is full, or a signal interrupts a
-  large write), the buffered writer ``open_private`` returns either issues a
-  second ``write()`` for the rest, so another writer's line can land between the
-  halves, or fails partway, leaving a line with no trailing newline for the next
-  append to be glued onto. Either way a reader sees a torn or merged line that
-  does not parse; nothing detects or repairs it;
+- a line cut short does the same. The realistic causes are the disk filling (the
+  kernel takes part of the line, then the rest fails with ``ENOSPC``) and the
+  writer being killed mid-line. Both leave a line with no trailing newline, and
+  the next append is glued onto it, so a reader sees a merged line that does not
+  parse; nothing detects or repairs it. (A non-fatal signal does not cut a write
+  to a local regular file short, and Python retries ``EINTR``. Halves of one line
+  with another writer's line between them would need a short write whose retry
+  then succeeded, which is uncommon.);
 - it does not hold on network filesystems.
 """
 
