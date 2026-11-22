@@ -18,9 +18,18 @@ is not the guarantee here -- it covers pipes and FIFOs, not regular files, and
 real bus lines run well past it (22 KB lines were measured on the live bus,
 against a ``PIPE_BUF`` of 4096). The property was measured rather than assumed:
 8 concurrent writers appending lines of 30 KB to 1 MB, with no torn or interleaved
-lines. It carries two constraints: a writer that emits one line in more than one
-``write()`` call, or flushes partway through it, loses the guarantee; and it does
-not hold on network filesystems.
+lines. It carries three constraints:
+
+- a writer that emits one line in more than one ``write()`` call, or flushes
+  partway through it, loses the guarantee;
+- a **short write** does the same, and is the ordinary way it happens. When the
+  kernel takes only part of a line (the disk is full, or a signal interrupts a
+  large write), the buffered writer ``open_private`` returns either issues a
+  second ``write()`` for the rest, so another writer's line can land between the
+  halves, or fails partway, leaving a line with no trailing newline for the next
+  append to be glued onto. Either way a reader sees a torn or merged line that
+  does not parse; nothing detects or repairs it;
+- it does not hold on network filesystems.
 """
 
 from __future__ import annotations
