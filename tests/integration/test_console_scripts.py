@@ -21,8 +21,10 @@ from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
 import pytest
+from mcp import ClientSession, StdioServerParameters, stdio_client
 
 from spanreed.identity import derive_agent_identity
+from spanreed.mcp_server import mcp_app
 
 
 def _script(name: str) -> Path:
@@ -88,3 +90,20 @@ def test_spanreed_mcp_runs_the_server_and_exits_clean_on_eof(
     log = (state_root / "logs" / "spanreed-mcp.log").read_text()
     assert "event=startup" in log
     assert "event=shutdown reason=clean" in log
+
+
+async def test_spanreed_mcp_serves_spanreeds_tools(state_root: Path, session_cwd: Path) -> None:
+    """The installed script, driven by a real MCP client, serves spanreed's tools.
+
+    A clean start and exit alone would also pass for ``main()`` running an empty
+    server (review of #112), so this asks the server what it serves.
+    """
+    expected = {tool.name for tool in await mcp_app.list_tools()}
+    params = StdioServerParameters(
+        command=str(_script("spanreed-mcp")), env=_env(state_root), cwd=str(session_cwd)
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
+        served = {tool.name for tool in (await session.list_tools()).tools}
+    assert expected, "the in-process server lists no tools; nothing would be compared"
+    assert served == expected
