@@ -907,6 +907,15 @@ class CodexClient:
                     chunk = sock.recv(65536)
                 except TimeoutError as exc:
                     raise TimeoutError(f"no response to {context} before the deadline") from exc
+                except ConnectionError as exc:
+                    # A server that exits with our bytes still unread in its
+                    # queue resets the connection instead of closing it, so the
+                    # same departure arrives as ECONNRESET or as EOF depending
+                    # on whether it had read everything. Both get one sentence.
+                    raise ConnectionError(
+                        f"server closed the connection during {context}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
                 if not chunk:
                     raise ConnectionError(f"server closed the connection during {context}")
                 self._buf.extend(chunk)

@@ -324,6 +324,60 @@ class TestHandshake:
         assert client.initialized
 
 
+class TestConnectionLoss:
+    def test_a_reset_mid_call_names_the_call(self, tmp_path: Path) -> None:
+        """Regression (#118): a server that exits with the client's bytes still
+        unread resets the connection rather than closing it, and the read then
+        raised a bare `[Errno 104] Connection reset by peer` naming neither
+        the peer nor the call. This server answers the handshake, waits for
+        `thread/start` to be queued, and closes without reading it — on Linux
+        that is a reset every time, not some of the time."""
+        path = tmp_path / "reset.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        listener.listen(1)
+        handshake_done = threading.Event()
+
+        def serve() -> None:
+            conn, _ = listener.accept()
+            buf = _server_handshake(conn)
+            methods: list[str] = []
+            while "initialized" not in methods:
+                decoded = ws_decode(buf)
+                if decoded is None:
+                    buf.extend(conn.recv(65536))
+                    continue
+                _opcode, payload, used = decoded
+                del buf[:used]
+                msg = json.loads(payload.decode())
+                methods.append(msg["method"])
+                if msg["method"] == "initialize":
+                    conn.sendall(
+                        server_encode(json.dumps({"id": msg["id"], "result": {}}).encode())
+                    )
+            handshake_done.set()
+            conn.recv(1, socket.MSG_PEEK)  # until `thread/start` is queued, unread
+            conn.close()
+
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        client = CodexClient(socket_path=path, timeout=5.0)
+        try:
+            client.connect()
+            # The server must have stopped reading before `thread/start` goes
+            # out, or it could swallow it with `initialized` and close cleanly.
+            assert handshake_done.wait(5.0)
+            with pytest.raises(ConnectionError) as caught:
+                client.request("thread/start", {})
+        finally:
+            client.close()
+            listener.close()
+            server.join(5.0)
+        message = str(caught.value)
+        assert "server closed the connection during thread/start" in message
+        assert "ConnectionResetError" in message, "the reset path, not a clean EOF"
+
+
 # ------------------------------------------------- server→client requests
 
 
