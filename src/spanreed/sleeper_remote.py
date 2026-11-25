@@ -436,18 +436,8 @@ class Target:
         it is, not as another bridge process or worker last saw it. Never held
         while an operation runs. Like a sleeper's lock file it is never deleted.
         """
-        private_dir(self._dir, parents=True)
-        lock_path = self._dir / ".lock"
-        touch_private(lock_path)
-        fd = os.open(lock_path, os.O_RDONLY)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        with _records_lock(self._dir):
+            yield
 
     def _path(self, request_id: str) -> Path:
         return self._dir / f"{request_id}.json"
@@ -552,24 +542,44 @@ class Target:
             f.write(json.dumps(line, default=str) + "\n")
 
 
+@contextlib.contextmanager
+def _records_lock(peer_dir: Path) -> Generator[None, None, None]:
+    """The flock on ``<peer_dir>/.lock``, which every change to that peer's records is made under."""
+    private_dir(peer_dir, parents=True)
+    lock_path = peer_dir / ".lock"
+    touch_private(lock_path)
+    fd = os.open(lock_path, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def prune_records(store: StateStore, now: datetime | None = None) -> int:
     """Delete idempotency records older than :data:`RECORD_RETENTION`. Returns how many.
 
     Run by a bridge at start. Age is the record's ``received_at``, or the file's
-    mtime when the record can't be read.
+    mtime when the record can't be read. Each peer's records are pruned under
+    that peer's lock, like every other change to them.
     """
     cutoff = (now or datetime.now(UTC)) - RECORD_RETENTION
     pruned = 0
-    for path in (store.root / "sleeper-ops" / "in").glob("*/*.json"):
-        try:
-            received = RequestRecord.model_validate_json(path.read_text()).received_at
-        except (OSError, ValueError):
-            try:
-                received = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-            except OSError:
-                continue
-        if received < cutoff:
-            with contextlib.suppress(OSError):
-                path.unlink()
-                pruned += 1
+    for peer_dir in sorted((store.root / "sleeper-ops" / "in").glob("*/")):
+        with _records_lock(peer_dir):
+            for path in peer_dir.glob("*.json"):
+                try:
+                    received = RequestRecord.model_validate_json(path.read_text()).received_at
+                except (OSError, ValueError):
+                    try:
+                        received = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+                    except OSError:
+                        continue
+                if received < cutoff:
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                        pruned += 1
     return pruned

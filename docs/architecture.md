@@ -1553,7 +1553,8 @@ Every change to a record is decided on the record as it is, not as some process 
 read it: reading a record and writing its next state is one step, under an
 exclusive `flock` on `<state>/sleeper-ops/in/<peer>/.lock` (never deleted, like a
 sleeper's lock). That covers a new record, a re-queue from a dead process, the step
-to `running` and the step to `done`; the lock is never held while an operation runs.
+to `running`, the step to `done`, and the bridge's start-up prune of records older
+than seven days; the lock is never held while an operation runs.
 It matters because one peer can have two live bridge processes here: when two hosts
 are conjoined both ways, each has a bridge for the other in each direction. Without
 it, both could find a request queued under a dead process and both take it over, or

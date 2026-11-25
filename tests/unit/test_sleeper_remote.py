@@ -606,6 +606,24 @@ class TestIdempotency:
         assert prune_records(switched_on, later + timedelta(hours=2)) == 2
         assert list((switched_on.root / "sleeper-ops" / "in").glob("*/*.json")) == []
 
+    def test_pruning_waits_for_the_peer_lock(self, switched_on: StateStore, proj: Path) -> None:
+        """Catches ``prune_records`` deleting records outside the lock every other
+        change to them is made under."""
+        deliver(target(switched_on), frame("list"))
+        later = datetime.now(UTC) + RECORD_RETENTION + timedelta(hours=1)
+        pruned: list[int] = []
+        holder = target(switched_on)
+        with holder._lock():  # pyright: ignore[reportPrivateUsage]
+            pruner = threading.Thread(
+                target=lambda: pruned.append(prune_records(switched_on, later))
+            )
+            pruner.start()
+            pruner.join(timeout=0.5)
+            assert pruned == [], "it pruned while another process held the lock"
+            assert len(list((switched_on.root / "sleeper-ops" / "in").glob("*/*.json"))) == 1
+        pruner.join(timeout=10)
+        assert pruned == [1]
+
 
 # ------------------------------------------------------------------ the other ops
 
