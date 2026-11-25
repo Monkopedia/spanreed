@@ -1669,8 +1669,9 @@ Nothing here has been built or run. To measure in the implementation PR:
 
 **Status: designed, not built.** Nothing in this section has been run. Facts below that
 come from reading the code or looking at this machine say so. Anything that needs a
-measurement is under "Not verified yet (adoption)". The points the request does not
-settle are A1–A12 in
+measurement is under "Not verified yet (adoption)". What was observed on this machine
+is in [findings.md](findings.md#observations-for-adopting-a-running-agent-2026-11-25),
+not here. The points the request does not settle are A1–A14 in
 [open-questions.md](open-questions.md#adopting-a-running-agent-as-a-sleeper-designed-not-built),
 each with a recommendation. This section describes the design **as recommended**, and
 names the question each choice depends on.
@@ -1695,16 +1696,10 @@ The request settles three things: the conversation is kept (the first wake resum
 the bus id is kept and the display name is not the hex, and the handover has no double
 run and no missed mail. The rest is the author's design.
 
-**The pilots, as of 2026-11-25 on kaladin** (read from the registry and from Claude
-Code's per-process session files, `~/.claude/sessions/<pid>.json`). All three have an
-id derived from their cwd, have a display name equal to the directory's basename, and
-run interactively in panes of the owner's own `claude` tmux session:
-
-| agent | id | cwd |
-|---|---|---|
-| hauler | `agent-eac78acd` | `~/git/hauler` |
-| sdbus-kotlin | `agent-f65be093` | `~/git/sdbus-kotlin` |
-| lsp-kotlin | `agent-eccec404` | `~/git/lsp-kotlin` |
+**The pilots** (hauler, sdbus-kotlin, lsp-kotlin) are listed with their ids and cwds in
+[findings.md](findings.md#observations-for-adopting-a-running-agent-2026-11-25). What
+matters for the design: all three have an id derived from their cwd, and all three run
+interactively in panes of the owner's own `claude` tmux session.
 
 #### What already works
 
@@ -1748,9 +1743,8 @@ recently running session (A3).
   it, and reads everything else from the session behind it. The registry row gives the
   id, the display name and `pid`/`pid_start`. Claude Code's per-process file
   `~/.claude/sessions/<pid>.json` gives `sessionId` and `cwd`. That file is an internal
-  format, not a promised one: in Claude Code 2.1.283 on kaladin its `procStart` equals
-  `/proc/<pid>/stat` field 22, and so equals the row's `pid_start`. Adoption uses it
-  only when `procStart` matches. When the file is missing, unreadable or does not match,
+  format, not a promised one; what was observed of it is in findings.md (above).
+  Adoption uses it only when its `procStart` matches the row's `pid_start`. When the file is missing, unreadable or does not match,
   `--adopt` refuses and says to pass `--session-id`, `--agent-id` and `--cwd` instead.
   It prints every value it took.
 - **`--name`** defaults, under `--adopt`, to the session's display name if
@@ -1790,11 +1784,30 @@ rather than reading the field. An adopted record keeps its old id under a readab
 - **The woken session must speak as the record's id.** The runner sets
   `SPANREED_AGENT_NAME=<name>`, and the identity rules then mint `agent-<name>`. For an
   adopted record that would be `agent-hauler`, a different agent with an empty inbox.
-  Recommended (A7): the runner also sets `SPANREED_AGENT_ID=<record.agent_id>`, which
-  `derive_agent_identity` reads ahead of `SPANREED_AGENT_NAME`. It is validated like any
-  id and must be unqualified. `SPANREED_AGENT_NAME` stays the record key that the hooks,
-  `request_sleep` and the Monitor's replay use. It is set on every launch, so a record
-  whose id is `agent-<name>` behaves exactly as today.
+  Recommended (A7): the runner (`sleeper_runner.py`, where it sets
+  `SPANREED_AGENT_NAME` today) also sets `SPANREED_AGENT_ID=<record.agent_id>`. It is
+  validated like any id and must be unqualified, and it is set on every launch, so a
+  record whose id is `agent-<name>` behaves exactly as today. **Two functions mint an
+  id from `SPANREED_AGENT_NAME`, and both must read `SPANREED_AGENT_ID` first**
+  (read from the code):
+  - `identity.derive_agent_identity` (`identity.py:35`). Reached by the SessionStart
+    hook (`_cmd_session_start`, `cli.py:847`), by every MCP tool that asks who it is
+    (`mcp_server.py:274`, `291`, `311`, `363`), by `register`'s default
+    (`cli.py:145`), and by `_ensure_registered` for the name (`cli.py:584`).
+  - `identity.session_agent_identity` (`identity.py:84`). It returns on
+    `SPANREED_AGENT_NAME` itself (precedence 1) before it ever calls
+    `derive_agent_identity`, so fixing only the first function leaves this one minting
+    `agent-hauler`. It is the CLI's path, through `_self_identity` (`cli.py:75`): the
+    inbox Monitor `inbox-watch` (`cli.py:416`), `send`'s default sender
+    (`cli.py:365`), `agent-id`, and the other self-addressed commands (`cli.py:592`,
+    `614`, `640`). A miss here would point the woken sleeper's Monitor at the wrong
+    inbox.
+
+  The implementation PR should route both through one helper and test each entry point
+  above in a woken adopted sleeper. Three readers use `SPANREED_AGENT_NAME` as the
+  **record key**, not as an id, and stay as they are: `request_sleep`
+  (`mcp_server.py:330`), the Monitor's replay (`cli.py:445`) and the turn hooks'
+  `_activity` (`cli.py:1065`).
 
 #### The handover
 
@@ -1836,90 +1849,173 @@ sleep".
 
 **C. `create` ends the live session itself, then commits, all in one bounded call.**
 This is **recommended for v1 and the pilots** (A1). Run from outside the session, by a
-person or by the coordinator, C does what the runner does at sleep, with the `create`
-process acting as the runner for generation 0:
+person or by the coordinator (who may is A14), C does what the runner does at sleep,
+with the `create` process acting as the runner for generation 0. The difference from a
+runner is that the live session was not started by spanreed: its hooks report no turns
+and no `Stop.background_tasks` (it has no `SPANREED_SLEEPER`), so `create` has to judge
+"idle" from outside (A2, A13), and its Monitor keeps delivering mail until it is stopped.
 
-1. **Validate**, then take the sleeper lock. If the id's row is live, its pid must be
-   the session being adopted: its `~/.claude/sessions/<pid>.json` must name this
-   `sessionId`, and its `procStart` must match. Otherwise refuse. A live session is
-   ended only with `--end-session` (A2). Without that flag, `create` refuses while the
-   session is live and says how to proceed.
+1. **Validate**, then take the sleeper lock. Refuse unless all of these hold:
+   - If the id's row is live, its pid is the session being adopted: that pid's
+     `~/.claude/sessions/<pid>.json` names this `sessionId`, and its `procStart`
+     matches. A live session is ended only with `--end-session` (A2). Without that
+     flag, `create` refuses while the session is live and says how to proceed.
+   - **No other session answers this id or runs this conversation.** The row holds
+     only the latest pid, and two sessions in one cwd share an id (protocol.md), so the
+     row alone cannot show a second session. `create` refuses when (a) any process
+     other than the adopted session's own Monitor is tailing this id's inbox file (the
+     Monitor is `tail -F <inbox>`, so this finds every listening session, however its id
+     was minted), (b) any other live `sessions/<pid>.json` names this `sessionId` (A9's
+     check, run here too), or (c), for an id derived from a cwd, any other live
+     `sessions/<pid>.json` has that cwd. All three are best-effort; (a) is the one that
+     does not depend on Claude Code's internal files.
+   - **The caller is not a descendant of the session.** Step 5 would signal the
+     `create` process itself. Self-adoption is shape B.
+   - **The session looks idle** (A2): its transcript has not been written in the last
+     60 s, and its last record ends a turn (no `tool_use` waiting for its result, no
+     user record waiting for a reply).
+   - **No background work is seen** (A13, as recommended: adoption waits for
+     background work, it does not stop it). Seen means either a descendant of the
+     session's pid other than its MCP servers, its inbox Monitor and their children
+     (a background shell, a build, a foreground tool's process), or a subagent
+     transcript (`<project>/<session-id>/subagents/agent-*.jsonl`) written in the last
+     60 s. **Neither check sees everything.** The live session has no
+     `Stop.background_tasks` to read, because its hooks don't report turns. A
+     background shell writes nothing to the transcript until it ends, so only its
+     process shows it. A subagent runs inside the `claude` process and writes only to
+     its own transcript, so one that is waiting on a long model call can look idle.
+     These are best-effort guards against accidents, and they fail toward refusing.
+
+   Then record the **inbox snapshot** `S`: the inbox's current length, as the
+   `InboxPosition` that `read_through` already uses. Only lines at or before `S` can
+   ever be treated as history ("Where `read_through` starts").
 2. **Write the record**: `state=sleeping`, `generation` 0, `runner_pid` set to this
-   process, `claude_pid`/`claude_pid_start` set to the live session, and `read_through`
-   set to a **provisional** position computed now (see below). The registry row keeps
-   the live pid, with the sleeper marker laid over it from the record, so name lookup
-   keeps working. From this moment a sender sees `sleeping` with a live runner, and
-   only appends. A wake, by mail or by hand, does nothing. The live session's own
-   Monitor goes on delivering whatever arrives.
-3. **End the live session**, as in "The exit": list its descendants, send SIGTERM, then
-   SIGKILL after 15 s, then SIGKILL to any descendants still running whose start time is
-   unchanged. It is not this process's child, so "gone" is polled by pid and start time.
-   Background work stops, as with `request_sleep` (decision 7).
-4. **Under the lock, commit**: compute `read_through` against the now-complete
-   transcript, and rewrite the row as a sleeper row (`pid` 0, `pid_start` −1, display
-   name from the record), and set `state=asleep`. If any line after `read_through` is
-   unread, release the lock and wake it through the ordinary wake path (generation 1,
-   `--resume`, in a new tmux session; A6). A sender that wakes it first in that moment
-   makes this wake a no-op.
-5. Print what happened: the values used, `read_through`, the lines that will be
+   process, `claude_pid`/`claude_pid_start` set to the live session, `S`, and
+   `read_through` set to a **provisional** position computed now (see below). The
+   registry row keeps the live pid, with the sleeper marker laid over it from the
+   record, so name lookup keeps working. From this moment a sender sees `sleeping`
+   with a live runner, and only appends. A wake, by mail or by hand, does nothing.
+   Then **release the lock.**
+3. **Stop deliveries to the live session.** `create` finds the session's Monitor (a
+   descendant of its pid running `tail -n 0 -F <this inbox>`) and sends it `SIGSTOP`.
+   From here on, mail is appended to the inbox and nothing hands it to the live
+   session. `SIGSTOP` is used rather than killing it so that an abort (step 4) can undo
+   it: `SIGCONT` resumes `tail` at its file offset, and it delivers whatever arrived in
+   the meantime. No Monitor found means none is delivering, and the step is skipped.
+   More than one is refused at step 1.
+4. **Re-check idle, after a quiet period.** Wait `Q` (recommended: 10 s, so a Monitor
+   event queued just before the freeze has time to start its turn), then run the step-1
+   idle and background-work checks again, requiring no transcript write since the
+   freeze. **If anything is active, abort** (A2): `SIGCONT` the Monitor, delete the
+   record under the lock (which removes the marker, leaving the live row as it was),
+   and exit non-zero saying the session became busy. Nothing was lost: the live
+   session's Monitor delivers what arrived during the freeze.
+5. **End the live session**, as in "The exit": list its descendants, send SIGTERM,
+   then SIGKILL after 15 s, then SIGKILL to any descendants still running whose start
+   time is unchanged. The stopped Monitor is one of them; SIGKILL ends a stopped
+   process. It is not this process's child, so "gone" is polled by pid and start time.
+   Background work is **not** knowingly stopped: by step 4 none was seen (A13).
+6. **Under the lock, commit**: compute `read_through` against the now-complete
+   transcript and `S`, rewrite the row as a sleeper row (`pid` 0, `pid_start` −1,
+   display name from the record), and set `state=asleep`. If any line after
+   `read_through` is unread, release the lock and wake it through the ordinary wake
+   path (generation 1, `--resume`, in a new tmux session; A6). A sender that wakes it
+   first in that moment makes this wake a no-op.
+7. Print what happened: the values used, `S`, `read_through`, the lines that will be
    replayed and the lines treated as history.
 
+**The lock is not held across steps 3 to 5**, as it is not across the runner's own
+exit. Holding it for up to 25 s would block every sender to this id. Exclusion in that
+window comes from the record: `sleeping` with a live `runner_pid`, which no wake acts
+on.
+
 - *Double run:* none. The record exists, with a live runner, before the session is
-  signalled, and nothing can wake the sleeper until step 4.
-- *Mail in the gap:* there is no gap. Before step 2, the live session receives mail
-  normally. After step 2, the argument of "Why no message is lost" applies unchanged,
-  with this process as the runner. Mail the live session had queued but never turned
-  into a turn (an `enqueue` with no turn yet) has no delivered record, so it is
-  replayed.
-- *Bounded:* it runs about as long as an exit, at most 15 s plus the escalation. No
-  process outlives the command, so it fits "no persistent process" without needing the
-  runner analogy.
-- *If `create` dies between steps 2 and 4*, the record says `sleeping` with a dead
+  signalled, and nothing can wake the sleeper until step 6.
+- *Mail that is never seen:* none. Every inbox line after `S` that the transcript does
+  not show as delivered is replayed (lines from step 3 on cannot have been delivered).
+  Before step 3 the live session receives mail normally. Mail the live session had
+  queued but never turned into a turn has no delivered record, so it is replayed. A
+  line before `S` that the live session missed is history (A5), and `create` lists it.
+- *What is not guaranteed: a turn cut off by step 5.* A message that reached a turn
+  counts as read once that turn has a real assistant record, so if step 5 ends that
+  turn, the message is not replayed and the work on it is lost. Steps 3 and 4 make
+  this unlikely: after the freeze no new mail can start a turn, and the re-check
+  aborts if one is running. They cannot rule it out. The idle checks are judged from
+  outside (A2), a foreground tool call may write nothing to the transcript while it
+  runs, and a turn can also start from something other than mail (a person typing in
+  the pane, a background task finishing) in the moment between step 4 and step 5.
+  The claim is therefore: **no message goes unseen, and a message is lost mid-work
+  only if a turn starts or runs undetected through the step-4 re-check.**
+- *Bounded:* about `Q` plus an exit, at most 15 s plus the escalation. No process
+  outlives the command, so it fits "no persistent process" without needing the runner
+  analogy.
+- *If `create` dies between steps 2 and 6*, the record says `sleeping` with a dead
   runner. If the session is still alive, the orphan rule blocks a wake and reports it.
-  Its message should say "adoption interrupted", not "runner died". If the session has
-  exited too, the next mail wakes the sleeper normally from the provisional
+  Its message should say "adoption interrupted", not "runner died". Its Monitor may
+  still be stopped: the report says so, and that `kill -CONT <pid>` resumes it. If the
+  session has exited too, the next mail wakes the sleeper normally from the provisional
   `read_through`. Mail may be replayed then, but none is lost.
-- *A session that has already exited* (shape A) is the same command without step 3.
+- *A session that has already exited* (shape A) is the same command without steps 3
+  to 5.
 - *The risk is ending a session mid-turn.* Test 8 measured SIGTERM only at idle. C
-  therefore refuses while the session looks busy (A2).
+  therefore refuses, twice, while the session looks busy (A2).
 
 Self-adoption (B) remains possible later as "C, run detached once the current turn
 ends", if the owner wants agents to put themselves to sleep (A1).
 
 #### Where `read_through` starts
 
-A plain `create` starts at the end of the inbox. An adopted record starts at the **last
-inbox line that the adopted session's transcript shows as delivered**, using the
-existing read-check: the three delivered record kinds, each followed by a real turn.
-Call that line the high-water mark (HWM):
+A plain `create` starts at the end of the inbox. An adopted record starts from two
+positions:
 
-- Lines after the HWM are unread, and the first wake replays them. By definition none of
-  them has a delivered record, so the Monitor's replay filter passes them all.
+- **`S`, the inbox snapshot** taken at step 1 of C (for shape A, at validation). It
+  bounds what can be history: nothing that arrived after `S` is ever classed as history,
+  however the handover goes.
+- **The high-water mark (HWM)**: the **last inbox line at or before `S` that the
+  adopted session's transcript shows as delivered**, using the existing read-check (the
+  three delivered record kinds, each followed by a real turn).
+
+`read_through` is the HWM. Then:
+
+- **Lines after the HWM** follow the ordinary `first_unread_line()` rule: the first wake
+  replays every one without a delivered record, and the replay filter skips the ones
+  that have one. That includes every line after `S`, delivered by the live session or
+  not. For example, a line that arrives during the handover and is lost to the
+  Monitor's batch cut, followed by one that is delivered, is still replayed: it is after
+  `S`, so the later delivery cannot pull the HWM past it.
 - **Undelivered lines at or before the HWM are history, not replayed** (A5). These are
-  mail the live session missed while it was awake. The usual cause is the Monitor's
-  ~3 KB batch cut (findings Test 9), which affects awake agents today. Replaying them
-  would also bring back mail from earlier conversations under the same id. `create`
-  lists them by line and `msg_id` so they can be forwarded by hand (rule 7: visible).
-- **No delivery at all** in a readable transcript (a conversation that has had no mail,
-  or one just after `/clear`, which starts a new session id). The HWM would then be line
-  0 and would replay the inbox's whole history. Recommended instead (A4): start after
-  the last line whose `ts` is earlier than the transcript's first record. Mail older
-  than the conversation is history, and mail that arrived during it without being
-  delivered is replayed.
+  mail the live session missed while it was awake, before the handover began. The usual
+  cause is the Monitor's ~3 KB batch cut (findings Test 9), which affects awake agents
+  today. Replaying them would also bring back mail from earlier conversations under the
+  same id. `create` lists them by line and `msg_id` so they can be forwarded by hand
+  (rule 7: visible).
+- **No delivery at or before `S`** in a readable transcript (a conversation that has had
+  no mail, or one just after `/clear`, which starts a new session id). The HWM would
+  then be line 0 and would replay the inbox's whole history. Recommended instead (A4):
+  start after the last line, at or before `S`, that was **stamped on this host** and
+  whose `ts` is earlier than the transcript's first record. Only local lines are
+  compared by clock. A line relayed from a peer (its `from_agent` is qualified
+  `name@host`) carries the sending machine's `ts` (`bridge.py` copies it), so its
+  clock is never compared; it is placed by its position in the file, which is the order
+  it arrived here. Mail older than the conversation is history, and mail that arrived
+  during it without being delivered is replayed. A local line's `ts` is taken just
+  before it is appended, on the same clock as the transcript, so only a clock step on
+  this machine can misplace it.
 - **Compaction** can cut the last delivered records out of the chain, exactly as in
   #88. The HWM then falls back to an earlier line, and the lines between are replayed
   once. That is the safe direction.
 - **A rewritten inbox** is handled as it is now: `scan_inbox` detects it and starts over
   from line 1, which can cause duplicates but no loss.
 - **When it is computed.** A provisional value is computed at step 2 and stored. The
-  final value is computed at step 4, against the complete transcript, and replaces it.
-  If the transcript is unreadable at step 4, the provisional value stays and the existing
+  final value is computed at step 6, against the complete transcript and the stored
+  `S`, and replaces it. Both are at or before `S`.
+  If the transcript is unreadable at step 6, the provisional value stays and the existing
   fail-safe applies: `needs_input` is set with the reason, and the backlog after it is
   replayed. A transcript that is unreadable *at validation* refuses the adoption.
 
 #### The registry row, and what stays put
 
-At step 4 the live session's row is **replaced** by the sleeper row: `pid` 0,
+At step 6 the live session's row is **replaced** by the sleeper row: `pid` 0,
 `pid_start` −1, the same `agent_id` and `working_dir`, and the display name from the
 record (the same name, under `--adopt`). Focus is carried over, because it describes
 the conversation that goes on, and status is cleared, as on any re-registration (A12).
@@ -1943,7 +2039,9 @@ are hard to reach when the sleeper's id is `agent-<name>`:
   launch, the wake also refuses when any live pid's `~/.claude/sessions/<pid>.json`
   names the record's session id, with a matching `procStart`. This applies to every
   sleeper, works on a best-effort basis (the file is internal), and is never the only
-  guard.
+  guard. Adoption runs the same check at step 1 of C, along with the inbox-listener
+  check, so a second session that is **already running** when the agent is adopted is
+  refused there; A8 covers only sessions that start later.
 
 #### What changes for the adopted agent
 
@@ -1970,6 +2068,16 @@ transcript and claiming a bus id need nothing more than running as the user, whi
 already `register --agent-id` any id. The ids and names that are already held are
 protected only from accidents, by the #80 refusals above.
 
+**`--end-session` is new, though.** No command today ends another agent's live
+session; a sleeper is only ever ended by its own runner. With `--end-session`, any
+process running as the user, the coordinator included, can end any local agent that
+looks idle. Spanreed cannot tell who is running a CLI command, so it cannot enforce a
+rule about who may (decision 7: the checks guard against accidents, not agents). Who
+should is A14. Whatever the answer, `create` records the caller's identity, as
+`_self_identity` resolves it, in the record's `adopted` field and in the activity log,
+so an ending is never silent. That identity is asserted, not proven, like every
+`from_agent`.
+
 #### Compatibility
 
 - **Existing records need no migration.** Their `agent_id` is `agent-<name>`, so lookups
@@ -1986,10 +2094,11 @@ protected only from accidents, by the #80 refusals above.
   is informational, so nothing breaks.
 - **Peers** see an unchanged row format.
 
-The record gains one optional field: `adopted`, which holds `at`, `from_pid`,
-`from_pid_start`, and `read_through_basis` (`transcript`, `conversation_start` or
-`provisional`). It records where the agent came from and why it starts reading where it
-does. `sleeper list` shows it.
+The record gains one optional field: `adopted`, which holds `at`, `by` (the caller's
+asserted identity), `from_pid`, `from_pid_start`, `inbox_snapshot` (`S`), and
+`read_through_basis` (`transcript`, `conversation_start` or `provisional`). It records
+where the agent came from, who adopted it, and why it starts reading where it does.
+`sleeper list` shows it.
 
 #### Not verified yet (adoption)
 
@@ -2002,12 +2111,25 @@ Nothing here has been built or run. To measure in the implementation PR:
 - **Whether `--resume <id>` needs the original cwd.** The `cwd` check assumes it does.
 - **SIGTERM to a session mid-turn**, which A2 exists to avoid. Test 8 measured idle
   only.
-- **`~/.claude/sessions/<pid>.json`:** its fields (`sessionId`, `cwd`, `procStart`,
-  `status`) were observed in Claude Code 2.1.283 on kaladin. It is not documented.
-  Whether it is removed at exit, and what each `status` value means (`busy` and `shell`
-  were seen), is unmeasured.
-- **`CLAUDE_CODE_SESSION_ID`** in the Bash tool's environment (seen in 2.1.283; a
-  subagent sees its parent's), which self-adoption (B) would read.
+- **`~/.claude/sessions/<pid>.json`** beyond what findings.md records: whether it is
+  removed at exit, and what each `status` value means.
+- **Whether `sessions/<pid>.json` updates its `sessionId` after `/clear`.** A4 assumes
+  `/clear` starts a new session id. If the file keeps the old one, `--adopt` would
+  resume the conversation from before the `/clear`, not the one the agent is in. The
+  implementation PR must check this before `--adopt` trusts the field, or compare it
+  with the newest transcript in the cwd's project folder.
+- **Whether `cwd` in `sessions/<pid>.json` is the start directory** (the one the id was
+  minted from) or follows the session. Step 1's check (c) assumes the start directory.
+- **The idle checks of A2**: whether an idle session ever writes to its transcript
+  without a turn, whether a turn in progress always shows as a final record with no
+  answer (a `tool_use` with no `tool_result`, or a user record with no assistant
+  reply), and whether a foreground tool call writes nothing while it runs.
+- **The background-work checks of A13**: which descendants a session has when idle (MCP
+  servers, the Monitor, anything else), so that the rest can be read as work.
+- **`SIGSTOP` on the Monitor's `tail`**: that Claude Code does not react to a stopped
+  Monitor, and that `SIGCONT` delivers the lines appended meanwhile as ordinary events.
+- **`CLAUDE_CODE_SESSION_ID`** beyond the one observation in findings.md, which
+  self-adoption (B) would read.
 - **What `claude --resume` does when the conversation is already open in another
   process.** `claude --help` (2.1.283) says only that `--bg --resume` "starts a copy and
   says so when the session is already running".

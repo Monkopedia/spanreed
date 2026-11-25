@@ -157,16 +157,27 @@ design doc is written as if every recommendation is taken.
 - **A1. Which handover.** (A) Refuse while the session is live, so someone ends it and then
   adopts. (B) The session adopts itself, and a waiter at generation 0 takes over when it exits.
   (C) `create` ends the live session itself and commits, in one bounded call. *Recommendation:*
-  C for v1 and the pilots. It has no gap for mail and no double run, and no process outlives
-  the command. A is the same command when the session has already exited. B can come later as
+  C for v1 and the pilots. No mail goes unseen and there is no double run, and no process
+  outlives the command. It does not fully rule out ending a turn that is handling mail: see
+  A2. A is the same command when the session has already exited. B can come later as
   "C, run detached once the current turn ends", if agents should put themselves to sleep. B
   needs its own marker, because the orphan rule as built reports every send as a wake failure.
   It also has no way to see the live session's turns, because its hooks don't report them.
-- **A2. Ending a live session: opt-in, and only when idle.** *Recommendation:* end it only with
-  `--end-session`, and otherwise refuse while it is live. Even with the flag, refuse while the
-  transcript has been written in the last 60 s. That is a guard against accidents, which fails
-  toward refusing. SIGTERM mid-turn is unmeasured (Test 8 was at idle), and it stops background
-  work, as `request_sleep` does (decision 7). Claude Code's `sessions/<pid>.json` `status`
+- **A2. Ending a live session: opt-in, only when idle, and what to do if it stops being
+  idle.** The live Monitor keeps delivering mail during the handover, so a single idle check
+  at the start can pass and a turn can then start and be cut off by SIGTERM. If that turn
+  already has an assistant record, its message counts as read and is not replayed.
+  *Recommendation:* (1) end it only with `--end-session`, and otherwise refuse while it is
+  live. (2) Before anything else, require idle: transcript unwritten for 60 s and its last
+  record ending a turn. (3) After writing the record, stop the live Monitor with `SIGSTOP`, so
+  no new mail can start a turn, wait 10 s, and check idle again. (4) **If it is not idle, abort**:
+  `SIGCONT` the Monitor (it then delivers what arrived), delete the record, and exit non-zero.
+  The alternative to (4) is to wait, bounded, for the turn to end and check again; it is more
+  likely to succeed, but leaves the session deaf to mail for as long as it waits. Even with
+  all of this, a turn that runs undetected (a long foreground tool call that writes nothing,
+  or a turn started by a person typing in the pane in the last moment) can still be cut off,
+  so the design claims "no message goes unseen", not "no message is interrupted". SIGTERM
+  mid-turn is unmeasured (Test 8 was at idle). Claude Code's `sessions/<pid>.json` `status`
   (`busy`/`shell`) might be a better idle signal, but it is undocumented and unmeasured.
 - **A3. CLI shape.** *Recommendation:* both forms. `--session-id`/`--agent-id` (with `--name`
   and `--cwd`) is the primitive. `--adopt AGENT` fills them in from the agent's registry row and
@@ -174,15 +185,20 @@ design doc is written as if every recommendation is taken.
   `pid_start`. If that doesn't work, it refuses and asks for the explicit flags. It never copies
   the permission mode (decision 2), the model or `claude_args`, and it prints what it took.
 - **A4. `read_through` when the transcript shows no delivery at all**, for example a
-  conversation just after `/clear`. *Recommendation:* start after the last inbox line older than
-  the transcript's first record. Mail from before the conversation is history, and mail during
-  it without a delivery is replayed. The alternative, the end of the inbox, could lose mail that
-  arrived during the handover.
+  conversation just after `/clear`. *Recommendation:* start after the last inbox line, up to the
+  snapshot `S` (A5), that was stamped on this host and whose `ts` is older than the
+  transcript's first record. Mail from before the conversation is history, and mail during it
+  without a delivery is replayed. Lines relayed from a peer carry the sending machine's clock,
+  so their `ts` is never compared; they are placed by their position in the file. The
+  alternative, the end of the inbox, could lose mail that arrived during the handover.
 - **A5. Undelivered lines before the high-water mark.** These are mail the live session missed
-  while awake, mostly to the Monitor's ~3 KB batch cut. *Recommendation:* treat them as history,
-  as the request's "mail after that line is unread" implies, and have `create` list them by line
-  and `msg_id` so a person can forward them. Replaying them would also bring back mail from
-  earlier conversations under the same id.
+  while awake, mostly to the Monitor's ~3 KB batch cut. The request does not address this;
+  the recommendation is the author's. *Recommendation:* treat them as history, and have
+  `create` list them by line and `msg_id` so a person can forward them. Replaying them would
+  also bring back mail from earlier conversations under the same id. **This applies only up
+  to the inbox snapshot `S` taken when `create` starts.** A line that arrives after `S` is
+  never history, even if a later line was delivered, so mail dropped during the handover is
+  replayed rather than buried.
 - **A6. Waking at adoption.** `create` launches nothing today (a stage-1 call by the author).
   *Recommendation:* an adoption that finds unread mail after `read_through` wakes the sleeper
   straight away, through the ordinary wake path. Otherwise mail from the handover waits for the
@@ -203,7 +219,10 @@ design doc is written as if every recommendation is taken.
 - **A9. A hand-run `claude --resume` of a sleeper's conversation.** *Recommendation:* before
   every launch, also refuse when a live pid's `~/.claude/sessions/<pid>.json` names the record's
   session id, the same way the orphan rule refuses. This applies to all sleepers. It is
-  best-effort, because the file is internal, and it is never the only guard.
+  best-effort, because the file is internal, and it is never the only guard. Adoption runs it
+  too, together with a check that no other process is tailing the id's inbox (and, for a
+  cwd-derived id, that no other live session has that cwd). That covers a second session that
+  is already running when the agent is adopted, which A8 does not.
 - **A10. The adopted agent loses its shell environment**, `SSH_AUTH_SOCK` included. That is the
   sleeper allowlist ("Environment"), and the gap is already known. But a repo agent that used to
   push over ssh stops being able to. *Recommendation:* accept it for the pilots and check first
@@ -214,6 +233,26 @@ design doc is written as if every recommendation is taken.
   past what decision 4 of #86 covered.
 - **A12. What the replaced row keeps (minor).** *Recommendation:* keep the display name (from the
   record) and the focus, and clear the status, as any re-registration does.
+- **A13. May adoption stop background work, or must it wait for it?** Decision 7 lets
+  background work be stopped only when the agent itself asks to sleep (`request_sleep`); the
+  idle timeout never stops anything. Adoption is an outside actor ending the session without
+  the agent asking, which is closer to the idle-timeout case, but decision 7 did not consider
+  it. *Recommendation:* wait. Refuse to adopt while background work is seen, and say what was
+  seen. Detection is weak and best-effort: the live session has no `Stop.background_tasks`
+  (its hooks don't report turns), a background shell writes nothing to the transcript until it
+  ends, and subagents write only to `<session>/subagents/agent-*.jsonl`. So `create` looks at
+  the session's descendant processes (anything but its MCP servers and Monitor) and at recent
+  writes to its subagent transcripts. A subagent waiting on a long model call can still look
+  idle. The alternative is a `--stop-background` flag that stops it, as `request_sleep` does,
+  and logs what was stopped.
+- **A14. Who may run `--end-session`?** No command today ends another agent's live session.
+  With it, the coordinator (or any process running as the user) can end any idle local agent.
+  Spanreed cannot enforce who runs a CLI command (decision 7). *Recommendation:* the owner, or
+  an agent acting on the owner's instruction that names the target agent; the coordinator does
+  not adopt on its own initiative. `create` records the caller's asserted identity in the
+  record and the activity log. It refuses when the caller is inside the target session
+  (that is self-adoption, B). Where that rule lives (fleet policy, the coordinator's
+  instructions) is for the owner.
 
 ## Out-of-scope (for now)
 

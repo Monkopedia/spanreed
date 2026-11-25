@@ -597,3 +597,34 @@ For `sleeper create --trust`. Claude Code 2.1.283, kaladin.
 Not measured: a session rewriting the file at the same moment (unit-tested only,
 by simulating the write); `CLAUDE_CONFIG_DIR`; macOS.
 
+
+## Observations for adopting a running agent (2026-11-25)
+
+Looked at on kaladin, Claude Code 2.1.283, while designing "Adopting a running agent"
+(architecture.md, PR #129). Observations of the live machine, not experiments. Those
+marked *review* were measured by the reviewer of #129 (review 6061036209).
+
+- **The pilots.** From the registry and `~/.claude/sessions/<pid>.json`. Each id is
+  derived from its cwd, each display name is the directory's basename, and each runs
+  interactively in a pane of the owner's own `claude` tmux session. Each had exactly one
+  live session file (*review*).
+
+  | agent | id | cwd |
+  |---|---|---|
+  | hauler | `agent-eac78acd` | `~/git/hauler` |
+  | sdbus-kotlin | `agent-f65be093` | `~/git/sdbus-kotlin` |
+  | lsp-kotlin | `agent-eccec404` | `~/git/lsp-kotlin` |
+
+- **`~/.claude/sessions/<pid>.json`**, one per running `claude`, is not documented. Its
+  fields include `sessionId`, `cwd`, `procStart` and `status`. `procStart` equals
+  `/proc/<pid>/stat` field 22, and so equals a registry row's `pid_start` for the same pid.
+  `status` was seen as `busy` and `shell`; what each means was not checked.
+- **`CLAUDE_CODE_SESSION_ID`** is set in the Bash tool's environment, and a subagent sees
+  its parent's.
+- **Subagent transcripts** go to `~/.claude/projects/<project>/<session-id>/subagents/agent-*.jsonl`,
+  not to the session's own transcript (*review*; the directory layout also seen
+  here).
+- **A background shell writes nothing to the transcript until it ends** (*review*).
+
+Not checked: whether a session file is removed at exit, whether its `sessionId` changes
+after `/clear`, and whether its `cwd` follows the session or stays where it started.
