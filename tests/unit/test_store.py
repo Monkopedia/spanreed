@@ -1078,6 +1078,41 @@ class TestDeliveryVerdict:
             store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="late")
         assert f"(pid {me}, role connect) shut down cleanly" in str(excinfo.value)
 
+    def test_a_row_is_refused_once_its_bridge_is_marked_stopping(self, store: StateStore) -> None:
+        """#122: between the stopping mark and the row clear, the row and its live
+        owner are still there, but the link reads stopped. The resolver must
+        refuse, as the verdict and protocol.md's table say."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        store.write_peer_link(_peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start))
+        _mirror(store, "adolin", me, me_start)
+        store.mark_peer_links_stopping(me, me_start)  # rows not cleared yet
+        with pytest.raises(ValueError) as excinfo:
+            store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="late")
+        assert str(excinfo.value).startswith("'agent-r@adolin' is a mirrored entry")
+        assert f"(pid {me}, role connect) shut down cleanly" in str(excinfo.value)
+        assert store.recv_messages("agent-r@adolin") == []
+
+    def test_a_row_another_live_bridge_owns_is_accepted_while_the_record_stops(
+        self, store: StateStore
+    ) -> None:
+        """#127 review: with conjoin running both ways, this host's connect
+        bridge and the peer's serve bridge share ``peers/adolin.json``. The
+        record's connect owner exiting must not refuse rows the live serve
+        bridge mirrored, which it forwards."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        serve = subprocess.Popen(["sleep", "30"])
+        try:
+            serve_start = store_module.pid_start_time(serve.pid)
+            store.write_peer_link(_peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start))
+            _mirror(store, "adolin", serve.pid, serve_start)
+            store.mark_peer_links_stopping(me, me_start)
+            store.clear_agents_owned_by(me, me_start)
+            msg = store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="hi")
+        finally:
+            serve.kill()
+            serve.wait()
+        assert [m.msg_id for m in store.recv_messages("agent-r@adolin")] == [msg.msg_id]
+
     def test_an_attached_bridge_with_no_row_does_not_claim_the_recipient_was_live(
         self, store: StateStore
     ) -> None:
@@ -1123,6 +1158,32 @@ class TestStoppingAt:
         found = store.read_peer_link("adolin")
         assert found is not None and found.stopping_at is not None
         assert found.note == "late junk line"
+
+    def test_mark_does_not_lose_a_note_written_during_it(
+        self, store: StateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#122: the reader thread persisting a note between the mark's read and
+        its write must not be overwritten by the copy read before it."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        link = _peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start)
+        store.write_peer_link(link)
+        noted = link.model_copy(update={"note": "written mid-mark"})
+        writer = threading.Thread(target=store.write_peer_link, args=(noted,))
+        real_list = store.list_peer_links
+
+        def list_then_race() -> list[PeerLink]:
+            links = real_list()
+            if not writer.is_alive() and writer.ident is None:
+                writer.start()
+                writer.join(timeout=0.5)  # blocks on the lock when the mark holds it
+            return links
+
+        monkeypatch.setattr(store, "list_peer_links", list_then_race)
+        store.mark_peer_links_stopping(me, me_start)
+        writer.join()
+        found = store.read_peer_link("adolin")
+        assert found is not None and found.stopping_at is not None
+        assert found.note == "written mid-mark"
 
     def test_a_new_conjoin_overwrites_it(self, store: StateStore) -> None:
         me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
