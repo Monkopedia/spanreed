@@ -198,7 +198,7 @@ Resolution, in order:
 - `true` — a live local session is tailing that inbox, or (for a mirrored `<id>@<host>` inbox) an attached bridge will forward it.
 - `false` — the message is **queued**. The recipient's session has exited, or the `conjoin` for its host is running but reconnecting (`delivery` begins `QUEUED, BRIDGE RECONNECTING` and says when the link dropped and when it last connected). `delivery` explains which.
 
-A send to a host with no `conjoin` running is refused at resolution (above), so it never reaches a verdict. The one exception is a bridge that stops between the append and the verdict, which reads `NOT DELIVERED: NO BRIDGE IS RUNNING` ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
+A send to a host with no `conjoin` running is refused at resolution (above), so it never reaches a verdict. The one exception is a `conjoin` that stops between the append and the verdict. Whether it was killed (its rows linger with a dead owner) or exited cleanly (its exit already removed them), the verdict is judged by the host's bridge, not by the row, and reads `NOT DELIVERED: NO BRIDGE IS RUNNING`: the message waits in the outbound `inboxes/<id>@<host>.jsonl` and goes out when the next `conjoin` to that host attaches, because a bridge forwards every `*@<host>` inbox whether or not a registry row names it ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
 
 Queuing rather than refusing is deliberate: a restarting session picks its mail up. Reporting that as plain success is not — the CLI exits **3** for it (`spanreed send`), and the MCP tool's docstring directs the agent to check the flag and say "queued" rather than "sent".
 

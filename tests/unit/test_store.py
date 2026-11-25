@@ -976,7 +976,7 @@ class TestDeliveryVerdict:
         live, detail = store.delivery_verdict("agent-r@adolin")
         assert not live
         assert detail.startswith("NOT DELIVERED: NO BRIDGE IS RUNNING to 'adolin'")
-        assert "unless a bridge to 'adolin' is started again" in detail
+        assert "until a bridge to 'adolin' is started again" in detail
 
     def test_a_mirrored_agent_behind_a_reconnecting_bridge_is_queued(
         self, store: StateStore
@@ -1016,6 +1016,35 @@ class TestDeliveryVerdict:
         live, detail = store.delivery_verdict("agent-r@adolin")
         assert not live
         assert detail.startswith("NOT DELIVERED: NO BRIDGE IS RUNNING to 'adolin'")
+
+    def test_a_conjoin_that_exits_cleanly_after_the_send_leaves_the_mail_queued(
+        self, store: StateStore
+    ) -> None:
+        """PR #120 review: a clean exit clears the rows before the verdict runs.
+
+        The message is still in the outbound inbox, which the next `conjoin` to
+        that host forwards, so it must not be called unreadable."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        store.write_peer_link(_peer_link("adolin"))
+        _mirror(store, "adolin", me, me_start)
+        msg = store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="raced")
+        # conjoin exits cleanly: reconnect_loop clears its rows, the link records
+        # its detach, and the process is gone.
+        store.clear_agents_owned_by(me, me_start)
+        store.write_peer_link(
+            _peer_link(
+                "adolin",
+                bridge_pid=_dead_pid(),
+                bridge_pid_start=None,
+                detached_at=datetime.now(UTC),
+            )
+        )
+        live, detail = store.delivery_verdict("agent-r@adolin")
+        assert not live
+        assert detail.startswith("NOT DELIVERED: NO BRIDGE IS RUNNING to 'adolin'")
+        assert "goes out when the next `spanreed conjoin adolin` attaches" in detail
+        assert "registers under exactly that id" not in detail
+        assert [m.msg_id for m in store.recv_messages("agent-r@adolin")] == [msg.msg_id]
 
 
 def _mirror(store: StateStore, host: str, owner_pid: int, owner_pid_start: int | None) -> None:

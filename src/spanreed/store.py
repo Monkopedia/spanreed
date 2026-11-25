@@ -836,8 +836,8 @@ class StateStore:
             f"{to_agent!r} is a mirrored entry for host {host!r}, and there is no bridge "
             f"running to deliver it. " + why + f"Refusing rather than queuing: mail for "
             f"another host is accepted only while a `spanreed conjoin` for that host is "
-            f"running, connected or reconnecting, because nothing else will ever forward "
-            f"it. This row is left over from that process and says nothing about whether "
+            f"running, connected or reconnecting, because nothing forwards it until one is "
+            f"started again. This row is left over from that process and says nothing about whether "
             f"the agent on {host!r} is running. Restart the bridge with `spanreed conjoin "
             f"{host}` and send again once it has synced; `spanreed list` shows every peer "
             f"and its state."
@@ -863,7 +863,7 @@ class StateStore:
         entry = next(
             (a for a in self.list_agents(include_stale=True) if a.agent_id == agent_id), None
         )
-        if entry is None:
+        if entry is None and "@" not in agent_id:
             return False, (
                 f"NOT DELIVERED TO A LIVE SESSION: nothing is registered as {agent_id!r} "
                 f"on this bus, so the message sits in inboxes/{agent_id}.jsonl with no "
@@ -874,16 +874,21 @@ class StateStore:
         if record is not None:
             return self._sleeper_verdict(record)
         _, _, host = agent_id.rpartition("@")
+        # A host-qualified id is judged by its bridge even with no row: a
+        # `conjoin` that exits cleanly between the append and this verdict has
+        # already cleared its rows, yet the next `conjoin` to that host
+        # forwards every `*@<host>` inbox regardless of the registry.
         if "@" in agent_id:
             link = self.read_peer_link(host) if _HOST_FILENAME_RE.fullmatch(host) else None
             state = peer_link_state(link) if link is not None else "stopped"
             if link is None or state == "stopped":
                 return False, (
-                    f"NOT DELIVERED: NO BRIDGE IS RUNNING to {host!r}. {agent_id!r} is a "
-                    f"mirrored entry for that host, but no `spanreed conjoin` process for "
-                    f"it is running now, so nothing will forward the message from "
-                    f"inboxes/{agent_id}.jsonl unless a bridge to {host!r} is started "
-                    f"again. Do not wait on a reply."
+                    f"NOT DELIVERED: NO BRIDGE IS RUNNING to {host!r}. {agent_id!r} is "
+                    f"addressed to that host, but no `spanreed conjoin` process for it is "
+                    f"running now. The message waits in the outbound inbox "
+                    f"inboxes/{agent_id}.jsonl and goes out when the next `spanreed "
+                    f"conjoin {host}` attaches; until a bridge to {host!r} is started "
+                    f"again, nothing forwards it. Do not wait on a reply."
                 )
             if state == "reconnecting":
                 return False, (
@@ -901,6 +906,7 @@ class StateStore:
                 f"that snapshot is the only evidence this host has of it, so delivery "
                 f"beyond the bridge is not confirmed here."
             )
+        assert entry is not None  # a bare id with no row returned above
         if is_stale(entry):
             return False, (
                 f"NOT DELIVERED TO A LIVE SESSION: {agent_id} ({entry.name}) is in the "
