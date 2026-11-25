@@ -29,6 +29,12 @@ record". It is written atomically (temp file, then rename) under `<name>.lock`. 
 outlives a `retire`: a process blocked on the old file would otherwise go on to act on a sleeper
 that a new `create` had locked through a new one.
 
+The file is named after the sleeper's **name**, not its id. Today the record's `agent_id` is always
+`agent-<name>`. An adopted record (designed, not built; `architecture.md`, "Adopting a running
+agent") keeps the id it had, such as `agent-eac78acd` under the name `hauler`. So a reader that
+goes from an id to a record must match the record's `agent_id` field, and never derive a file
+name from the id.
+
 `sleeper-ops/` and `logs/sleeper-ops.jsonl` belong to managing sleepers over `conjoin`
 (#86), which is designed but not built. Their file states, the idempotency record and the
 audit line are specified in [`architecture.md`](architecture.md#managing-a-peers-sleepers-over-conjoin-86).
@@ -119,6 +125,11 @@ JSON keys match Python field names exactly (no aliasing) — `from` is reserved 
 ### `cursors/<session_id>`
 
 Plain text file containing the last-delivered `msg_id` for this session. Used on session restart to replay any messages that arrived while the session was down.
+
+Despite the name, **no Claude session writes one.** The writers are Codex workers (keyed by agent
+id) and `conjoin` bridges (keyed `.bridge.<inbox>`). A Claude session's Monitor is `tail -n 0`, and
+a sleeper replays from its record's `read_through`, which is checked against the transcript. So
+adopting a running agent as a sleeper has no cursor to take over, and leaves this directory alone.
 
 ### `peers/<host>.json` — peer records
 
@@ -305,6 +316,8 @@ Agents are addressed by `agent_id`. An id is **minted** from the directory a ses
 - Default: `agent_id = "agent-" + sha256(absolute_cwd)[:8]`. Display name = basename of cwd.
 - Override: `SPANREED_AGENT_NAME` env var → `agent_id = "agent-<name>"`, display name = `<name>`. The resulting id must be legal (see **Agent id syntax** below); an override containing `@`, `/`, or a space is refused at derivation rather than producing an id that later misroutes.
 
+**Designed, not built (adopting a running agent, open question A7):** a sleeper's runner also sets `SPANREED_AGENT_ID`, which outranks `SPANREED_AGENT_NAME`, so an adopted sleeper whose id is not `agent-<name>` comes back under its own id. It must be a legal unqualified id. For every other sleeper it equals `agent-<name>`, so nothing changes.
+
 v1 limitation: two Claude Code sessions started in the same cwd share an agent — fine for the typical one-session-per-repo workflow.
 
 ### Resolving (every other command)
@@ -413,6 +426,7 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed log [--since AGE] [--agent ID\|NAME]` | Dump the activity log as JSON lines |
 | `spanreed codex --name N --cwd DIR [--model M] [--effort E] [--mode MODE] [--instructions TEXT]` | Run a Codex worker: a headless bus agent that turns inbound mail into `codex` turns. `--cwd` is required and has no default. |
 | `spanreed sleeper create --name N --cwd DIR --permission-mode MODE [--model M] [--idle-timeout T] [--trust] [-- CLAUDE_ARGS...]` | Record a sleeper. Anything after `--` is stored as `claude_args` and passed to `claude` verbatim on every launch, after spanreed's own flags; only allowlisted flags are accepted (note that `--debug-file` writes wherever its path points, with the user's permissions; `--mcp-config`, `--strict-mcp-config`, `--append-system-prompt`, `--append-system-prompt-file`, `--system-prompt`, `--disallowed-tools`, `--effort`, `--fallback-model`, `--verbose`, `--debug-file`, `--name`), each with the number of values it takes. Anything else, including a bare word, is refused. It starts asleep and nothing is launched until its first mail or `wake`. `--trust` first marks `DIR` trusted in Claude Code's state file (`projects.<DIR>.hasTrustDialogAccepted`), so the first launch is not stopped by its trust dialog; without it, an untrusted `DIR` is warned about here and in `sleeper list`. Resolves `claude` and `spanreed` on the caller's PATH, for every later launch. Refuses a name held by a present agent's id or display name, or by an existing sleeper |
+| `spanreed sleeper create --adopt AGENT [--end-session] --permission-mode MODE [--name N] [...]`<br>`spanreed sleeper create --name N --cwd DIR --session-id UUID [--agent-id ID] --permission-mode MODE [...]` | *Designed, not built.* Make a running or recently running agent a sleeper, keeping its conversation (`--session-id`: the first launch is `--resume`) and its bus id (`--agent-id`: inbox and addresses unchanged). `--adopt` reads the id, name, session id and cwd from the agent's registry row and Claude Code's `~/.claude/sessions/<pid>.json`, and prints them. Never the permission mode, which is required as on every create. The transcript must exist and be readable, and its cwd must match `--cwd`. A live session is ended (SIGTERM, then SIGKILL) only with `--end-session`, after the record is written, so no mail falls between the two. `read_through` starts after the last inbox line the transcript shows as delivered, and anything later is replayed. Refused with `--host`. See `architecture.md`, "Adopting a running agent" |
 | `spanreed sleeper list [--json]` | Every sleeper's record: state (`ASLEEP`, `AWAKE`, `SLEEPING`, with `(runner dead)` when its runner is gone), settings, last wake failure, skipped lines |
 | `spanreed sleeper retire N` | Delete an asleep sleeper's record and row. Its inbox is kept |
 | `spanreed sleeper wake N` | Wake it by hand, by the same path a message takes. Exit 1 if the wake failed (the reason is printed and recorded) |

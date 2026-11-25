@@ -146,6 +146,75 @@ Still open:
   shipped and been used. Turning it on by default would also turn on what "What turning it on
   grants" describes, for every user who runs `conjoin`.
 
+## Adopting a running agent as a sleeper (designed, not built)
+
+Design in [`architecture.md`](architecture.md#adopting-a-running-agent). The request came from
+the owner on 2026-11-25, as main-coordinator relayed it. It settles three things: the adopted
+conversation is resumed, the bus id is kept (not shown as hex), and the handover has no double run
+and no missed mail. Each question below is open, and each has the author's recommendation. The
+design doc is written as if every recommendation is taken.
+
+- **A1. Which handover.** (A) Refuse while the session is live, so someone ends it and then
+  adopts. (B) The session adopts itself, and a waiter at generation 0 takes over when it exits.
+  (C) `create` ends the live session itself and commits, in one bounded call. *Recommendation:*
+  C for v1 and the pilots. It has no gap for mail and no double run, and no process outlives
+  the command. A is the same command when the session has already exited. B can come later as
+  "C, run detached once the current turn ends", if agents should put themselves to sleep. B
+  needs its own marker, because the orphan rule as built reports every send as a wake failure.
+  It also has no way to see the live session's turns, because its hooks don't report them.
+- **A2. Ending a live session: opt-in, and only when idle.** *Recommendation:* end it only with
+  `--end-session`, and otherwise refuse while it is live. Even with the flag, refuse while the
+  transcript has been written in the last 60 s. That is a guard against accidents, which fails
+  toward refusing. SIGTERM mid-turn is unmeasured (Test 8 was at idle), and it stops background
+  work, as `request_sleep` does (decision 7). Claude Code's `sessions/<pid>.json` `status`
+  (`busy`/`shell`) might be a better idle signal, but it is undocumented and unmeasured.
+- **A3. CLI shape.** *Recommendation:* both forms. `--session-id`/`--agent-id` (with `--name`
+  and `--cwd`) is the primitive. `--adopt AGENT` fills them in from the agent's registry row and
+  Claude Code's `~/.claude/sessions/<pid>.json`, used only when `procStart` matches the row's
+  `pid_start`. If that doesn't work, it refuses and asks for the explicit flags. It never copies
+  the permission mode (decision 2), the model or `claude_args`, and it prints what it took.
+- **A4. `read_through` when the transcript shows no delivery at all**, for example a
+  conversation just after `/clear`. *Recommendation:* start after the last inbox line older than
+  the transcript's first record. Mail from before the conversation is history, and mail during
+  it without a delivery is replayed. The alternative, the end of the inbox, could lose mail that
+  arrived during the handover.
+- **A5. Undelivered lines before the high-water mark.** These are mail the live session missed
+  while awake, mostly to the Monitor's ~3 KB batch cut. *Recommendation:* treat them as history,
+  as the request's "mail after that line is unread" implies, and have `create` list them by line
+  and `msg_id` so a person can forward them. Replaying them would also bring back mail from
+  earlier conversations under the same id.
+- **A6. Waking at adoption.** `create` launches nothing today (a stage-1 call by the author).
+  *Recommendation:* an adoption that finds unread mail after `read_through` wakes the sleeper
+  straight away, through the ordinary wake path. Otherwise mail from the handover waits for the
+  next send.
+- **A7. How a woken adopted sleeper knows its id.** *Recommendation:* the runner sets a new
+  `SPANREED_AGENT_ID`, which outranks `SPANREED_AGENT_NAME` when an identity is minted. It is
+  validated, unqualified, and set on every launch; for a record whose id is `agent-<name>` it
+  equals what is minted today. The alternative is to read the id from the record whenever
+  `SPANREED_SLEEPER=1`. That would make minting depend on shared state. Either way it grants
+  nothing new: `SPANREED_AGENT_NAME` can already mint any `agent-<x>`.
+- **A8. A new session in the sleeper's directory takes its id.** All three pilots have ids
+  derived from their cwd, so plain `claude` in `~/git/hauler` mints `agent-eac78acd`. The
+  SessionStart upsert puts it on the sleeper's row, and two conversations then answer the same
+  mail. This exists for every sleeper today, but it is hard to reach. *Recommendation:*
+  `session-start` and `inbox-watch`, in a session without `SPANREED_SLEEPER`, refuse an id that a
+  local sleeper record holds. The session stays off the bus, and its context says why and how to
+  join under another name.
+- **A9. A hand-run `claude --resume` of a sleeper's conversation.** *Recommendation:* before
+  every launch, also refuse when a live pid's `~/.claude/sessions/<pid>.json` names the record's
+  session id, the same way the orphan rule refuses. This applies to all sleepers. It is
+  best-effort, because the file is internal, and it is never the only guard.
+- **A10. The adopted agent loses its shell environment**, `SSH_AUTH_SOCK` included. That is the
+  sleeper allowlist ("Environment"), and the gap is already known. But a repo agent that used to
+  push over ssh stops being able to. *Recommendation:* accept it for the pilots and check first
+  whether hauler, sdbus-kotlin and lsp-kotlin push over ssh. A per-sleeper environment
+  passthrough would be a separate decision.
+- **A11. Adopting over `conjoin`.** *Recommendation:* refuse the adopt flags with `--host` in
+  v1. Remote management (#86) is not built, and ending a session on another machine is a step
+  past what decision 4 of #86 covered.
+- **A12. What the replaced row keeps (minor).** *Recommendation:* keep the display name (from the
+  record) and the focus, and clear the status, as any re-registration does.
+
 ## Out-of-scope (for now)
 
 - Persistence across machine reboots
