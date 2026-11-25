@@ -106,6 +106,46 @@ Still open:
 - **`list_agents` does not mark a reconnecting peer's agents** (from #34, recommendation: leave as is). While `conjoin` reconnects, the peer's mirrored rows read as live in `list_agents`, because the decision keeps them addressable. Nothing on the `Agent` record says the link is down; `list_peers`, `spanreed list` (`RECONNECTING`) and the send verdict do. Recommendation: leave the record unchanged, since the send verdict already tells the sender the mail is only queued.
 - **A peer that comes back under a different host label** (from #34, recommendation: accept). `conjoin` owns every row it mirrored, under every label a peer has declared to it, until it exits. If the peer reconnects under a new `--label` or hostname, the old label's rows stay addressable and queue mail nothing will forward until `conjoin` exits. Recommendation: accept; relabelling a peer mid-run is rare and restarting `conjoin` clears it.
 
+## Remote sleeper management (#86, designed, not built)
+
+Design in [`architecture.md`](architecture.md#managing-a-peers-sleepers-over-conjoin-86), wire
+format in [`protocol.md`](protocol.md#pipe-frames). The owner's decisions of 2026-11-25 are
+recorded there, under "Decisions", with the words that are his marked as his. They settled the
+carrier (frames over `conjoin`), the grant (one per-machine switch,
+`spanreed sleeper remote-access on|off|show`, off by default), and the first draft's R1, R2 and
+R5 to R8; R3 and R4 were superseded by the single switch. No cap on a remote create beyond a
+local one, and a person at a terminal to turn the switch on, come from a design summary the
+author proposed and the owner answered "yes" (14:47:09Z); the summary is quoted on #86, in the
+comment of 2026-11-25 14:59.
+
+Decided after review of #119:
+
+- **R9. The numbers behind request expiry.** The owner answered "recs fine" to the
+  recommendations (#86, comment of 2026-11-25 14:54): `--timeout` is capped at 600 s, which is
+  also the longest a request lives; the clock allowance for skew between the two hosts is a
+  fixed 30 s; and expiry is checked again when a queued request starts, answering `expired`
+  instead of running it.
+- **R10. The TTY check on `remote-access on`.** Accepted for v1 ("recs fine", same comment), and
+  stated as protection against **accidents, not a boundary against agents**. The switch is a
+  key in `config.json` that any process running as the user can write directly, without the
+  command; and the command itself can be driven through `tmux send-keys` or `script(1)`. Asked
+  whether to accept that, the owner: "I mean this is true of all things, claude can rewrite its
+  own settings in the right environment, this is how the agentic world works and there's no
+  inherent way around it without crazy security controls" (#86, comment of 2026-11-25 14:59).
+  Nothing stronger, such as a root-owned file, is added. `architecture.md`, decision 7.
+- **What the grant amounts to.** In the spanreed session (his words, recorded on #119 by the
+  coder in the comment of 2026-11-25 15:39), the owner called it roughly equivalent to the ssh access a conjoin implies, but bidirectional, and
+  "this is expected"; and said trust is transitive across the conjoin graph, without changing the
+  model: "when you conjoin with someone, you trust their entire bus/network". `architecture.md`,
+  decisions 9 and 10.
+
+Still open:
+
+- **Default-on after a few releases?** Deferred by the owner on 2026-11-25: "that sounds fine for
+  now, maybe after a few releases we turn it on by default". Revisit once remote management has
+  shipped and been used. Turning it on by default would also turn on what "What turning it on
+  grants" describes, for every user who runs `conjoin`.
+
 ## Out-of-scope (for now)
 
 - Persistence across machine reboots
