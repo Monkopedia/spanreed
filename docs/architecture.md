@@ -1898,6 +1898,9 @@ and no `Stop.background_tasks` (it has no `SPANREED_SLEEPER`), so `create` has t
      does not depend on Claude Code's internal files.
    - **The caller is not a descendant of the session.** Step 5 would signal the
      `create` process itself. Self-adoption is shape B.
+   - **No pending abort report under this name** (`listing: pending`, "The abort
+     path"). Committing would remove a report whose listing was never made; `create`
+     names `spanreed sleeper adopt --recover NAME`, which finishes it.
    - **The session looks idle** (A2): its transcript has not been written in the last
      60 s, and its last record ends a turn (no `tool_use` waiting for its result, no
      user record waiting for a reply).
@@ -2069,8 +2072,13 @@ outside the session, to make `tail` deliver them one at a time. So the abort pat
 not promise delivery. It promises that every line is accounted for:
 
 1. `SIGCONT` the Monitor (if step 3 stopped one).
-2. Under the lock, delete the record. That removes the sleeper marker and leaves the live
-   row as it was.
+2. Under the lock, first write the **abort report**, `sleepers/<name>.adopt-aborted.json`,
+   marked `listing: pending`, with `S`, `F`, `adopted.frozen_monitor`, the transcript
+   path, the reason, the time, and the pid and start time of the process running the
+   abort; then, still under the lock, delete the record. That removes the sleeper marker
+   and leaves the live row as it was. The order matters: from the moment the record is
+   gone, the pending report is what names `S` and `F`, so a death during the wait below
+   leaves something that says the lines after `S` are unchecked.
 3. Wait `W` (recommended: 30 s, so the burst's turn has time to write a real assistant
    record). Then take the inbox's length as the **listing mark** `L`, and run the
    read-check on every line after `S` up to `L`. The listing starts at the inbox snapshot
@@ -2080,14 +2088,32 @@ not promise delivery. It promises that every line is accounted for:
 4. Report **every line after `S` up to `L`**, by line number, `msg_id`, sender and
    length, each marked "delivered" or "not shown as delivered", in three places: the
    command's output (when there is one; a recovery started by the wake path has none),
-   the activity log (rule 7), and an **abort report**, `sleepers/<name>.adopt-aborted.json`,
-   which `sleeper list` shows until it is dismissed (`spanreed sleeper adopt --dismiss
-   NAME`) or the next adoption under that name commits. The report holds `S`, `L`, the
-   reason, and the undelivered lines. It is a separate file because the record is gone
-   after step 2, and because the activity log is opt-in, so it alone would not reliably
-   reach a person. The report says that the undelivered lines are still in the inbox,
+   the activity log (rule 7), and the abort report, which step 4 completes: under the
+   lock, it rewrites the report with `listing: complete`, `L` and the undelivered lines.
+   `sleeper list` shows a complete report until it is dismissed (`spanreed sleeper adopt
+   --dismiss NAME`) or the next adoption under that name commits. It is a separate file
+   because the record is gone after step 2, and because the activity log is opt-in, so it
+   alone would not reliably reach a person. The report says that the undelivered lines are still in the inbox,
    where the agent's `recv_messages` can read them, and that a person can forward them.
    `create` then exits non-zero.
+
+**A pending report is never dropped.** If the process that wrote it is dead (pid and
+start time), whatever finds it finishes it: the read-check needs only the inbox and the
+transcript, both named in the report, so any process can do steps 3 and 4. A finisher
+first sends `SIGCONT` to `frozen_monitor` if its pid and start time still match (a no-op
+if step 1 already did it), waits out whatever is left of `W` since the report's time,
+then lists up to the inbox length it sees and completes the report under the lock, if it
+is still pending when re-read there (two finishers write the same account; the first
+wins). The finishers:
+- `sleeper list` shows every pending report as "listing not finished: lines after `S`
+  unchecked", with whether its writer is alive. If the writer is dead and `W` has passed,
+  `list` completes it before printing. It does not wait for `W`; a younger one is shown as
+  pending, with the command below.
+- `spanreed sleeper adopt --recover NAME`, with no record but a pending report whose
+  writer is dead, finishes it, waiting out `W`.
+- `--dismiss NAME` refuses a pending report and names `--recover`. A new adoption under
+  that name is refused at step 1 while a pending report exists, for the same reason: its
+  commit would remove a report whose listing was never made.
 
 Lines appended after `L` are not listed and need not be: the Monitor was resumed at
 step 1, and the burst it released ends before them, so each reaches the live session as
@@ -2139,12 +2165,14 @@ At a checkpoint with the flag set:
 
 A signal that arrives inside a locked window is therefore acted on at the next
 checkpoint, which follows the window's release directly. The windows are a record write
-and, in step 3, one `SIGSTOP`. A signal received after K5 (from the marker write on)
+and, in step 3, one `SIGSTOP`. A signal received after the K5 check
 comes too late to abort: the session is being ended. `create` finishes step 5 and the
 bounded commit, then exits with the signal's status (A15 (i)). A signal received while
 the abort path runs (from step 4's busy check or from a checkpoint) is recorded and
 changes nothing; the abort finishes and `create` exits non-zero. SIGKILL remains the way
-to stop `create` at once, and the recovery below covers it.
+to stop `create` at once, and the recovery below covers it. A SIGKILL during the abort
+path's wait leaves no record, but it does leave the pending abort report from step 2,
+which is finished as described under "The abort path".
 
 **Why this cannot deadlock.** The only code that takes the sleeper lock in `create` is
 its main line: steps 1, 2, 3.2–3.4, 5's marker write, 6, the K1/K2 deletion and the
@@ -2188,8 +2216,12 @@ A **recovery** finishes what `create` started. It branches on the phase marker:
   the recovery first re-runs step 4's idle and background-work checks, requiring no
   transcript write since the marker's time; whether it should, and what a busy result
   does, is A15 (iv). Then, if the session is still alive 15 s after the recovery's
-  SIGTERM, it sends SIGKILL, and then SIGKILL to every descendant in the marker still
-  running with an unchanged start time, as step 5 does. It then does step 6: under the lock, computes `read_through` against the now-complete transcript and
+  SIGTERM, it sends SIGKILL. **Whether or not `from_pid` was alive**, it then sends
+  SIGKILL to every descendant in the marker still running with an unchanged start time,
+  as step 5 does, and to `frozen_monitor` if its pid and start time still match, and
+  polls until they are gone. This covers the likeliest way into this branch: `create`
+  sent SIGTERM, was killed during its 15 s wait, and the session exited cleanly, leaving
+  the stopped `tail` (own process group, #88) holding the inbox open. It then does step 6: under the lock, computes `read_through` against the now-complete transcript and
   `S`, rewrites the row as a sleeper row, sets `asleep`, and wakes the sleeper through
   the ordinary wake path if any line after `read_through` is unread. Nothing is listed,
   because nothing aborted: the replay covers every line after `S`.
@@ -2228,7 +2260,22 @@ and returns at once (A15 is the choice):
 
 Either way, `spanreed sleeper adopt --recover NAME` can be run by hand. It runs in the
 foreground and prints what it does, and refuses while another recovery for the record
-is alive. `sleeper list` shows an interrupted adoption as such, with its phase (not yet
+is alive.
+
+**If the recovery is interrupted.** A recovery, hand-run or detached, installs the same
+record-only handler as `create`, for SIGINT, SIGTERM and SIGHUP, before it reads the
+record, so it too never acts on a signal while it holds the lock. It has one checkpoint,
+**R1**, after it reads the record and before it changes anything (no lock held): a flag
+found there ends it with the signal's status and leaves the record as it was, for the
+next recovery (by hand, or a wake falling back to (b)). After R1 it has started to act,
+and every branch runs to the end with the flag recorded and changing nothing, then exits
+with the signal's status: the abort branch because its wait is the account the abort
+promises, and the commit branches because, as with `create` after K5, the session is
+being or has been ended. A SIGHUP (a killed tmux session, or a closed terminal) means its
+output may have nowhere to go; it ignores errors writing to its terminal and relies on the
+activity log and the report. A SIGKILL is covered as for `create`: before step 2 of the
+abort path the record is still there for the next recovery, and after it the pending
+report is. `sleeper list` shows an interrupted adoption as such, with its phase (not yet
 frozen, frozen, or ending), whether a recovery is running, and how to start one. Until a
 recovery runs, a session in the frozen phase hears nothing.
 

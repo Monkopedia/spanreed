@@ -330,7 +330,9 @@ design doc is written as if every recommendation is taken.
   two; that the `frozen_monitor` write was not ordered before the `SIGSTOP`; and that the
   recovery ran its 30 s wait inside whichever sender triggered it. Revised again after
   review 6061584298, which found that a handler taking the sleeper lock could fire while
-  `create` already held it and wait on itself forever. The design now:
+  `create` already held it and wait on itself forever. Revised again after review
+  6061710901, which found that the abort deleted the record before writing its report,
+  so a death in the 30 s wait left nothing naming the unchecked lines. The design now:
   - `create` installs its SIGINT/SIGTERM/SIGHUP handler before it writes the record. The
     handler only records the signal; `create` acts on it at fixed checkpoints, all
     outside the lock (after step 2's release, before step 3 takes the lock, after step
@@ -343,12 +345,17 @@ design doc is written as if every recommendation is taken.
     and only that. Its **recovery** branches on the marker. With no marker and the
     session alive, it aborts: resume the recorded Monitor, delete the record, wait 30 s,
     list every line since `S`. With the marker, the session is ending: send it SIGTERM
-    (the recovery cannot tell whether `create` had), SIGKILL it and the recorded
-    descendants if it outlives 15 s from that SIGTERM, then complete the commit
+    (the recovery cannot tell whether `create` had), SIGKILL it if it outlives 15 s from
+    that SIGTERM, SIGKILL the recorded descendants and stopped Monitor whatever the
+    session's state, then complete the commit
     (`read_through`, `asleep`, wake if unread); the record is kept.
   - The listing of an abort goes to the activity log and an abort report,
     `sleepers/<name>.adopt-aborted.json`, which `sleeper list` shows until it is dismissed
-    or the next adoption commits; and to the output when there is one.
+    or the next adoption commits; and to the output when there is one. The report is
+    written as `listing: pending` before the record is deleted and completed after the
+    wait, so a death in the wait leaves it pending, and `sleeper list` or `--recover`
+    finishes it; a pending report is never dismissed. The recovery uses the same
+    record-only signal handler, acting on a signal only before it changes anything.
 
   Four points need a decision.
   (i) **A signal after the phase marker** cannot be undone, because the session is
