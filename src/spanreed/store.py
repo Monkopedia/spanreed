@@ -247,11 +247,6 @@ def peer_link_state(link: PeerLink) -> PeerLinkState:
     return "reconnecting" if link.role == "connect" else "stopped"
 
 
-def peer_link_is_attached(link: PeerLink) -> bool:
-    """True iff ``link``'s bridge is running with its link up. See :func:`peer_link_state`."""
-    return peer_link_state(link) == "attached"
-
-
 class AgentIdHeld(RuntimeError):
     """``register_agent(refuse_live_holder=True)`` found a live row it would take over."""
 

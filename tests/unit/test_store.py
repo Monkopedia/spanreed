@@ -16,7 +16,6 @@ from spanreed.protocol import Agent, Message, PeerLink
 from spanreed.store import (
     StateStore,
     format_age,
-    peer_link_is_attached,
     peer_link_state,
 )
 
@@ -158,7 +157,8 @@ class TestPidOneIsUnknown:
         start = store_module.pid_start_time(1)
         assert not store_module.process_is_alive(1, None)
         assert not store_module.process_is_alive(1, start)
-        assert not peer_link_is_attached(_peer_link("adolin", bridge_pid=1, bridge_pid_start=None))
+        link = _peer_link("adolin", bridge_pid=1, bridge_pid_start=None)
+        assert peer_link_state(link) == "stopped"
 
 
 class TestFocus:
@@ -819,21 +819,21 @@ class TestPeerLinks:
         assert store.read_peer_link("never-bridged") is None
 
     def test_attached_while_the_bridge_process_lives(self, store: StateStore) -> None:
-        assert peer_link_is_attached(_peer_link("adolin"))
+        assert peer_link_state(_peer_link("adolin")) == "attached"
 
     def test_detached_once_the_bridge_pid_is_gone(self, store: StateStore) -> None:
         link = _peer_link("adolin", bridge_pid=_dead_pid(), bridge_pid_start=None)
-        assert not peer_link_is_attached(link)
+        assert peer_link_state(link) != "attached"
 
     def test_detached_when_the_start_time_no_longer_matches(self, store: StateStore) -> None:
         """PID reuse: the pid is alive but belongs to something else now."""
         link = _peer_link("adolin", bridge_pid_start=-1)
-        assert not peer_link_is_attached(link)
+        assert peer_link_state(link) != "attached"
 
     def test_a_clean_teardown_is_detached_even_with_a_live_pid(self, store: StateStore) -> None:
         """``detached_at`` is authoritative — the same process may reconnect later."""
         link = _peer_link("adolin", detached_at=datetime.now(UTC))
-        assert not peer_link_is_attached(link)
+        assert peer_link_state(link) != "attached"
 
     def test_a_dropped_link_with_conjoin_still_running_is_reconnecting(
         self, store: StateStore
