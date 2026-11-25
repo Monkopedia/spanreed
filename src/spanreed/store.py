@@ -684,8 +684,12 @@ class StateStore:
           :meth:`delivery_verdict`.) The exception is a mirrored ``<id>@<host>``
           row whose owning bridge process is gone: no ``conjoin`` for that host
           is running, so nothing would ever forward the mail, and it is refused
-          (issue #34). A bridge that is only reconnecting keeps its process, and
-          so its rows, alive.
+          (issue #34). So is one whose host's peer record already reads
+          ``stopped`` while the row's owner still lives: a ``conjoin`` marks its
+          record stopping a few milliseconds before it clears its rows, and the
+          resolver must not accept what :meth:`delivery_verdict` then reports as
+          having no bridge (issue #122). A bridge that is only reconnecting keeps
+          its process, and so its rows, alive.
         - ``to_agent`` matches exactly one **live** agent's display name →
           resolve to that agent's id (``send_message("ksrpc", ...)`` works).
         - several live agents share the name → ambiguous, raise.
@@ -702,7 +706,7 @@ class StateStore:
         agents = self.list_agents(include_stale=True)
         exact = next((a for a in agents if a.agent_id == to_agent), None)
         if exact is not None:
-            if "@" in to_agent and is_stale(exact):
+            if "@" in to_agent and (is_stale(exact) or self._host_link_stopped(to_agent)):
                 raise ValueError(self._no_bridge_running_error(to_agent))
             return to_agent
         by_name = [a for a in agents if a.name == to_agent]
@@ -721,6 +725,12 @@ class StateStore:
         if by_name:
             raise ValueError(self._stale_name_error(to_agent, by_name))
         raise ValueError(self._unknown_recipient_error(to_agent, agents).strip())
+
+    def _host_link_stopped(self, to_agent: str) -> bool:
+        """True iff the peer record for ``to_agent``'s ``@host`` exists and reads ``stopped``."""
+        host = to_agent.rpartition("@")[2]
+        link = self.read_peer_link(host) if _HOST_FILENAME_RE.fullmatch(host) else None
+        return link is not None and peer_link_state(link) == "stopped"
 
     @staticmethod
     def _stale_name_error(to_agent: str, dead_rows: list[Agent]) -> str:

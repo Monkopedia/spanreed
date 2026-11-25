@@ -1078,6 +1078,20 @@ class TestDeliveryVerdict:
             store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="late")
         assert f"(pid {me}, role connect) shut down cleanly" in str(excinfo.value)
 
+    def test_a_row_is_refused_once_its_bridge_is_marked_stopping(self, store: StateStore) -> None:
+        """#122: between the stopping mark and the row clear, the row and its live
+        owner are still there, but the link reads stopped. The resolver must
+        refuse, as the verdict and protocol.md's table say."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        store.write_peer_link(_peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start))
+        _mirror(store, "adolin", me, me_start)
+        store.mark_peer_links_stopping(me, me_start)  # rows not cleared yet
+        with pytest.raises(ValueError) as excinfo:
+            store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="late")
+        assert str(excinfo.value).startswith("'agent-r@adolin' is a mirrored entry")
+        assert f"(pid {me}, role connect) shut down cleanly" in str(excinfo.value)
+        assert store.recv_messages("agent-r@adolin") == []
+
     def test_an_attached_bridge_with_no_row_does_not_claim_the_recipient_was_live(
         self, store: StateStore
     ) -> None:
