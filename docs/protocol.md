@@ -19,12 +19,25 @@ codex/<name>.log        per-Codex-worker log: startup config, every turn, every
                         approval decision (both outcomes). Never a credential.
 sleepers/<name>.json    one record per sleeper: the source of truth for its presence
 sleepers/<name>.lock    that sleeper's flock; never deleted, not even by retire
+sleeper-ops/out/<peer>/ requests this host's CLI has asked a peer to run (designed, #86; not built)
+sleeper-ops/in/<peer>/  one idempotency record per request a peer asked this host to run (same)
+logs/sleeper-ops.jsonl  audit log of every remote sleeper operation this host received (same)
 ```
 
 `sleepers/<name>.json` is the record whose fields `architecture.md` lists under "The sleeper
 record". It is written atomically (temp file, then rename) under `<name>.lock`. Its lock file
 outlives a `retire`: a process blocked on the old file would otherwise go on to act on a sleeper
 that a new `create` had locked through a new one.
+
+`sleeper-ops/` and `logs/sleeper-ops.jsonl` belong to managing sleepers over `conjoin`
+(#86), which is designed but not built. Their file states, the idempotency record and the
+audit line are specified in [`architecture.md`](architecture.md#managing-a-peers-sleepers-over-conjoin-86).
+The switch lives in `config.json` under `sleeper_remote_access`, one object for the whole
+machine: `{"enabled": true, "enabled_at": "<UTC>", "path_env": "<PATH>"}`. It is not keyed by
+peer. Anything other than `"enabled": true`, including an absent key or an unreadable
+`config.json`, means off. Any process running as the user can write this key directly,
+without `spanreed sleeper remote-access on`; the command's TTY check guards against
+accidents, not against agents (`architecture.md`, decision 7 of #86).
 
 `codex/<name>.log` is written only by `spanreed codex` (see
 [`architecture.md`](architecture.md#codex-workers)). It is append-only, plain text, one timestamped
@@ -127,9 +140,17 @@ One record per peer host a `spanreed conjoin` bridge has ever attached here. Wri
   "registry_requests_sent": 1,
   "detached_at": null,
   "stopping_at": null,
-  "note": null
+  "note": null,
+  "bridge_features": ["sleeper-ops"],
+  "peer_features": ["sleeper-ops"]
 }
 ```
+
+`bridge_features` and `peer_features` are designed for #86 and not built. `bridge_features` is
+what **this** host's bridge process supports; `peer_features` is what the peer listed in its
+`hello`, and is `null` when its `hello` had no `features` field (a peer too old to say). The CLI
+reads both before it writes a remote sleeper request, so neither an older peer nor an older
+`conjoin` already running here can swallow one silently.
 
 **Liveness of a link is the bridge PID**, computed exactly as `is_stale` computes an agent's — PID alive *and* start-time matching. This is not a second liveness model: a mirrored `@host` registry entry records the bridge's PID for the same reason, so link state and mirrored-agent state can never disagree. On the connect end that PID is `conjoin`'s, which outlives a dropped link. A link is in one of three states ([#34](https://github.com/Monkopedia/spanreed/issues/34)):
 
@@ -396,6 +417,8 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed sleeper retire N` | Delete an asleep sleeper's record and row. Its inbox is kept |
 | `spanreed sleeper wake N` | Wake it by hand, by the same path a message takes. Exit 1 if the wake failed (the reason is printed and recorded) |
 | `spanreed sleeper attach N` | `tmux attach` to the sleeper's current session, whatever its generation |
+| `spanreed sleeper create\|list\|wake\|sleep\|retire --host PEER ... [--timeout S]` | *Designed (#86), not built.* Run the operation on a conjoined peer, through this host's bridge to it. Arguments are sent as typed and validated again by the peer; `create --cwd` must be absolute or start with `~`. `--timeout` is at most 600 s and is also the request's lifetime: it is never sent or resent after it. Output is the peer's, each line prefixed `[PEER] `. Exit 0 ok; 1 it ran on the peer and failed; 2 nothing was run (no bridge, a bridge or peer too old, bad argument, timed out before sending, expired); 3 sent, outcome unknown; 4 refused by the peer. `attach --host` prints the ssh command to run instead |
+| `spanreed sleeper remote-access show\|on\|off` | *Designed (#86), not built.* One switch per machine, off by default: while on, every conjoined peer may manage this host's sleepers, which lets it **run commands as this user**: roughly the access ssh gives, but in both directions, and transitive, since conjoining with someone trusts their entire bus and network (see `architecture.md`, "What turning it on grants"). `on` refuses unless stdin is a TTY and this host's label is typed back, a guard against accidents, not against agents, since any process running as the user can write the `config.json` key itself. It records `PATH` for remote creates. Read per request |
 | `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
 
 ## Cross-host bridge wire-format
@@ -446,7 +469,8 @@ A message addressed to `agent-X@hostB` is delivered by the normal `send_message`
 ### Pipe frames
 
 **Frames carry no version, and compatibility is structural.** `hello` announces
-`{"kind", "host"}` and nothing more, so two hosts running different `spanreed`
+`{"kind", "host"}`, plus, once #86 is built, an optional `features` list of
+capabilities (never a version), so two hosts running different `spanreed`
 versions agree only by the shape of what they send. That is a decision, not an
 oversight, and it puts two obligations on every receiver:
 
@@ -471,11 +495,13 @@ answered" indistinguishable before.
 The pipe carries newline-delimited JSON frames, each with a `kind`:
 
 ```json
-{"kind": "hello", "host": "<the sender's own host label>"}
+{"kind": "hello", "host": "<the sender's own host label>", "features": ["sleeper-ops"]}
 {"kind": "msg", "message": { <Message, addresses in RECEIVER's namespace> }}
 {"kind": "registry", "agents": [ <Agent, ...> ], "local_rows": 5, "stale_local_rows": 1}
 {"kind": "registry-request"}
 {"kind": "ping"}
+{"kind": "sleeper-op", "request_id": "<32 hex>", "expires_at": "<UTC>", "op": "<op>", "args": { ... }, "requested_by": "<free text>"}
+{"kind": "sleeper-op-result", "request_id": "<32 hex>", "outcome": "<outcome>", "exit": 0, "stdout": "...", "stderr": "...", "records": null}
 ```
 
 - `msg` — a forwarded bus message. The receiving bridge appends `message` verbatim to `inboxes/<message.to_agent>.jsonl`, **provided `message.to_agent` is a legal id** (see Agent id syntax). A frame whose `to_agent` is not — e.g. `../../x` — is refused and logged, and the reader carries on with the next frame; before #12 it was written wherever the path pointed, including outside the state root.
@@ -491,7 +517,34 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
   On a label that fails validation the receiver **sends nothing further and closes**. Specifically, it does **not** send a `registry` frame — that frame carries agent ids, display names, absolute working directories, pids and focus text, and a peer whose identity was just rejected must not receive it. `hello` is the only frame a refused peer ever sees, and it was already in flight. The refusal is reported on stderr, naming the rule and the `--label` override; stdout is the pipe and carries nothing but frames.
 
   A receiver that gives up waiting for `hello` (`--handshake-timeout`) has ended that attempt, and the decision is **final**: a `hello` that arrives afterwards is ignored, so it opens no peer record and the `registry` frame behind it mirrors nothing. Otherwise the late peer's agents would be mirrored, and its link recorded as attached, under the pid of a `conjoin` that had given up on that attempt, and both would read as live and connected (issue #83). Likewise a `registry` frame that a link's reader applies after that link's teardown is ignored, so it cannot replace the mirror a later connection owns, or bring back rows that were cleared (issue #81). A `hello` the receiver accepted before giving up counts as arriving in time, and the link proceeds normally.
+  `features` (designed for #86, not built) lists what the sender's bridge process can carry. The only value so far is `sleeper-ops`. Absent means the sender is too old to say, and the receiver records `peer_features: null`. A receiver older than the field reads only `host` from `hello` and ignores it.
 - `ping` — keepalive; lets each side detect a dead pipe and lets `connect` trigger reconnect.
+- `sleeper-op` (designed for #86, not built) — "run this sleeper operation on your host." Sent by the **main thread** of the requesting bridge, from its request spool. Fields:
+  - `request_id`: exactly 32 lowercase hex characters, minted by the requester's CLI. It becomes a file name on both hosts, so a frame whose id does not match is refused with no reply, logged as `invalid`, and noted on the peer record.
+  - `expires_at`: an ISO 8601 UTC timestamp, the requester's `created_at` plus its timeout (at most 600 s). The requester's bridge never sends or resends the frame after it. The receiver answers a request with no idempotency record and a passed `expires_at` with `expired`, and never runs it; it also answers `expired` for one whose deadline passes while it waits in the queue. An `expires_at` that is missing, unparseable, or more than 600 s plus a 30 s clock allowance ahead of the receiver's clock is `invalid`.
+  - `op` and `args`, as typed by the user, never resolved on the requester:
+
+    | `op` | `args` |
+    |---|---|
+    | `create` | `name`, `cwd` (absolute, or `~`-prefixed for the target's home), `permission_mode`, `model` (or `null`), `idle_timeout` (the string as typed, e.g. `"15m"`, or `null` for the default), `trust` (bool), `claude_args` (list of strings) |
+    | `list` | none (`{}`) |
+    | `wake`, `sleep`, `retire` | `name` |
+
+  - `requested_by`: who asked, as the requester asserts it (`"<user> on <host>"`, plus the agent id when the CLI ran inside a bus session). Logged, never verified, like `from_agent`.
+
+  The receiver checks the switch (`config.json` `sleeper_remote_access`, one per machine, not keyed by peer), checks `expires_at`, writes its idempotency record (`sleeper-ops/in/<peer>/<request_id>.json`), and queues the operation for a worker thread that runs one at a time. The receiver **validates every field itself** and relies on no check made by the requester: the `cwd` form, `permission_mode`, the claude-args allowlist, `idle_timeout`, the `--trust` refusals and `name` (the list is in `architecture.md`, "Validation on receipt"). A request id it has seen before is **never run twice**: a finished one is answered from the record, a queued or running one is answered when it finishes, and one whose runner died is answered `interrupted`.
+- `sleeper-op-result` (same) — the answer, sent by the target's main thread. `outcome` is one of:
+
+  | `outcome` | meaning | requester exit |
+  |---|---|---|
+  | `ok` | ran and succeeded | 0 |
+  | `failed` | ran, and the target's own checks refused it or it failed, as locally | 1 |
+  | `interrupted` | the target's bridge ended partway through; the effect may be partial | 1 |
+  | `invalid` | malformed `args` or `expires_at`, or an `op` the target does not know (e.g. from a newer requester) | 2 |
+  | `expired` | its `expires_at` passed before it started; not run | 2 |
+  | `refused` | remote sleeper management is turned off on the target | 4 |
+
+  `exit` is the code the same command would have returned locally; `stdout` and `stderr` are its output, printed by the requester with each line prefixed `[PEER] `. `records` is the target's `sleeper list --json` array for `op: "list"` and `null` otherwise. After a `create` or `retire`, the target sends a `registry` frame **before** the result, so the requester's mirror is current by the time its CLI returns. The requester writes the result to `sleeper-ops/out/<peer>/<request_id>.reply.json` only if a matching `.sent` file exists; any other result is noted and dropped.
 
 ### Address rewriting (done by the sending bridge)
 
