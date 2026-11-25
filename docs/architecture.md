@@ -1547,16 +1547,18 @@ fail with "name already held" and report a failure for something that worked.
 - **A second operation while one is running.** It waits on the target's queue
   while the bridge is up (R6). While the bridge is down, it fails at once on the
   requester (spool step 1).
-- **Issue #34** (a dropped bridge deletes the peer's mirrored agents, so mail to
-  them is refused while it is down). Management never resolves through the
-  registry: the target looks the sleeper up by name in its own records. So #34
-  doesn't break any operation here, but it bounds what management can rescue.
-  While the bridge is down, a remote sleeper can be neither mailed (#34) nor managed
-  (no bridge, by design). After a remote `create`, the new sleeper is addressable
-  here as soon as the result arrives, because of the registry frame sent ahead of
-  it; that holds only while the link stays up, exactly as for every other mirrored
-  agent. If #34 is fixed by keeping mirrored rows as stale (its leading option),
-  nothing in this design changes.
+- **Issue [#34](https://github.com/Monkopedia/spanreed/issues/34)** (today a
+  bridge torn down cleanly deletes the peer's mirrored agents, so mail to them is
+  refused while it is down). Management never resolves through the
+  registry: the target looks the sleeper up by name in its own records, so #34
+  doesn't affect any operation here. While the bridge is down, a remote sleeper
+  can't be managed (no bridge, by design), whatever happens to its mail. After a
+  remote `create`, the new sleeper is addressable here as soon as the result
+  arrives, because of the registry frame sent ahead of it, and from then on its
+  mail follows the same rule as every other mirrored agent. The owner decided #34
+  on 2026-11-25 (queue while `conjoin` is running and reconnecting, refuse when no
+  `conjoin` process runs for that host); it is built separately, and nothing in
+  this design depends on which rule is in force.
 
 #### Validation on receipt
 
