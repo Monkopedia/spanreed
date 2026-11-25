@@ -277,6 +277,21 @@ class AgentIdHeld(RuntimeError):
         self.holder = holder
 
 
+REMOTE_ACCESS_KEY = "sleeper_remote_access"
+"""The ``config.json`` key of the remote sleeper management switch (#86)."""
+
+
+class RemoteAccess(BaseModel):
+    """The switch while it is on: when it was turned on, and the ``PATH`` recorded then.
+
+    Either may be ``None`` if the key was written by hand without it; a remote
+    create then fails, naming ``remote-access on`` as the way to record a ``PATH``.
+    """
+
+    enabled_at: datetime | None
+    path_env: str | None
+
+
 class StateStore:
     """Filesystem-backed state store for the Spanreed bus."""
 
@@ -1290,9 +1305,52 @@ class StateStore:
         """Enable/disable activity logging bus-wide (persisted in config.json)."""
         self._set_config_flag("activity_log", enabled)
 
+    def get_sleeper_remote_access(self) -> RemoteAccess | None:
+        """The remote sleeper management switch, or ``None`` when it is off (#86).
+
+        Off unless ``config.json`` holds ``sleeper_remote_access`` with
+        ``"enabled": true``. An absent key, any other value, and an unreadable
+        or malformed ``config.json`` all read as off: the check fails closed.
+        Read from disk on every call, so ``on`` and ``off`` take effect on the
+        next request without restarting a bridge.
+        """
+        value = self._read_config().get(REMOTE_ACCESS_KEY)
+        if not isinstance(value, dict):
+            return None
+        fields = cast("dict[str, object]", value)
+        if fields.get("enabled") is not True:
+            return None
+        enabled_at = fields.get("enabled_at")
+        path_env = fields.get("path_env")
+        try:
+            at = datetime.fromisoformat(enabled_at) if isinstance(enabled_at, str) else None
+        except ValueError:
+            at = None
+        return RemoteAccess(enabled_at=at, path_env=path_env if isinstance(path_env, str) else None)
+
+    def set_sleeper_remote_access(self, path_env: str | None) -> None:
+        """Turn the switch on, recording ``path_env`` for remote creates, or off (``None``).
+
+        Off removes the key, which reads as off like anything else that is not
+        ``"enabled": true``. The terminal check is the CLI's, not this method's.
+        """
+        config = self._read_config()
+        if path_env is None:
+            config.pop(REMOTE_ACCESS_KEY, None)
+        else:
+            config[REMOTE_ACCESS_KEY] = {
+                "enabled": True,
+                "enabled_at": datetime.now(UTC).isoformat(),
+                "path_env": path_env,
+            }
+        self._write_config(config)
+
     def _set_config_flag(self, key: str, value: bool) -> None:
         config = self._read_config()
         config[key] = value
+        self._write_config(config)
+
+    def _write_config(self, config: dict[str, object]) -> None:
         tmp = self._config_path.with_suffix(".json.tmp")
         write_private_text(tmp, json.dumps(config, indent=2))
         tmp.replace(self._config_path)
