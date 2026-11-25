@@ -20,6 +20,7 @@ import contextlib
 import fcntl
 import json
 import os
+import queue
 import re
 import threading
 from collections.abc import Callable, Generator
@@ -32,6 +33,7 @@ from pydantic import BaseModel, ValidationError
 
 from spanreed import sleeper_ops
 from spanreed._fsmode import open_private, private_dir, touch_private, write_private_text
+from spanreed.sleeper_runner import RETIRE_WAIT_S
 from spanreed.sleepers import SleeperError
 from spanreed.store import StateStore, pid_start_time, process_is_alive
 
@@ -40,6 +42,10 @@ MAX_LIFETIME_S = 600
 
 CLOCK_ALLOWANCE_S = 30
 """Skew allowed between the two hosts' clocks when judging ``expires_at`` (R9)."""
+
+STOP_WAIT_S = RETIRE_WAIT_S + 30
+"""How long a stopping bridge waits for its in-flight operation: the longest an
+operation blocks (a ``retire`` waiting for an awake sleeper), plus a margin."""
 
 RECORD_RETENTION = timedelta(days=7)
 """How long an idempotency record is kept (R5, decision 6). Far longer than any
@@ -583,3 +589,59 @@ def prune_records(store: StateStore, now: datetime | None = None) -> int:
                         path.unlink()
                         pruned += 1
     return pruned
+
+
+Deliver = Callable[[dict[str, Any] | None], None]
+"""Where :class:`Worker` hands a result: the bridge's main thread sends it.
+``None`` means the request was not run here (another process holds it)."""
+
+
+class Worker:
+    """The thread that runs a bridge process's queued requests, one at a time.
+
+    Owned by the bridge **process**, not by one link: under ``conjoin`` it
+    outlives a dropped link, so a request queued in this process still runs,
+    its record turns ``done``, and the resend after the reconnect is answered
+    from that record. The reader thread never runs an operation; a ``retire``
+    can block for 60 s, and a blocked reader stops reading pings, so the
+    watchdog would end the link under its own operation ("On the target").
+    """
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[tuple[Target, str, Deliver] | None] = queue.Queue()
+        self._closing = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="sleeper-ops")
+        self._thread.start()
+
+    def submit(self, target: Target, request_id: str, deliver: Deliver) -> None:
+        """Queue a request :meth:`Target.receive` said to run, behind any already queued."""
+        self._queue.put((target, request_id, deliver))
+
+    def _loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None or self._closing.is_set():
+                # Closing: what is still queued stays ``queued`` in its record,
+                # under a process about to exit. A resend then finds it queued
+                # in a dead process and re-queues it there or answers expired.
+                return
+            target, request_id, deliver = item
+            try:
+                result = target.run(request_id)
+            except Exception:  # an IO fault in the record must not end the worker
+                result = None
+            deliver(result)
+
+    def close(self, timeout: float = STOP_WAIT_S) -> bool:
+        """Start nothing more; wait up to ``timeout`` for the operation in flight.
+
+        Called when the bridge process is about to exit, so that an operation
+        it started finishes and stores its result before the process ends
+        ("When things break"). Returns ``False`` if it was still running when
+        the wait ran out: its record stays ``running``, which a resend turns
+        into ``interrupted``.
+        """
+        self._closing.set()
+        self._queue.put(None)
+        self._thread.join(timeout)
+        return not self._thread.is_alive()

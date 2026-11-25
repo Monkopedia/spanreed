@@ -1047,16 +1047,20 @@ remote sleeper without it.
 
 ### Managing a peer's sleepers over `conjoin` (#86)
 
-**Status: partly built; nothing reaches a peer yet.** Stage 1 built the target's
+**Status: partly built; no command sends a request yet.** Stage 1 built the target's
 side, tested without a second machine: `spanreed sleeper remote-access`, the
 operations shared with the local commands (`sleeper_ops.py`), and the handling of a
 `sleeper-op` frame on the target, with its validation, expiry, idempotency record
-and audit log (`sleeper_remote.py`). The bridge does not carry the frames yet, so no
-request can arrive: that, `features` in `hello`, and the requester's spool and
-`--host` commands are later stages. Facts below that come from reading the code say
+and audit log (`sleeper_remote.py`). Stage 2 built the bridge's part, tested over
+in-process pipes: `features` in `hello` and both lists on the peer record, the
+target's reader, worker thread and result (with the registry frame ahead of a
+create's or retire's), the requester's side of the spool (sending, resending on
+attach, expiry, reply files and cleanup; `sleeper_spool.py`), and the start-up
+prune. Nothing writes a request into the spool yet: the `--host` commands, which
+do, are stage 3. Facts below that come from reading the code say
 so; everything that needs a measurement is under "Not verified yet (remote
-management)". The question of default-on, and the calls stage 1 had to make where
-this section is silent, are in
+management)". The question of default-on, and the calls stages 1 and 2 had to make
+where this section is silent, are in
 [open-questions.md](open-questions.md#remote-sleeper-management-86-being-built).
 R9 and R10, which this design raised, are decided (decision 8).
 
@@ -1667,7 +1671,8 @@ grants").
 
 #### Not verified yet (remote management)
 
-Nothing here has been built or run. To measure in the implementation PR:
+None of this has been run between real hosts; it is tested over in-process pipes
+only. To measure before the `--host` commands ship:
 - **The `PATH` a remote create sees** on each end: what the serve end's ssh-launched
   environment holds on kaladin, adolin and the Mac, and whether the `PATH` recorded
   by `remote-access on` finds `claude` from there.

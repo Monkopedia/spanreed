@@ -163,6 +163,35 @@ Still open:
   - *A request re-queued from a dead bridge process writes no audit line of its own.* Its
     `received` line came from the dead process, and its outcome line names the bridge that ran
     it. Recommendation: keep; add a `requeued` event if a log ever proves hard to follow.
+- **Calls stage 2 had to make where the design is silent** (#86 stage 2, the bridge's frames).
+  Built as recommended, the same way as stage 1's; each is the owner's to change.
+  - *A spooled request for a peer that did not advertise `sleeper-ops`.* The design puts the
+    feature check in the CLI only (spool step 1), and says the bridge sends every unexpired
+    `.json`. A request can still meet a peer without the feature: one written while the link was
+    attached to a newer peer and drained after a reconnect to an older one. Recommendation,
+    built: the bridge holds it, notes it once on the peer record, and lets it expire unsent, so
+    the CLI reports "nothing was sent" (exit 2) instead of waiting out its timeout for an answer
+    an older peer will never send (exit 3). `.sent` requests are not resent to such a peer either.
+  - *The request file's contents.* The design says the CLI stamps `created_at` and `expires_at`
+    and writes the file, not what else is in it. Recommendation, built and specified in
+    `protocol.md`: the frame's fields plus `created_at`. A file the bridge cannot judge the
+    expiry of is renamed `.abandoned` unsent and noted.
+  - *A `features` value that is not a list of strings.* Recommendation, built: read as `null`
+    (the peer cannot be shown to carry anything) and noted.
+  - *What a request waiting on another live process gets if that process dies.* The design says
+    this bridge "watches the record and sends the result when it turns `done`". A holder that dies
+    leaves the record `running` and the watch never ends; the requester's CLI reports "outcome
+    unknown" (exit 3) and the next resend, after a reconnect, is answered `interrupted`.
+    Recommendation, built: keep it; re-deciding on each poll would also turn it into
+    `interrupted` sooner.
+  - *The worker across a reconnect.* The design gives the worker to "this bridge process". Built
+    that way: under `conjoin` one worker outlives each link, so a queued request still runs after
+    a drop and its resend is answered from its record. At exit the process starts nothing more
+    and waits for the operation in flight up to `RETIRE_WAIT_S` plus a 30 s margin, a number the
+    design leaves open ("plus a margin").
+  - *Which answers get the registry frame ahead of them.* Every answer to a `create` or `retire`,
+    whatever its outcome, including one answered from its record. An extra registry frame is
+    harmless; deciding by outcome would add a case.
 - **Default-on after a few releases?** Deferred by the owner on 2026-11-25: "that sounds fine for
   now, maybe after a few releases we turn it on by default". Revisit once remote management has
   shipped and been used. Turning it on by default would also turn on what "What turning it on
