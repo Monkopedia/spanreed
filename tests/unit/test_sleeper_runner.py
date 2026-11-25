@@ -967,6 +967,20 @@ class TestEndClaude:
             os.waitpid(grandchild, os.WNOHANG)
         assert not store_module.process_is_alive(grandchild, None) or _is_zombie(grandchild)
 
+    def test_a_non_decimal_digit_in_ps_output_is_skipped_not_raised(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same `isdigit`-then-`int()` shape #94 fixed for `$CLAUDE_PID`:
+        "²" passes `isdigit` and `int()` rejects it. `ps` does not print one,
+        so this pins the parser rather than a reproduced failure."""
+        ps = "  4242  4000\n  ²  4000\n  4243  4242\n"
+
+        def fake_run(args: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, 0, stdout=ps)
+
+        monkeypatch.setattr(sleeper_runner.subprocess, "run", fake_run)
+        assert sorted(p for p, _ in sleeper_runner._descendants(4000)) == [4242, 4243]  # pyright: ignore[reportPrivateUsage]
+
 
 def _is_zombie(pid: int) -> bool:
     try:

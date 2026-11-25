@@ -222,9 +222,10 @@ class TestProcessAndTransport:
         log = log_of(worker)
         assert "FAILED TO START" in log
         # Which half of the exchange notices first is a race with the child's
-        # exit — the write fails, or the read hits EOF — so both sentences are
-        # accepted. What is not optional is that one of them appears: a bare
-        # `[Errno 32] Broken pipe` names neither the peer nor the call.
+        # exit — the write fails, or the read hits EOF or a reset — so both
+        # sentences are accepted. What is not optional is that one of them
+        # appears: a bare `[Errno 32] Broken pipe` or `[Errno 104] Connection
+        # reset by peer` names neither the peer nor the call.
         assert (
             "the app-server connection was gone before" in log
             or "server closed the connection during thread/start" in log

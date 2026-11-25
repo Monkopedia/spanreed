@@ -515,7 +515,7 @@ def _descendants(pid: int) -> list[tuple[int, int | None]]:
     children: dict[int, list[int]] = {}
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        if len(parts) == 2 and parts[0].isdecimal() and parts[1].isdecimal():
             children.setdefault(int(parts[1]), []).append(int(parts[0]))
     found: list[int] = []
     stack = list(children.get(pid, []))
