@@ -55,7 +55,7 @@ from spanreed.store import (
     default_state_root,
     format_age,
     is_stale,
-    peer_link_is_attached,
+    peer_link_state,
     runner_is_alive,
 )
 from spanreed.transcript import find_transcript, read_deliveries, scan_inbox, unread_lines
@@ -261,6 +261,20 @@ def _print_bus_report(store: StateStore, agents: list[Agent], *, include_stale: 
     _print_peer_section(store)
 
 
+_PEER_PID_NOTE = {
+    "attached": "",
+    "reconnecting": (
+        " — running, link DOWN and retrying. Its mirrored agents\n"
+        "                        stay addressable; mail for them QUEUES until the "
+        "reconnect drains it"
+    ),
+    "stopped": (
+        " — no longer running, so its mirrored agents are gone\n"
+        "                        and mail for this host is REFUSED"
+    ),
+}
+
+
 def _print_peer_section(store: StateStore) -> None:
     """Write the cross-host bridge section of the bus report."""
     links = store.list_peer_links()
@@ -273,13 +287,10 @@ def _print_peer_section(store: StateStore) -> None:
         )
         return
     for link in links:
-        attached = peer_link_is_attached(link)
-        state = "ATTACHED" if attached else "DETACHED"
-        print(f"  {state}  {link.host}  (this end is the '{link.role}' side)")
-        print(
-            f"         bridge pid:    {link.bridge_pid}"
-            + ("" if attached else " — no longer running, so its mirrored agents are gone")
-        )
+        state = peer_link_state(link)
+        label = {"attached": "ATTACHED", "reconnecting": "RECONNECTING", "stopped": "DETACHED"}
+        print(f"  {label[state]}  {link.host}  (this end is the '{link.role}' side)")
+        print(f"         bridge pid:    {link.bridge_pid}" + _PEER_PID_NOTE[state])
         print(
             f"         attached at:   {link.attached_at.isoformat()} "
             f"({format_age(link.attached_at)})"
@@ -534,7 +545,7 @@ main way status goes stale.
 set_status `needs_input` (you can still proceed) or `blocked` (you're stopped).
   - `idle` — when you finish and are no longer working.
 
-set_status values: idle | working | needs_input | blocked."""
+  - set_status(status)   — status: idle | working | needs_input | blocked"""
 
 
 def _self_entry(store: StateStore, agent_id: str) -> Agent | None:

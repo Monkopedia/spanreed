@@ -16,7 +16,7 @@ from spanreed.protocol import Agent, Message, PeerLink
 from spanreed.store import (
     StateStore,
     format_age,
-    peer_link_is_attached,
+    peer_link_state,
 )
 
 
@@ -157,7 +157,8 @@ class TestPidOneIsUnknown:
         start = store_module.pid_start_time(1)
         assert not store_module.process_is_alive(1, None)
         assert not store_module.process_is_alive(1, start)
-        assert not peer_link_is_attached(_peer_link("adolin", bridge_pid=1, bridge_pid_start=None))
+        link = _peer_link("adolin", bridge_pid=1, bridge_pid_start=None)
+        assert peer_link_state(link) == "stopped"
 
 
 class TestFocus:
@@ -818,21 +819,48 @@ class TestPeerLinks:
         assert store.read_peer_link("never-bridged") is None
 
     def test_attached_while_the_bridge_process_lives(self, store: StateStore) -> None:
-        assert peer_link_is_attached(_peer_link("adolin"))
+        assert peer_link_state(_peer_link("adolin")) == "attached"
 
     def test_detached_once_the_bridge_pid_is_gone(self, store: StateStore) -> None:
         link = _peer_link("adolin", bridge_pid=_dead_pid(), bridge_pid_start=None)
-        assert not peer_link_is_attached(link)
+        assert peer_link_state(link) != "attached"
 
     def test_detached_when_the_start_time_no_longer_matches(self, store: StateStore) -> None:
         """PID reuse: the pid is alive but belongs to something else now."""
         link = _peer_link("adolin", bridge_pid_start=-1)
-        assert not peer_link_is_attached(link)
+        assert peer_link_state(link) != "attached"
 
     def test_a_clean_teardown_is_detached_even_with_a_live_pid(self, store: StateStore) -> None:
         """``detached_at`` is authoritative — the same process may reconnect later."""
         link = _peer_link("adolin", detached_at=datetime.now(UTC))
-        assert not peer_link_is_attached(link)
+        assert peer_link_state(link) != "attached"
+
+    def test_a_dropped_link_with_conjoin_still_running_is_reconnecting(
+        self, store: StateStore
+    ) -> None:
+        """#34: the connect end's process is the reconnect loop, so it lives on."""
+        link = _peer_link("adolin", detached_at=datetime.now(UTC))
+        assert peer_link_state(link) == "reconnecting"
+
+    def test_a_dropped_serve_link_is_stopped_even_before_its_process_exits(
+        self, store: StateStore
+    ) -> None:
+        """The serve end has no reconnect loop; its process ends with its link."""
+        link = _peer_link("adolin", role="serve", detached_at=datetime.now(UTC))
+        assert peer_link_state(link) == "stopped"
+
+    @pytest.mark.parametrize("detached", [True, False])
+    def test_a_dead_bridge_process_is_stopped_whatever_the_record_says(
+        self, store: StateStore, detached: bool
+    ) -> None:
+        """Killed (no teardown written) and exited (teardown written) read the same."""
+        link = _peer_link(
+            "adolin",
+            bridge_pid=_dead_pid(),
+            bridge_pid_start=None,
+            detached_at=datetime.now(UTC) if detached else None,
+        )
+        assert peer_link_state(link) == "stopped"
 
     def test_a_host_label_that_is_a_path_is_refused(self, store: StateStore) -> None:
         with pytest.raises(ValueError, match="not a usable peer host label"):
@@ -944,24 +972,242 @@ class TestDeliveryVerdict:
         assert "Queued for the bridge to 'adolin'" in detail
 
     def test_a_mirrored_agent_with_no_bridge_is_not_a_delivery(self, store: StateStore) -> None:
-        store.sync_remote_agents(
-            "adolin",
-            [
-                Agent(
-                    agent_id="agent-r",
-                    name="remote",
-                    working_dir="/tmp",
-                    pid=1,
-                    last_seen=datetime.now(UTC),
-                )
-            ],
-            os.getpid(),
-            store_module.pid_start_time(os.getpid()),
+        _mirror(store, "adolin", os.getpid(), store_module.pid_start_time(os.getpid()))
+        live, detail = store.delivery_verdict("agent-r@adolin")
+        assert not live
+        assert detail.startswith("NOT DELIVERED: NO BRIDGE IS RUNNING to 'adolin'")
+        assert "until a bridge to 'adolin' is started again" in detail
+
+    def test_a_mirrored_agent_behind_a_reconnecting_bridge_is_queued(
+        self, store: StateStore
+    ) -> None:
+        """#34: conjoin running, link down. Queued, and the verdict says when it
+        last connected and that it is retrying."""
+        attached = datetime.now(UTC) - timedelta(minutes=5)
+        store.write_peer_link(
+            _peer_link(
+                "adolin",
+                attached_at=attached,
+                detached_at=attached + timedelta(minutes=3),
+                last_registry_at=attached,
+            )
+        )
+        _mirror(store, "adolin", os.getpid(), store_module.pid_start_time(os.getpid()))
+        live, detail = store.delivery_verdict("agent-r@adolin")
+        assert not live
+        assert detail.startswith("QUEUED, BRIDGE RECONNECTING: 'agent-r@adolin'")
+        assert "The bridge to 'adolin' is RECONNECTING" in detail
+        assert "the link dropped 2m 0s ago and it is retrying" in detail
+        assert "It last connected 5m 0s ago" in detail
+        assert "forwarded when the reconnect succeeds" in detail
+
+    def test_a_mirrored_agent_whose_bridge_stopped_after_the_send_is_not_queued(
+        self, store: StateStore
+    ) -> None:
+        store.write_peer_link(
+            _peer_link(
+                "adolin",
+                bridge_pid=_dead_pid(),
+                bridge_pid_start=None,
+                detached_at=datetime.now(UTC),
+            )
+        )
+        _mirror(store, "adolin", os.getpid(), store_module.pid_start_time(os.getpid()))
+        live, detail = store.delivery_verdict("agent-r@adolin")
+        assert not live
+        assert detail.startswith("NOT DELIVERED: NO BRIDGE IS RUNNING to 'adolin'")
+
+    def test_a_conjoin_that_exits_cleanly_after_the_send_leaves_the_mail_queued(
+        self, store: StateStore
+    ) -> None:
+        """PR #120 review: a clean exit clears the rows before the verdict runs.
+
+        The message is still in the outbound inbox, which the next `conjoin` to
+        that host forwards, so it must not be called unreadable."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        store.write_peer_link(_peer_link("adolin"))
+        _mirror(store, "adolin", me, me_start)
+        msg = store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="raced")
+        # conjoin exits cleanly: reconnect_loop clears its rows, the link records
+        # its detach, and the process is gone.
+        store.clear_agents_owned_by(me, me_start)
+        store.write_peer_link(
+            _peer_link(
+                "adolin",
+                bridge_pid=_dead_pid(),
+                bridge_pid_start=None,
+                detached_at=datetime.now(UTC),
+            )
         )
         live, detail = store.delivery_verdict("agent-r@adolin")
         assert not live
-        assert detail.startswith("NOT DELIVERED TO A LIVE SESSION")
-        assert "will be forwarded when `spanreed conjoin adolin` next attaches" in detail
+        assert detail.startswith("NOT DELIVERED: NO BRIDGE IS RUNNING to 'adolin'")
+        assert "goes out when the next `spanreed conjoin adolin` attaches" in detail
+        assert "registers under exactly that id" not in detail
+        assert [m.msg_id for m in store.recv_messages("agent-r@adolin")] == [msg.msg_id]
+
+    def test_a_conjoin_mid_exit_reads_as_stopped_while_its_pid_still_lives(
+        self, store: StateStore
+    ) -> None:
+        """PR #120 second review: the real clean-exit ordering.
+
+        Teardown writes ``detached_at``, ``reconnect_loop`` clears the rows, and
+        the process exits tens of milliseconds later. In between, the pid is
+        alive, so without ``stopping_at`` the link read as reconnecting and the
+        verdict promised a reconnect that was never coming."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        store.write_peer_link(
+            _peer_link(
+                "adolin",
+                bridge_pid=me,
+                bridge_pid_start=me_start,
+                detached_at=datetime.now(UTC),
+                last_registry_at=datetime.now(UTC),
+            )
+        )
+        _mirror(store, "adolin", me, me_start)
+        store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="raced")
+        # reconnect_loop's exit, in its order; this process (the "conjoin") lives on.
+        store.mark_peer_links_stopping(me, me_start)
+        store.clear_agents_owned_by(me, me_start)
+        live, detail = store.delivery_verdict("agent-r@adolin")
+        assert not live
+        assert detail.startswith("NOT DELIVERED: NO BRIDGE IS RUNNING to 'adolin'")
+        assert "RECONNECTING" not in detail
+        with pytest.raises(ValueError) as excinfo:
+            store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="late")
+        assert f"(pid {me}, role connect) shut down cleanly" in str(excinfo.value)
+
+    def test_an_attached_bridge_with_no_row_does_not_claim_the_recipient_was_live(
+        self, store: StateStore
+    ) -> None:
+        """PR #120 review nit: with no row there is no snapshot naming it, and a
+        link that never synced has no snapshot at all."""
+        store.write_peer_link(_peer_link("adolin"))
+        live, detail = store.delivery_verdict("agent-r@adolin")
+        assert live
+        assert "was live in the registry snapshot" not in detail
+        assert "sent never" not in detail
+        assert "No registry snapshot from adolin currently lists the recipient" in detail
+
+
+class TestStoppingAt:
+    """#34: a ``conjoin`` mid-exit is stopped before its pid is gone."""
+
+    def test_a_stopping_record_is_stopped_even_with_a_live_pid(self) -> None:
+        link = _peer_link("adolin", detached_at=datetime.now(UTC), stopping_at=datetime.now(UTC))
+        assert peer_link_state(link) == "stopped"
+
+    def test_a_record_without_the_field_parses_as_not_stopping(self) -> None:
+        """Records from an older spanreed have no ``stopping_at``."""
+        raw = _peer_link("adolin").model_dump(mode="json")
+        raw.pop("stopping_at")
+        assert PeerLink.model_validate(raw).stopping_at is None
+
+    def test_mark_touches_only_the_owners_records(self, store: StateStore) -> None:
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        store.write_peer_link(_peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start))
+        store.write_peer_link(_peer_link("kaladin", bridge_pid=me, bridge_pid_start=-1))
+        store.mark_peer_links_stopping(me, me_start)
+        adolin, kaladin = store.read_peer_link("adolin"), store.read_peer_link("kaladin")
+        assert adolin is not None and adolin.stopping_at is not None
+        assert kaladin is not None and kaladin.stopping_at is None
+
+    def test_a_later_write_by_the_same_bridge_keeps_it(self, store: StateStore) -> None:
+        """The bridge's reader thread may persist a note after the exit began."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        link = _peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start)
+        store.write_peer_link(link)
+        store.mark_peer_links_stopping(me, me_start)
+        store.write_peer_link(link.model_copy(update={"note": "late junk line"}))
+        found = store.read_peer_link("adolin")
+        assert found is not None and found.stopping_at is not None
+        assert found.note == "late junk line"
+
+    def test_a_new_conjoin_overwrites_it(self, store: StateStore) -> None:
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        store.write_peer_link(_peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start))
+        store.mark_peer_links_stopping(me, me_start)
+        store.write_peer_link(_peer_link("adolin", bridge_pid=me, bridge_pid_start=-1))
+        found = store.read_peer_link("adolin")
+        assert found is not None and found.stopping_at is None
+
+
+def _mirror(store: StateStore, host: str, owner_pid: int, owner_pid_start: int | None) -> None:
+    """Mirror one peer agent, ``agent-r``, as a bridge owned by ``owner_pid`` would."""
+    store.sync_remote_agents(
+        host,
+        [
+            Agent(
+                agent_id="agent-r",
+                name="remote",
+                working_dir="/tmp",
+                pid=1,
+                last_seen=datetime.now(UTC),
+            )
+        ],
+        owner_pid,
+        owner_pid_start,
+    )
+
+
+class TestSendWhileABridgeIsDown:
+    """#34: queue while a conjoin for the host runs; refuse once none does."""
+
+    def test_an_exact_id_behind_a_reconnecting_bridge_is_accepted(self, store: StateStore) -> None:
+        store.write_peer_link(_peer_link("adolin", detached_at=datetime.now(UTC)))
+        _mirror(store, "adolin", os.getpid(), store_module.pid_start_time(os.getpid()))
+        msg = store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="hi")
+        assert [m.msg_id for m in store.recv_messages("agent-r@adolin")] == [msg.msg_id]
+
+    def test_a_display_name_behind_a_reconnecting_bridge_still_resolves(
+        self, store: StateStore
+    ) -> None:
+        store.write_peer_link(_peer_link("adolin", detached_at=datetime.now(UTC)))
+        _mirror(store, "adolin", os.getpid(), store_module.pid_start_time(os.getpid()))
+        msg = store.send_message(from_agent="agent-x", to_agent="remote", body="hi")
+        assert msg.to_agent == "agent-r@adolin"
+
+    def test_an_exact_id_whose_conjoin_was_killed_is_refused(self, store: StateStore) -> None:
+        """The rows linger with a dead owner, and before #34 this queued."""
+        dead = _dead_pid()
+        store.write_peer_link(_peer_link("adolin", bridge_pid=dead, bridge_pid_start=None))
+        _mirror(store, "adolin", dead, None)
+        with pytest.raises(ValueError) as excinfo:
+            store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="hi")
+        text = str(excinfo.value)
+        assert "there is no bridge running to deliver it" in text
+        assert (
+            f"NO BRIDGE IS RUNNING to 'adolin': the `spanreed conjoin` process that owned it (pid {dead}"
+            in text
+        )
+        assert "it was killed without tearing its link down" in text
+        assert "Refusing rather than queuing" in text
+        assert not store.inbox_path("agent-r@adolin").exists()
+
+    def test_an_exact_id_with_no_peer_record_at_all_is_refused(self, store: StateStore) -> None:
+        _mirror(store, "adolin", _dead_pid(), None)
+        with pytest.raises(ValueError, match="there is no bridge running to deliver it"):
+            store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="hi")
+
+    def test_an_unknown_agent_behind_a_reconnecting_bridge_names_the_state(
+        self, store: StateStore
+    ) -> None:
+        store.write_peer_link(_peer_link("adolin", detached_at=datetime.now(UTC)))
+        _mirror(store, "adolin", os.getpid(), store_module.pid_start_time(os.getpid()))
+        with pytest.raises(ValueError) as excinfo:
+            store.send_message(from_agent="agent-x", to_agent="agent-ghost@adolin", body="hi")
+        text = str(excinfo.value)
+        assert "The bridge to 'adolin' is RECONNECTING" in text
+        assert "'agent-ghost' is not among them: agent-r@adolin" in text
+
+    def test_clearing_by_owner_leaves_other_owners_and_local_rows(self, store: StateStore) -> None:
+        store.register_agent(name="l", working_dir="/tmp", pid=os.getpid(), agent_id="agent-l")
+        _mirror(store, "adolin", os.getpid(), store_module.pid_start_time(os.getpid()))
+        _mirror(store, "kaladin", 4242, None)
+        store.clear_agents_owned_by(os.getpid(), store_module.pid_start_time(os.getpid()))
+        ids = sorted(a.agent_id for a in store.list_agents(include_stale=True))
+        assert ids == ["agent-l", "agent-r@kaladin"]
 
 
 class TestResolverNamesTheRightRemedy:
@@ -1010,10 +1256,10 @@ class TestResolverNamesTheRightRemedy:
         text = self._error(store, "agent-r@adolin")
         assert self.UNQUALIFIED_REMEDY not in text
 
-    def test_a_dead_bridge_says_the_bridge_is_detached(self, store: StateStore) -> None:
+    def test_a_dead_bridge_says_no_bridge_is_running(self, store: StateStore) -> None:
         store.write_peer_link(_peer_link("adolin", bridge_pid=_dead_pid(), bridge_pid_start=None))
         text = self._error(store, "agent-r@adolin")
-        assert "The bridge to 'adolin' is DETACHED" in text
+        assert "NO BRIDGE IS RUNNING to 'adolin'" in text
         assert "until the bridge is restarted (`spanreed conjoin adolin`)" in text
         assert self.UNQUALIFIED_REMEDY not in text
 
@@ -1060,8 +1306,8 @@ class TestResolverNamesTheRightRemedy:
         assert "is a genuinely unknown agent rather than a sync failure" in text
         assert "'adolin' is currently advertising: agent-real@adolin" in text
 
-    def test_the_six_messages_are_actually_distinct(self, store: StateStore) -> None:
-        """A guard on the guards: six branches that all said the same thing would
+    def test_the_seven_messages_are_actually_distinct(self, store: StateStore) -> None:
+        """A guard on the guards: seven branches that all said the same thing would
         pass every assertion above that looks for a shared phrase."""
         messages: list[str] = []
         messages.append(self._error(store, "agent-typo"))
@@ -1077,8 +1323,10 @@ class TestResolverNamesTheRightRemedy:
         )
         messages.append(self._error(store, "agent-r@adolin"))  # healthy, unknown id
         store.write_peer_link(_peer_link("adolin", bridge_pid=_dead_pid(), bridge_pid_start=None))
-        messages.append(self._error(store, "agent-r@adolin"))  # detached
-        assert len(set(messages)) == 6
+        messages.append(self._error(store, "agent-r@adolin"))  # no bridge running
+        store.write_peer_link(_peer_link("adolin", detached_at=datetime.now(UTC)))
+        messages.append(self._error(store, "agent-r@adolin"))  # reconnecting, unknown id
+        assert len(set(messages)) == 7
 
 
 class TestFormatAge:

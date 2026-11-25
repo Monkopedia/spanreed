@@ -151,8 +151,8 @@ def list_peers() -> list[dict[str, object]]:
     """List the cross-host bridges this bus has, and how each one is doing.
 
     One record per peer host a ``spanreed conjoin`` has ever attached here,
-    including bridges that have since died (``detached_at`` set, or a
-    ``bridge_pid`` that is no longer running).
+    including links that have dropped (``detached_at`` set) and bridges that
+    have stopped (a ``bridge_pid`` that is no longer running).
 
     The field that matters most is ``last_registry_at``: ``null`` means this
     host has **never** received a registry snapshot from that peer, so none of
@@ -163,8 +163,14 @@ def list_peers() -> list[dict[str, object]]:
     Read it as:
 
     - no record for a host → no bridge was ever started for it here.
-    - record present, ``detached_at`` set or ``bridge_pid`` dead → the bridge
-      died; restart ``spanreed conjoin <host>``.
+    - record present, ``bridge_pid`` dead or ``stopping_at`` set → no bridge
+      is running (``stopping_at`` is a ``conjoin`` that has begun a clean
+      exit), and mail for that host is refused; restart ``spanreed conjoin
+      <host>``.
+    - ``role`` connect, ``detached_at`` set, ``stopping_at`` null,
+      ``bridge_pid`` alive → ``conjoin``
+      is running and reconnecting. The peer's agents stay addressable and mail
+      for them queues until the reconnect delivers it.
     - attached, ``last_registry_at`` null → the peer is not advertising; check
       ``spanreed list`` on the peer itself.
     - attached, ``last_registry_agents`` 0 → the peer answered and has nothing

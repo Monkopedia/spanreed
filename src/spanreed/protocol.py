@@ -247,6 +247,15 @@ class PeerLink(BaseModel):
     still up — *or* on one whose bridge was killed without running teardown, so
     do not read ``None`` as "attached": check ``bridge_pid`` liveness."""
 
+    stopping_at: datetime | None = None
+    """When this record's ``conjoin`` began a clean exit (issue #34). Written
+    *before* the process clears its mirrored rows, so the bridge reads as
+    stopped for the whole exit, not as reconnecting during the last tens of
+    milliseconds its pid is still alive. Never cleared by the process that set
+    it: the next ``conjoin`` writes a fresh record under its own pid. ``None``
+    on every record from a ``spanreed`` older than this field, which then
+    falls back to pid liveness alone."""
+
     note: str | None = None
     """Free-form diagnosis attached by the bridge: a frame that could not be
     parsed, a registry frame that arrived before the handshake, the reason for

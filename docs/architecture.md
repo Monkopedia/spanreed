@@ -1022,8 +1022,11 @@ advertising asleep agents:
    with `append_message`.
 3. That write runs `wake_if_needed`, **on hostB**, where the tmux session, the login
    and the sleeper record all live.
-4. If the link is down, the mail waits on the sending machine, and the reconnect
-   delivers it and wakes the sleeper. That is durable end to end.
+4. Mail queued in step 1 survives a drop, and mail sent *while* the link is down
+   queues too, as long as the `conjoin` for hostB is still running and retrying:
+   the reconnect delivers it and wakes the sleeper. Once no `conjoin` for hostB is
+   running (stopped, crashed or killed), a send to `agent-X@hostB` is refused
+   rather than queued, because nothing would forward it ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
 
 What changes:
 - **Peers must see asleep sleepers**, or no remote agent can address them.
@@ -1871,11 +1874,11 @@ Each bridge writes `peers/<host>.json` — attached-at, last frame, last registr
 
 This exists for a stated reason: the reported bug was diagnosable only from state that nothing printed, on a machine the owner could not attach a debugger to. `spanreed list` and the `list_peers` MCP tool now render these records in full, in words, with the remedy named — so the whole diagnosis fits in one pasted terminal buffer. That is the visibility-over-hiding principle applied to the bridge, and it resolves the "`@host` UX in `list_agents`" open question.
 
-Link liveness reuses the agent liveness model exactly (bridge PID alive + start-time match), so a link's state can never disagree with the state of the mirrored entries that bridge owns. Records are **kept** after teardown with `detached_at` set: "a bridge was here and died" is a diagnosis, and deleting the file would make it read as "no bridge was ever configured".
+Link liveness reuses the agent liveness model exactly (bridge PID alive + start-time match), so a link's state can never disagree with the state of the mirrored entries that bridge owns. A link is in one of three states: **attached** (the bridge process runs and its link is up), **reconnecting** (a `conjoin` runs but its link dropped and it is retrying; `detached_at` is set and the pid is alive), and **stopped** (no bridge process for that host runs, or its `conjoin` has begun a clean exit: `stopping_at` is written before the exit clears any mirrored row, so a pid that lives on for the last few milliseconds never reads as reconnecting). A serve end is never reconnecting: its process ends with its link. Records are **kept** after teardown with `detached_at` set: "a bridge was here and died" is a diagnosis, and deleting the file would make it read as "no bridge was ever configured".
 
 ### The core trick: reuse inboxes as the outbound queue
 
-The bridge **mirrors the peer's live agents into the local registry**, qualified by host (`agent-X@hostB`) and owned by the bridge's own PID. Both self-set presence fields cross the bridge: a mirrored entry carries the remote agent's `focus` *and* its `status`, so the "who needs a human" scan over `list_agents` (`status ∈ {needs_input, blocked}`) sees remote agents exactly as it sees local ones. Everything else falls out of the existing primitives with no MCP changes:
+The bridge **mirrors the peer's live agents into the local registry**, qualified by host (`agent-X@hostB`) and owned by the bridge's own PID. That PID is the bridge **process**, not one connection: on the connect end it is `conjoin` itself, whose reconnect loop outlives every dropped link. Both self-set presence fields cross the bridge: a mirrored entry carries the remote agent's `focus` *and* its `status`, so the "who needs a human" scan over `list_agents` (`status ∈ {needs_input, blocked}`) sees remote agents exactly as it sees local ones. Everything else falls out of the existing primitives with no MCP changes:
 
 - A local agent sends to `agent-X@hostB` → ordinary `send_message` → lands in `inboxes/agent-X@hostB.jsonl` locally.
 - The bridge tails every `*@hostB` inbox and forwards new lines over the pipe.
@@ -1889,8 +1892,10 @@ Global identity is `agent-X@homehost`; on its home host the agent is the bare `a
 
 ### Properties that fall out for free
 
-- **No cross-host heartbeat.** Remote-agent liveness is just "present in the peer's latest registry snapshot," which the peer computes with the local PID + start-time check. The snapshot's *age* is recorded on the peer record, so a caller can see how old that evidence is rather than assuming it is current. The bridge's own PID backs the mirrored entries, so if the pipe dies the remote agents correctly vanish from `list_agents`.
-- **Store-and-forward across disconnects.** If the pipe is down, outbound messages accumulate durably in the `*@peer` inbox files; on reconnect the bridge resumes from its saved cursor (the existing `cursors/` mechanism) and drains the backlog.
+- **No cross-host heartbeat.** Remote-agent liveness is just "present in the peer's latest registry snapshot," which the peer computes with the local PID + start-time check. The snapshot's *age* is recorded on the peer record, so a caller can see how old that evidence is rather than assuming it is current. The bridge process's PID backs the mirrored entries. On the connect end that is `conjoin`, so the remote agents stay in `list_agents` while it reconnects and vanish when it exits or dies; on the serve end, whose process ends with its link, they vanish with the link.
+- **Store-and-forward across disconnects, while `conjoin` runs.** The rule, decided by the owner on 2026-11-25 ([#34](https://github.com/Monkopedia/spanreed/issues/34)), turns on whether a `conjoin` process for that host is running, not on whether its link is up:
+  - **`conjoin` running, link down** (its reconnect loop is retrying): **queue.** The peer's mirrored agents stay addressable for the life of that `conjoin` process, sends go into the outbound `*@peer` inbox, and the reconnect drains them: the bridge advances its saved cursor (the existing `cursors/` mechanism) only after a confirmed send, so it resumes from that cursor. The delivery verdict says the message is queued because the bridge is reconnecting, and when it last connected. A dropped link does not clear the mirrored rows; `conjoin` clears every row it owns when it exits.
+  - **No `conjoin` running for that host** (stopped, crashed or killed): **refuse**, saying no bridge is running to deliver it. A killed `conjoin` never runs its exit, so its rows linger in the registry with a dead owner pid; the resolver refuses an exact `agent-X@peer` address whose row's owner is dead rather than queuing into an inbox nothing forwards until a `conjoin` to that host is started again ([protocol.md, "Recipient resolution"](protocol.md#recipient-resolution)).
 
 ### Launch and prerequisites (empirically settled)
 
@@ -1900,7 +1905,7 @@ Global identity is `agent-X@homehost`; on its home host the agent is the bare `a
 
 ### Reconnect
 
-`spanreed conjoin <host>` is a long-lived **foreground** command. When the pipe drops it re-establishes it with exponential backoff + jitter (a connection that stays up long enough resets the backoff). A dead pipe is detected three ways: EOF on the SSH child, SSH keepalive (`ServerAliveInterval`), and a receive-side watchdog (no frame — not even the peer's pings — within `recv_timeout`). SIGINT/SIGTERM tear down cleanly: clear the mirrored `@peer` entries and kill the SSH child.
+`spanreed conjoin <host>` is a long-lived **foreground** command. When the pipe drops it re-establishes it with exponential backoff + jitter (a connection that stays up long enough resets the backoff). A dead pipe is detected three ways: EOF on the SSH child, SSH keepalive (`ServerAliveInterval`), and a receive-side watchdog (no frame — not even the peer's pings — within `recv_timeout`). A dropped link leaves the mirrored `@peer` entries in place, so they stay addressable and mail for them queues while `conjoin` reconnects ([#34](https://github.com/Monkopedia/spanreed/issues/34)). When `conjoin` itself ends (SIGINT/SIGTERM, or `--max-reconnects` giving up) it clears every mirrored entry it owns and kills the SSH child. The serve end clears its entries at teardown, since its process ends with its link.
 
 Delivery across a drop is **at-least-once**: the outbound cursor advances only after a confirmed send (nothing lost), and delivery dedupes by `msg_id` (nothing double-delivered on resend). **Supervision is deliberately out of scope** — `conjoin` restarts the *pipe*, not itself. If you want it to survive reboots or crashes, wrap it in systemd/launchd/tmux.
 

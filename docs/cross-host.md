@@ -154,17 +154,18 @@ Don't `git pull` the plugin cache dirs directly — Claude tracks `gitCommitSha`
   - The peer is on an older `spanreed-bus` without the `conjoin` command (need ≥ 0.0.4 — see Updating above).
   - The peer's non-interactive `$PATH` doesn't include `spanreed`, and the interactive-shell probe failed too. Test manually: `ssh <peer> 'zsh -ic "command -v spanreed"'` should print an absolute path. If it doesn't, you can override the probe with `--remote-spanreed /abs/path/to/spanreed`.
 - **Permission denied at SSH.** Re-run the Step 1 verify. If it still fails, the `BatchMode=yes` flag is unmasking that your interactive shell silently uses a key the non-interactive path doesn't — that's Step 2.
-- **`spanreed list` doesn't show `@peer` agents.** Do not guess, and in particular do not conclude the agent is gone — `list_agents` cannot see a peer's agents for *any* of the reasons below, so an empty list distinguishes none of them. Read the `PEERS` section instead; it names exactly one of five states:
+- **`spanreed list` doesn't show `@peer` agents.** Do not guess, and in particular do not conclude the agent is gone — `list_agents` cannot see a peer's agents for *any* of the reasons below, so an empty list distinguishes none of them. Read the `PEERS` section instead; it names exactly one of six states:
 
   | what `PEERS` shows | what it means | fix |
   |---|---|---|
   | `(none)` | no bridge was ever started here | `spanreed conjoin <peer>` |
-  | `DETACHED <host>` | the `conjoin` process that owned it is gone | restart `spanreed conjoin <peer>` |
+  | `DETACHED <host>` | the `conjoin` process that owned it is gone; sends to the host are refused | restart `spanreed conjoin <peer>` |
+  | `RECONNECTING <host>` | `conjoin` is running, its link dropped and it is retrying. The peer's agents stay listed and mail for them queues until the reconnect | none, unless it persists; then check the `conjoin` terminal for why each attempt fails |
   | `ATTACHED`, `registry sync: NEVER` | the pipe is alive and carrying frames, but the peer has never advertised its agents. **Messages still cross in both directions** — this is why nothing else looks wrong | run `spanreed list` **on the peer**: if it shows live local agents, the two hosts' `spanreed` versions likely disagree (upgrade both); check the `note:` line for a dropped frame |
   | `ATTACHED`, `ZERO AGENTS ADVERTISED` | the peer answered and has nothing live to offer. The `held N local row(s), M judged stale` line says whether its agents exist but are failing its own PID liveness check | fix it on the peer — its sessions are not registered, or their recorded pids are dead |
   | `ATTACHED`, a recent sync with N agents | the bridge is healthy. An id you cannot address is genuinely unknown | check the ids the peer is advertising in the `AGENTS` section |
 
   The first sync normally lands within a few seconds (default cadence 3s).
 
-- **Agents are `@peer` but the bridge process died.** Mirrored entries are owned by the bridge's PID; if the bridge dies for good they go stale and drop out on the next `list_agents`. The peer record survives, showing `DETACHED`, which is how you tell this apart from a bridge that was never started. Restart `conjoin`.
+- **Agents are `@peer` but the bridge process died.** Mirrored entries are owned by the `conjoin` process's PID; a dropped link keeps them, but if `conjoin` dies they go stale, drop out on the next `list_agents`, and sends to them are refused. The peer record survives, showing `DETACHED`, which is how you tell this apart from a bridge that was never started. Restart `conjoin`.
 - **A `note:` line on a peer.** The bridge records what it could not process there: a frame it could not model (usually a version skew — upgrade both ends), a registry frame that arrived before the handshake (self-healing), or non-JSON noise on the pipe (a login banner or a shell profile that prints on non-interactive `ssh`, which will also break the handshake).
