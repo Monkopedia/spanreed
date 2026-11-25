@@ -1225,6 +1225,9 @@ sending resolvable after the fact:
    outbound inboxes. For each `.json` whose `expires_at` has not passed, it
    **renames it to `.sent` first**, then sends the `sleeper-op` frame. Only one
    process wins a rename, so two bridges to the same peer can't both send it.
+   It sends nothing to a peer whose `hello` did not list `sleeper-ops` (see
+   "Version skew"): such a request is held, noted once on the peer record, and
+   expires unsent, and a `.sent` one is not resent to it on attach.
 4. The bridge's reader thread receives `sleeper-op-result`, checks that
    `<request_id>.sent` exists, and writes `<request_id>.reply.json`. A result for
    an id it has no `.sent` file for is noted on the peer record and dropped.
@@ -1525,7 +1528,14 @@ absent optional field reads as `null`, not as empty. Each bridge also records
 its **own** list as `bridge_features`, because the requester has a second skew to
 catch: the CLI may be newer than the `conjoin` process already running on its own
 host, which would never read the spool. Step 1 of the spool checks both, and says
-which machine to upgrade or which `conjoin` to restart:
+which machine to upgrade or which `conjoin` to restart. The bridge checks
+`peer_features` again before it sends: a request written while the link was
+attached to a newer peer can be drained after a reconnect to an older one, which
+would drop it without a word. So a bridge sends no `sleeper-op` to a peer that did
+not list `sleeper-ops`; it holds the request and notes it on the peer record. One
+never sent expires unsent, so its CLI reports "nothing was sent" (exit 2); one
+already sent over an earlier link is not resent, and its CLI reports "outcome
+unknown" (exit 3). The CLI's refusal:
 
 ```
 spanreed sleeper wake --host adolin X: adolin's bridge does not support remote sleeper

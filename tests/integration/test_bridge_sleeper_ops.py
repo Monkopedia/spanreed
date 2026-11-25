@@ -495,6 +495,22 @@ class TestRequesterSpool:
         assert link is not None and link.note is not None
         assert "NOT sent" in link.note and "predates" in link.note
 
+    def test_a_held_sent_request_is_noted_as_already_sent(self, store: StateStore) -> None:
+        """A ``.sent`` request held on attach went out over an earlier link, so it
+        is not said to "expire unsent"; the note says it is not resent."""
+        unsent = spool_request(store, "adolin")
+        in_flight = spool_request(store, "adolin", suffix=".sent")
+        with fake_peer(store, {"kind": "hello", "host": "adolin"}) as peer:
+            _wait(lambda: in_flight in ((store.read_peer_link("adolin") or _no_link()).note or ""))
+            assert peer.frames("sleeper-op") == []
+        link = store.read_peer_link("adolin")
+        assert link is not None and link.note is not None
+        [about_unsent] = [s for s in link.note.split(". ") if unsent in s]
+        [about_sent] = [s for s in link.note.split(". ") if in_flight in s]
+        assert "NOT sent" in about_unsent and "expire unsent" in about_unsent
+        assert "NOT resent" in about_sent and "expire unsent" not in about_sent
+        assert "outcome is unknown" in link.note
+
     def test_a_peer_listing_other_features_is_sent_nothing(self, store: StateStore) -> None:
         request_id = spool_request(store, "adolin")
         hello = {"kind": "hello", "host": "adolin", "features": ["something-else"]}

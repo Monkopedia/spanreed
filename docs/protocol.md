@@ -178,8 +178,9 @@ bridge process supports; it is `null` on a record written by a `spanreed` older 
 record). The CLI will read both before it writes a remote sleeper request (#86 stage 3), so
 neither an older peer nor an older `conjoin` already running here can swallow one silently.
 The bridge checks `peer_features` too: it sends no request to a peer that did not list
-`sleeper-ops`, and notes on the record each request it holds back. A held request expires
-unsent.
+`sleeper-ops`, and notes on the record each request it holds back. A held request never sent
+(`.json`) expires unsent; one already sent over an earlier link (`.sent`) is not resent, and its
+outcome is unknown to this host.
 
 **Liveness of a link is the bridge PID**, computed exactly as `is_stale` computes an agent's — PID alive *and* start-time matching. This is not a second liveness model: a mirrored `@host` registry entry records the bridge's PID for the same reason, so link state and mirrored-agent state can never disagree. On the connect end that PID is `conjoin`'s, which outlives a dropped link. A link is in one of three states ([#34](https://github.com/Monkopedia/spanreed/issues/34)):
 

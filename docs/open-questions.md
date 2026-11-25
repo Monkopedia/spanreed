@@ -165,13 +165,14 @@ Still open:
     it. Recommendation: keep; add a `requeued` event if a log ever proves hard to follow.
 - **Calls stage 2 had to make where the design is silent** (#86 stage 2, the bridge's frames).
   Built as recommended, the same way as stage 1's; each is the owner's to change.
-  - *A spooled request for a peer that did not advertise `sleeper-ops`.* The design puts the
-    feature check in the CLI only (spool step 1), and says the bridge sends every unexpired
-    `.json`. A request can still meet a peer without the feature: one written while the link was
+  - *A spooled request for a peer that did not advertise `sleeper-ops`.* The design put the
+    feature check in the CLI only (spool step 1), and said the bridge sends every unexpired
+    `.json`; spool step 3 and "Version skew" in `architecture.md` now carry the hold below. A request can still meet a peer without the feature: one written while the link was
     attached to a newer peer and drained after a reconnect to an older one. Recommendation,
     built: the bridge holds it, notes it once on the peer record, and lets it expire unsent, so
     the CLI reports "nothing was sent" (exit 2) instead of waiting out its timeout for an answer
-    an older peer will never send (exit 3). `.sent` requests are not resent to such a peer either.
+    an older peer will never send (exit 3). `.sent` requests are not resent to such a peer either;
+    their CLI reports "outcome unknown" (exit 3), and the note says they were already sent.
   - *The request file's contents.* The design says the CLI stamps `created_at` and `expires_at`
     and writes the file, not what else is in it. Recommendation, built and specified in
     `protocol.md`: the frame's fields plus `created_at`. A file the bridge cannot judge the

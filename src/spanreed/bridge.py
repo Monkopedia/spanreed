@@ -595,29 +595,45 @@ class Bridge:
                 del self._watching[request_id]
                 self._results.put((frame.get("op"), result))
 
-    def _hold(self, request_ids: list[str]) -> None:
-        """Say on the peer record why requests are not being sent. Once per request."""
-        new = [rid for rid in request_ids if rid not in self._held_noted]
-        if not new:
+    def _hold(self, unsent: list[str], sent: list[str]) -> None:
+        """Say on the peer record why requests are not being sent. Once per request.
+
+        ``unsent`` are ``.json`` requests, never sent: they expire unsent.
+        ``sent`` are ``.sent`` requests (on attach only), sent over an earlier
+        link and now not resent: whether they ran is not known here.
+        """
+        new_unsent = [rid for rid in unsent if rid not in self._held_noted]
+        new_sent = [rid for rid in sent if rid not in self._held_noted]
+        if not new_unsent and not new_sent:
             return
-        self._held_noted.update(new)
+        self._held_noted.update(new_unsent + new_sent)
         said = (
             "sent no features in its hello (its spanreed predates remote sleeper management)"
             if self._peer_features is None
             else f"listed features {self._peer_features} in its hello, without {SLEEPER_OPS!r}"
         )
-        self._note(
-            f"sleeper request(s) {', '.join(new)} in sleeper-ops/out/{self.peer_host}/ were "
-            f"NOT sent: {self.peer_host} {said}, so it would ignore them. They expire "
-            f"unsent. Upgrade spanreed on {self.peer_host} and restart its end of `conjoin`."
-        )
+        where = f"sleeper-ops/out/{self.peer_host}/"
+        parts = [f"{self.peer_host} {said}, so it would ignore sleeper requests."]
+        if new_unsent:
+            parts.append(
+                f"Request(s) {', '.join(new_unsent)} in {where} were NOT sent, and expire unsent."
+            )
+        if new_sent:
+            parts.append(
+                f"Request(s) {', '.join(new_sent)} in {where} were sent over an earlier link and "
+                f"are NOT resent; their outcome is unknown here (check `spanreed sleeper list "
+                f"--host {self.peer_host}` and its audit log)."
+            )
+        parts.append(f"Upgrade spanreed on {self.peer_host} and restart its end of `conjoin`.")
+        self._note(" ".join(parts))
 
     def _drain_spool(self, *, attach: bool) -> None:
         """Send this host's requests for the peer; on ``attach``, resend those in flight.
 
         A request is sent only before its ``expires_at``, and only to a peer
         that advertised ``sleeper-ops``: an older peer drops the frame without a
-        word, so a request for one is held and expires unsent. Expiry is
+        word, so a request for one is held: one never sent expires unsent, and
+        one already sent over an earlier link is not resent. Expiry is
         enforced here whatever its CLI does, so a killed CLI's request is never
         sent late ("Every request expires").
         """
@@ -625,7 +641,7 @@ class Bridge:
         assert spool is not None
         spool.expire()
         if self._peer_features is None or SLEEPER_OPS not in self._peer_features:
-            self._hold(spool.ids(".json") + (spool.ids(".sent") if attach else []))
+            self._hold(spool.ids(".json"), spool.ids(".sent") if attach else [])
             return
         if attach:
             for frame in spool.resend():
