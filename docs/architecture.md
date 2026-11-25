@@ -1104,6 +1104,17 @@ design that his words were an answer to, and says so.
    request starts, and the TTY check is accepted for v1 with its limits stated
    (R10). Decision 7, given after, restates those limits to cover the file as well
    as the command.
+9. **The grant is about what ssh already gives, but both ways, and that is
+   expected.** On the switch letting any conjoined peer run commands as him, *the
+   owner:* "again, this is relatively equivalent to the ssh access, other than the
+   fact that it makes it bidirectional, which we should note, this is expected". The
+   end that was ssh'd into can also manage the end that dialled it, which it may have
+   no ssh access to. Recorded in his sign-off on #119 (comment of 2026-11-25 15:39).
+10. **Trust is transitive across the conjoin graph, and the model stays as is.**
+    *The owner:* "this is an interesting note, we should document this clearly, but I
+    don't think we should change the model. it should be clear that when you conjoin
+    with someone, you trust their entire bus/network" (same #119 comment). See "What
+    turning it on grants".
 
 **The target resolves everything.** The target's own spanreed runs the operation, so
 paths, `claude` and `PATH` resolve there, and it logs every remote operation. This
@@ -1342,6 +1353,10 @@ can make a bypassPermissions sleeper and mark its folder trusted, pass an inline
 --mcp-config whose command Claude runs when the sleeper wakes, or point
 --debug-file at any file you can write.
 
+Conjoining with someone means trusting their entire bus and network: a machine
+conjoined only to one of your peers can reach adolin through it, if that peer's
+switch is on too.
+
 It stays on until `spanreed sleeper remote-access off`.
 PATH recorded for remote creates: /home/u/.local/bin:/usr/local/bin:/usr/bin
 
@@ -1401,6 +1416,16 @@ dialled often has no ssh path back at all (decision 1's Mac behind NAT), and for
 the switch is the only way in. Nor does any of this stop at the peer's owner: any
 agent or process running as that user on the peer can write the peer's request
 spool. The earlier draft called the grant "bounded" by the allowlist; it is not.
+
+**It is roughly the access ssh already gives, made bidirectional** (decision 9). A
+conjoin already implies that the dialling end can ssh into the other. The switch
+gives about the same power, but in both directions: the end that was ssh'd into can
+also manage the dialling end, which it may have no ssh access to. This is expected.
+
+**Conjoining with someone means trusting their entire bus and network**
+(decision 10). Trust is transitive: if A and B both have the switch on, a machine
+conjoined only to B can reach A through B, by running commands as the user on B and
+from there managing A's sleepers. This is by design and not limited.
 
 #### The audit log
 
