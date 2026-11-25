@@ -133,8 +133,8 @@ Decided after review of #119:
   own settings in the right environment, this is how the agentic world works and there's no
   inherent way around it without crazy security controls" (#86, comment of 2026-11-25 14:59).
   Nothing stronger, such as a root-owned file, is added. `architecture.md`, decision 7.
-- **What the grant amounts to.** In his sign-off on #119 (comment of 2026-11-25 15:39), the
-  owner called it roughly equivalent to the ssh access a conjoin implies, but bidirectional, and
+- **What the grant amounts to.** In the spanreed session (his words, recorded on #119 by the
+  coder in the comment of 2026-11-25 15:39), the owner called it roughly equivalent to the ssh access a conjoin implies, but bidirectional, and
   "this is expected"; and said trust is transitive across the conjoin graph, without changing the
   model: "when you conjoin with someone, you trust their entire bus/network". `architecture.md`,
   decisions 9 and 10.

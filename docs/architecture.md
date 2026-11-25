@@ -1112,11 +1112,13 @@ design that his words were an answer to, and says so.
    owner:* "again, this is relatively equivalent to the ssh access, other than the
    fact that it makes it bidirectional, which we should note, this is expected". The
    end that was ssh'd into can also manage the end that dialled it, which it may have
-   no ssh access to. Recorded in his sign-off on #119 (comment of 2026-11-25 15:39).
+   no ssh access to. These are his words in the spanreed session, recorded on #119 by
+   the coder (comment of 2026-11-25 15:39), not a GitHub comment of his own.
 10. **Trust is transitive across the conjoin graph, and the model stays as is.**
     *The owner:* "this is an interesting note, we should document this clearly, but I
     don't think we should change the model. it should be clear that when you conjoin
-    with someone, you trust their entire bus/network" (same #119 comment). See "What
+    with someone, you trust their entire bus/network" (his words in the spanreed
+    session, recorded in the same #119 comment). See "What
     turning it on grants".
 
 **The target resolves everything.** The target's own spanreed runs the operation, so
@@ -1199,8 +1201,8 @@ sending resolvable after the fact:
 
 1. **Before writing anything**, the CLI reads `peers/<peer>.json`. It refuses, with
    exit 2 and the remedy named, when there is no record ("no bridge to adolin has
-   ever attached here: run `spanreed conjoin adolin`"), when the bridge is detached
-   or its pid is dead (the same liveness test `spanreed list` uses), when this
+   ever attached here: run `spanreed conjoin adolin`"), when the link is not
+   **attached** (see "Which link state counts as down" below), when this
    host's bridge process doesn't list `sleeper-ops` in `bridge_features` (it was
    started by an older spanreed: restart `conjoin`), or when the peer didn't
    advertise `sleeper-ops` in its `hello` (see "Version skew"). No request is ever
@@ -1235,6 +1237,17 @@ operation on the target counts against it (see "On the target").
 can't be sent now fails now (step 1) or at its timeout (step 6). A `create` that
 fires hours later, when someone reconnects, would surprise whoever had given up on
 it.
+
+**Which link state counts as down.** A link is attached, reconnecting or stopped
+([`protocol.md`](protocol.md#peershostjson--peer-records), #34), judged by the same
+test `spanreed list` uses: `stopping_at` first, then the pid, then `detached_at`.
+For a remote sleeper request only **attached** counts as up. **Reconnecting** and
+**stopped** are both down: step 1 refuses at once, exit 2, and the error names the
+state ("the bridge to adolin is reconnecting (link dropped at …)" or "… is
+stopped"). Mail queues while `conjoin` reconnects; a sleeper request does not, since
+a reconnect may take hours. A request already written when an attached link drops
+is the one exception, and it is bounded: its `.json` or `.sent` file is sent or
+resent on reconnect only until its `expires_at`, at most 600 s after it was made.
 
 #### Every request expires
 
@@ -1428,7 +1441,10 @@ also manage the dialling end, which it may have no ssh access to. This is expect
 **Conjoining with someone means trusting their entire bus and network**
 (decision 10). Trust is transitive: if A and B both have the switch on, a machine
 conjoined only to B can reach A through B, by running commands as the user on B and
-from there managing A's sleepers. This is by design and not limited.
+from there managing A's sleepers. This is by design and not limited. The example
+is a lower bound: bus trust extends a third machine's reach beyond the switch,
+because B's agents can act on its messages (and, per decision 7, can turn B's switch
+on). That is what "trusting their entire bus and network" covers.
 
 #### The audit log
 
@@ -1573,20 +1589,18 @@ fail with "name already held" and report a failure for something that worked.
   `.abandoned` (see "Every request expires"). It never fires after the timeout the
   person chose.
 - **A second operation while one is running.** It waits on the target's queue
-  while the bridge is up (R6). While the bridge is down, it fails at once on the
-  requester (spool step 1).
-- **Issue [#34](https://github.com/Monkopedia/spanreed/issues/34)** (today a
-  bridge torn down cleanly deletes the peer's mirrored agents, so mail to them is
-  refused while it is down). Management never resolves through the
-  registry: the target looks the sleeper up by name in its own records, so #34
-  doesn't affect any operation here. While the bridge is down, a remote sleeper
-  can't be managed (no bridge, by design), whatever happens to its mail. After a
+  while the link is attached (R6). While the link is reconnecting or stopped, it
+  fails at once on the requester (spool step 1), naming the state.
+- **Issue [#34](https://github.com/Monkopedia/spanreed/issues/34)**, built in #120:
+  mail to a peer's mirrored agents queues while `conjoin` is reconnecting and is
+  refused once no `conjoin` for that host runs. Management never resolves through
+  the registry: the target looks the sleeper up by name in its own records, so #34
+  doesn't change any operation here. While the link is reconnecting or stopped, a
+  remote sleeper can't be managed (by design, see "Which link state counts as
+  down"), even though its mail queues while reconnecting. After a
   remote `create`, the new sleeper is addressable here as soon as the result
   arrives, because of the registry frame sent ahead of it, and from then on its
-  mail follows the same rule as every other mirrored agent. The owner decided #34
-  on 2026-11-25 (queue while `conjoin` is running and reconnecting, refuse when no
-  `conjoin` process runs for that host); it is built separately, and nothing in
-  this design depends on which rule is in force.
+  mail follows the same rule as every other mirrored agent.
 
 #### Validation on receipt
 
