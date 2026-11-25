@@ -19,6 +19,13 @@ never spoke" from "I dropped what it said". The pull turns that into a question
 this side asks and can count, and the peer record makes every one of those
 outcomes readable without attaching a debugger to either host.
 
+Mirrored rows are owned by the bridge **process**, not by one connection. On
+the connect end that process is ``conjoin``'s reconnect loop, which outlives a
+dropped link: the peer's agents stay addressable while it reconnects, mail for
+them queues in the outbound inbox, and the rows are cleared only when
+``conjoin`` exits (issue #34). The serve end's process ends with its link, so
+it clears them at teardown.
+
 Status: prototype. Point-to-point only. ``conjoin`` reconnects with backoff
 when the pipe dies (foreground command — supervision is the user's job);
 multi-hop routing and peer-host discovery are out of scope for now.
@@ -115,6 +122,7 @@ class Bridge:
         sync_interval: float = 3.0,
         recv_timeout: float | None = None,
         hello_timeout: float = 15.0,
+        mirror_outlives_link: bool = False,
     ) -> None:
         self._read = read
         self._write = write
@@ -129,6 +137,11 @@ class Bridge:
         # How long run() waits for the peer's hello. A parameter so the
         # no-handshake path can be tested without a 15-second test.
         self.hello_timeout = hello_timeout
+        # True under `conjoin`'s reconnect loop, which owns the mirrored rows
+        # for its whole life and clears them when it exits (#34). False for a
+        # bridge whose process ends with its link -- the serve end -- which
+        # clears them itself at teardown.
+        self.mirror_outlives_link = mirror_outlives_link
         self.peer_host: str | None = None
         self._stop = threading.Event()
         self._hello = threading.Event()
@@ -151,12 +164,14 @@ class Bridge:
         self._registry_requested = threading.Event()
         # A diagnosis observed before there was a peer record to write it to.
         self._deferred_note: str | None = None
-        # Teardown clears the mirrored agents, but the reader thread is still
-        # running then and can apply a registry frame the peer had already
-        # sent -- re-mirroring the peer's agents AFTER the clear. Those rows are
-        # owned by this process's pid, and `conjoin` outlives a dropped link,
-        # so they read as LIVE while the peer is disconnected. One lock and a
-        # flag make "clear" and "apply" mutually exclusive and final.
+        # Teardown ends this link's say over the mirror, but the reader thread
+        # is still running then and can apply a registry frame the peer had
+        # already sent. Without a guard that frame re-mirrors rows AFTER they
+        # were cleared (#81): on the serve end, after teardown's own clear; under
+        # `conjoin`, after its exit-time clear, or over the snapshot of the next
+        # connection. Those rows are owned by a live pid, so they would read as
+        # LIVE with nothing behind them. One lock and a flag make "tear down"
+        # and "apply" mutually exclusive and final.
         self._mirror_lock = threading.Lock()
         self._torn_down = False
         # Why the link ended, for the disconnect line. First writer wins: the
@@ -533,7 +548,8 @@ class Bridge:
             if self.peer_host is not None:
                 with self._mirror_lock:
                     self._torn_down = True
-                    self.store.clear_remote_agents(self.peer_host)
+                    if not self.mirror_outlives_link:
+                        self.store.clear_remote_agents(self.peer_host)
                 # The record is updated, never deleted: "a bridge to this host
                 # was up and is now gone" is a diagnosis, and removing the file
                 # would make it indistinguishable from "no bridge was ever
@@ -694,6 +710,7 @@ def _run_bridge_once(
         role="connect",
         recv_timeout=recv_timeout,
         hello_timeout=hello_timeout,
+        mirror_outlives_link=True,  # reconnect_loop clears them when conjoin exits
     )
     holder[0] = bridge
     try:
@@ -725,6 +742,12 @@ def reconnect_loop(
 
     ``peer`` names the far side in the status lines; it is display-only.
 
+    This loop is what owns the peer's mirrored agents: they are written under
+    this process's pid, survive every dropped link so mail for the peer keeps
+    queuing while it reconnects, and are cleared here when the loop ends
+    (issue #34). A ``conjoin`` killed before it gets here leaves them behind
+    with a dead owner pid, which the resolver refuses.
+
     The ``spawn``/``run_once``/``wait``/``shutdown`` seams are injectable for
     testing; the defaults use real subprocesses and a shutdown-interruptible
     sleep.
@@ -741,20 +764,26 @@ def reconnect_loop(
     backoff = _BASE_BACKOFF
     attempts = 0
     target = peer or "peer"
-    while not shutdown.is_set():
-        _status(f"connecting to {target}..." if attempts == 0 else f"reconnecting to {target}...")
-        proc = spawn(argv)
-        uptime = run_once(proc, label, store, holder)
-        if shutdown.is_set():
-            break
-        attempts += 1
-        if max_reconnects is not None and attempts >= max_reconnects:
-            _status(f"giving up after {attempts} attempt(s) (--max-reconnects)")
-            break
-        backoff = _BASE_BACKOFF if uptime >= _HEALTHY_UPTIME else min(backoff * 2, _MAX_BACKOFF)
-        delay = backoff + backoff * 0.5 * random.random()  # jittered
-        _status(f"retrying in {delay:.0f}s")
-        waiter(delay)
+    try:
+        while not shutdown.is_set():
+            _status(
+                f"connecting to {target}..." if attempts == 0 else f"reconnecting to {target}..."
+            )
+            proc = spawn(argv)
+            uptime = run_once(proc, label, store, holder)
+            if shutdown.is_set():
+                break
+            attempts += 1
+            if max_reconnects is not None and attempts >= max_reconnects:
+                _status(f"giving up after {attempts} attempt(s) (--max-reconnects)")
+                break
+            backoff = _BASE_BACKOFF if uptime >= _HEALTHY_UPTIME else min(backoff * 2, _MAX_BACKOFF)
+            delay = backoff + backoff * 0.5 * random.random()  # jittered
+            _status(f"retrying in {delay:.0f}s")
+            waiter(delay)
+    finally:
+        pid = os.getpid()
+        store.clear_agents_owned_by(pid, pid_start_time(pid))
     _status("stopped")
     return 0
 

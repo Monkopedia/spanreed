@@ -23,11 +23,12 @@ Spanreed is for what it doesn't cover:
   Native cross-machine messaging needs Remote Control at both ends: a paid claude.ai
   sign-in, not an API key, Bedrock, Vertex or Foundry, and on Team or Enterprise only
   once an Owner enables it.
-- **Durable mail, on one machine.** Inboxes are files, so mail to a local agent waits
-  while it isn't running, including a sleeper that is asleep. Across machines it does
-  not yet: while a `conjoin` bridge is down, the far host's agents drop off the bus and
-  sends to them fail ([#34](https://github.com/Monkopedia/spanreed/issues/34)). Native
-  cross-machine messaging does queue for an offline peer.
+- **Durable mail.** Inboxes are files, so mail to a local agent waits while it
+  isn't running, including a sleeper that is asleep. Across machines, mail queues
+  while the link is down as long as `conjoin` is running and reconnecting; with no
+  `conjoin` running, sends to the far host are refused
+  ([#34](https://github.com/Monkopedia/spanreed/issues/34)). Native cross-machine
+  messaging queues for an offline peer with nothing to keep running.
 - **Threading.** Messages carry `msg_id` and `in_reply_to`, and `wait_for_reply`
   blocks on the answer, which request/response between agents is built on.
 - **[Codex workers](#codex-workers-experimental)**, which have no native address.
@@ -171,7 +172,7 @@ Check it with `spanreed list`, whose `PEERS` section shows every bridge and when
 
 Prerequisites: `spanreed-bus` ≥ 0.0.4 on both hosts, and key-based non-interactive SSH (it reconnects unattended, so it can't answer a password prompt). Full setup, the most common SSH gotcha (non-default key name), and how to update `spanreed` on a peer host: [`docs/cross-host.md`](docs/cross-host.md). Design in [`docs/architecture.md`](docs/architecture.md#cross-host-the-ssh-bus-bridge).
 
-**Mail does not wait for a bridge that is down.** When the pipe drops, the peer's agents are removed from `list_agents` and a send to an `agent-xxxx@host` address usually fails until the bridge reconnects and re-syncs ([#34](https://github.com/Monkopedia/spanreed/issues/34)). That holds after a clean teardown; if `conjoin` is killed instead, the peer's rows can linger, and a send to the exact address still queues. Mail already accepted while the bridge was up is kept and sent on reconnect.
+**Mail waits for a bridge that is reconnecting, not for one that is stopped.** While `conjoin` is running, the peer's agents stay in `list_agents` even when the pipe drops: a send to an `agent-xxxx@host` address queues, the send's result says the bridge is reconnecting and when it last connected, and the reconnect delivers it. `spanreed list` shows that bridge as `RECONNECTING`. Once no `conjoin` for that host is running (you stopped it, it gave up, it crashed or it was killed), sends to the host are refused with an error saying no bridge is running to deliver them ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
 
 Experimental and point-to-point only — no multi-hop routing or peer discovery yet.
 

@@ -42,7 +42,7 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
@@ -216,26 +216,40 @@ depend on another module having checked first.
 """
 
 
-def peer_link_is_attached(link: PeerLink) -> bool:
-    """True iff ``link``'s bridge process is still running.
+PeerLinkState = Literal["attached", "reconnecting", "stopped"]
 
-    The same PID + start-time test :func:`is_stale` applies to agents, and for
-    the same reason: a mirrored ``@host`` entry is live exactly while the bridge
-    that created it is, so the link's liveness must be computed identically or
-    ``list`` and ``list_agents`` would disagree with each other.
 
-    ``detached_at`` is checked first because a clean teardown is authoritative,
-    but it is **not** sufficient on its own: a bridge killed with SIGKILL never
-    writes it, so a record with ``detached_at is None`` may still belong to a
-    long-dead process. Never read ``detached_at is None`` as "attached".
+def peer_link_state(link: PeerLink) -> PeerLinkState:
+    """Which of the three states a bridge to ``link.host`` is in (issue #34).
+
+    - ``attached``: the bridge process is running and its link is up, so mail
+      for the peer is forwarded continuously.
+    - ``reconnecting``: a ``conjoin`` (the connect end) is running but its link
+      is down and its reconnect loop is retrying. The peer's mirrored agents
+      stay addressable and mail queues in the outbound inbox until the
+      reconnect drains it.
+    - ``stopped``: no bridge process for that host is running -- it exited,
+      crashed or was killed. Mail for the peer is refused.
+
+    Liveness is the same PID + start-time test :func:`is_stale` applies to
+    agents, because a mirrored ``@host`` row is owned by the bridge's pid: the
+    link and its rows must be judged alive identically or ``list`` and
+    ``list_agents`` would disagree. ``detached_at`` marks a link that dropped,
+    never a process that ended -- a bridge killed with SIGKILL writes nothing --
+    so it separates attached from reconnecting and nothing more. A ``serve``
+    end has no reconnect loop: its process ends with its link, so a detached
+    serve link is stopped even in the moment before that process exits.
     """
-    if link.detached_at is not None:
-        return False
-    if not _is_pid_alive(link.bridge_pid):
-        return False
-    if link.bridge_pid_start is None:
-        return True
-    return pid_start_time(link.bridge_pid) == link.bridge_pid_start
+    if not process_is_alive(link.bridge_pid, link.bridge_pid_start):
+        return "stopped"
+    if link.detached_at is None:
+        return "attached"
+    return "reconnecting" if link.role == "connect" else "stopped"
+
+
+def peer_link_is_attached(link: PeerLink) -> bool:
+    """True iff ``link``'s bridge is running with its link up. See :func:`peer_link_state`."""
+    return peer_link_state(link) == "attached"
 
 
 class AgentIdHeld(RuntimeError):
@@ -509,8 +523,10 @@ class StateStore:
         Used by the cross-host bridge. ``remote_agents`` are the peer's *bare*
         local agents; each is stored locally as ``<id>@<home_host>`` owned by
         the bridge's own pid/pid_start, so :func:`is_stale` treats them as live
-        exactly while the bridge is. Replaces any prior ``@home_host`` entries
-        (so departed remote agents drop out).
+        exactly while the bridge process is. For ``conjoin`` that process is the
+        long-lived reconnect loop, so the rows outlive a dropped link and stay
+        addressable while it reconnects (issue #34). Replaces any prior
+        ``@home_host`` entries (so departed remote agents drop out).
         """
         suffix = f"@{home_host}"
         now = datetime.now(UTC)
@@ -540,9 +556,23 @@ class StateStore:
     def clear_remote_agents(self, home_host: str) -> None:
         """Remove all mirrored ``@home_host`` entries (bridge teardown)."""
         suffix = f"@{home_host}"
+        self._drop_rows(lambda a: a.agent_id.endswith(suffix))
+
+    def clear_agents_owned_by(self, owner_pid: int, owner_pid_start: int | None) -> None:
+        """Remove every mirrored row one bridge process owns (``conjoin`` exiting).
+
+        Keyed on the owner rather than a host because the reconnect loop does not
+        know the label a peer declares in its hello, and a peer may come back
+        under another one: every row this process mirrored must go when it ends.
+        """
+        self._drop_rows(
+            lambda a: "@" in a.agent_id and (a.pid, a.pid_start) == (owner_pid, owner_pid_start)
+        )
+
+    def _drop_rows(self, doomed: Callable[[Agent], bool]) -> None:
         with self._registry_lock():
             agents = self._read_registry_unlocked()
-            kept = [a for a in agents if not a.agent_id.endswith(suffix)]
+            kept = [a for a in agents if not doomed(a)]
             if len(kept) != len(agents):
                 self._write_registry_unlocked(kept)
 
@@ -610,7 +640,11 @@ class StateStore:
           An id is canonical and unambiguous, and a session that is merely
           restarting must keep accepting mail that waits for it. (The caller is
           still told it was not delivered to a running session — see
-          :meth:`delivery_verdict`.)
+          :meth:`delivery_verdict`.) The exception is a mirrored ``<id>@<host>``
+          row whose owning bridge process is gone: no ``conjoin`` for that host
+          is running, so nothing would ever forward the mail, and it is refused
+          (issue #34). A bridge that is only reconnecting keeps its process, and
+          so its rows, alive.
         - ``to_agent`` matches exactly one **live** agent's display name →
           resolve to that agent's id (``send_message("ksrpc", ...)`` works).
         - several live agents share the name → ambiguous, raise.
@@ -625,7 +659,10 @@ class StateStore:
           first unless the error says so (issue #55).
         """
         agents = self.list_agents(include_stale=True)
-        if any(a.agent_id == to_agent for a in agents):
+        exact = next((a for a in agents if a.agent_id == to_agent), None)
+        if exact is not None:
+            if "@" in to_agent and is_stale(exact):
+                raise ValueError(self._no_bridge_running_error(to_agent))
             return to_agent
         by_name = [a for a in agents if a.name == to_agent]
         sleeper_ids = self.sleeper_ids()
@@ -703,18 +740,23 @@ class StateStore:
                 f"sync; `spanreed list` shows every peer this bus has bridged and when "
                 f"each last synced."
             )
-        if not peer_link_is_attached(link):
-            detached = (
-                f"at {link.detached_at.isoformat()}"
-                if link.detached_at is not None
-                else "without tearing down cleanly, so its process is simply gone"
-            )
+        state = peer_link_state(link)
+        if state == "stopped":
             return (
-                prefix + f"The bridge to {host!r} is DETACHED: the `spanreed conjoin` "
-                f"process that owned it (pid {link.bridge_pid}, role {link.role}) ended "
-                f"{detached}. Mirrored agents are dropped when their bridge goes away, "
-                f"so nothing on {host!r} is addressable from this host until the bridge "
-                f"is restarted (`spanreed conjoin {host}`). " + not_evidence
+                prefix + self._bridge_stopped(host, link) + f"Mirrored agents are dropped "
+                f"when their bridge process ends, so nothing on {host!r} is addressable "
+                f"from this host until the bridge is restarted (`spanreed conjoin "
+                f"{host}`). " + not_evidence
+            )
+        if state == "reconnecting":
+            known = sorted(a.agent_id for a in agents if a.agent_id.endswith(f"@{host}"))
+            return (
+                prefix + self._bridge_reconnecting(host, link) + f"The agents its last "
+                f"registry snapshot named stay addressable while it reconnects, and "
+                f"{local_part!r} is not among them: "
+                f"{', '.join(known) if known else '(none)'}. If it registered on "
+                f"{host!r} after that snapshot, it becomes addressable at the first "
+                f"sync after the reconnect. " + not_evidence
             )
         attached_for = format_age(link.attached_at)
         if link.last_registry_at is None:
@@ -757,6 +799,50 @@ class StateStore:
             f"{advertising}. Call list_agents for the full set."
         )
 
+    @staticmethod
+    def _bridge_stopped(host: str, link: PeerLink) -> str:
+        """The bridge process for ``host`` is gone, and when it last ran."""
+        dropped = (
+            f"its link dropped {format_age(link.detached_at)}"
+            if link.detached_at is not None
+            else "it was killed without tearing its link down"
+        )
+        return (
+            f"NO BRIDGE IS RUNNING to {host!r}: the `spanreed conjoin` process that "
+            f"owned it (pid {link.bridge_pid}, role {link.role}) is no longer running. "
+            f"It last connected {format_age(link.attached_at)}, and {dropped}. "
+        )
+
+    @staticmethod
+    def _bridge_reconnecting(host: str, link: PeerLink) -> str:
+        """``conjoin`` for ``host`` is running; its link is down and retrying."""
+        return (
+            f"The bridge to {host!r} is RECONNECTING: its `spanreed conjoin` process "
+            f"(pid {link.bridge_pid}) is running, but the link dropped "
+            f"{format_age(link.detached_at)} and it is retrying. It last connected "
+            f"{format_age(link.attached_at)}. "
+        )
+
+    def _no_bridge_running_error(self, to_agent: str) -> str:
+        """Why an exact mirrored id whose bridge process has ended is refused."""
+        host = to_agent.rpartition("@")[2]
+        link = self.read_peer_link(host) if _HOST_FILENAME_RE.fullmatch(host) else None
+        why = (
+            self._bridge_stopped(host, link)
+            if link is not None and peer_link_state(link) == "stopped"
+            else "The `spanreed conjoin` process that mirrored it is no longer running. "
+        )
+        return (
+            f"{to_agent!r} is a mirrored entry for host {host!r}, and there is no bridge "
+            f"running to deliver it. " + why + f"Refusing rather than queuing: mail for "
+            f"another host is accepted only while a `spanreed conjoin` for that host is "
+            f"running, connected or reconnecting, because nothing else will ever forward "
+            f"it. This row is left over from that process and says nothing about whether "
+            f"the agent on {host!r} is running. Restart the bridge with `spanreed conjoin "
+            f"{host}` and send again once it has synced; `spanreed list` shows every peer "
+            f"and its state."
+        )
+
     def delivery_verdict(self, agent_id: str) -> tuple[bool, str]:
         """Whether a live process is watching ``agent_id``'s inbox, and why.
 
@@ -769,7 +855,10 @@ class StateStore:
 
         Returns ``(True, ...)`` only when something is actually tailing that
         inbox: a live local session, or — for a mirrored ``<id>@<host>`` inbox —
-        an attached bridge that will forward it.
+        an attached bridge that will forward it. A mirrored inbox has two other
+        answers, and they read differently: *queued, bridge reconnecting* while
+        a ``conjoin`` for the host runs with its link down, and *no bridge
+        running* when none does (issue #34; see :func:`peer_link_state`).
         """
         entry = next(
             (a for a in self.list_agents(include_stale=True) if a.agent_id == agent_id), None
@@ -787,14 +876,22 @@ class StateStore:
         _, _, host = agent_id.rpartition("@")
         if "@" in agent_id:
             link = self.read_peer_link(host) if _HOST_FILENAME_RE.fullmatch(host) else None
-            if link is None or not peer_link_is_attached(link):
+            state = peer_link_state(link) if link is not None else "stopped"
+            if link is None or state == "stopped":
                 return False, (
-                    f"NOT DELIVERED TO A LIVE SESSION: {agent_id!r} is a mirrored entry "
-                    f"for host {host!r}, and this bus has no attached bridge to {host!r} "
-                    f"right now. The message was appended to inboxes/{agent_id}.jsonl and "
-                    f"will be forwarded when `spanreed conjoin {host}` next attaches and "
-                    f"drains that inbox — treat it as QUEUED, not delivered, and do not "
-                    f"wait on a reply."
+                    f"NOT DELIVERED: NO BRIDGE IS RUNNING to {host!r}. {agent_id!r} is a "
+                    f"mirrored entry for that host, but no `spanreed conjoin` process for "
+                    f"it is running now, so nothing will forward the message from "
+                    f"inboxes/{agent_id}.jsonl unless a bridge to {host!r} is started "
+                    f"again. Do not wait on a reply."
+                )
+            if state == "reconnecting":
+                return False, (
+                    f"QUEUED, BRIDGE RECONNECTING: {agent_id!r} is a mirrored entry for "
+                    f"host {host!r}. " + self._bridge_reconnecting(host, link) + f"The "
+                    f"message was appended to inboxes/{agent_id}.jsonl and is forwarded "
+                    f"when the reconnect succeeds. Treat it as QUEUED, not delivered, and "
+                    f"do not wait on a reply."
                 )
             return True, (
                 f"Queued for the bridge to {host!r} (conjoin pid {link.bridge_pid}, "

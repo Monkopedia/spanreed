@@ -130,16 +130,25 @@ One record per peer host a `spanreed conjoin` bridge has ever attached here. Wri
 }
 ```
 
-**Liveness of a link is the bridge PID**, computed exactly as `is_stale` computes an agent's — PID alive *and* start-time matching. This is not a second liveness model: a mirrored `@host` registry entry records the bridge's PID for the same reason, so link state and mirrored-agent state can never disagree. `detached_at` is authoritative when set (a clean teardown) but **is not sufficient**: a bridge killed with `SIGKILL` never writes it, so `detached_at == null` must never be read as "attached".
+**Liveness of a link is the bridge PID**, computed exactly as `is_stale` computes an agent's — PID alive *and* start-time matching. This is not a second liveness model: a mirrored `@host` registry entry records the bridge's PID for the same reason, so link state and mirrored-agent state can never disagree. On the connect end that PID is `conjoin`'s, which outlives a dropped link. A link is in one of three states ([#34](https://github.com/Monkopedia/spanreed/issues/34)):
+
+| state | test | mail for the peer |
+|---|---|---|
+| **attached** | pid live, `detached_at` null | forwarded continuously |
+| **reconnecting** | pid live, `detached_at` set, `role` `connect` | queued; the reconnect drains it |
+| **stopped** | pid dead (or recycled), or a `serve` record with `detached_at` set | refused |
+
+`detached_at` records that a **link** dropped, never that a process ended: a bridge killed with `SIGKILL` never writes anything, so `detached_at == null` must never be read as "attached". A serve end has no reconnect loop and exits with its link, so a detached serve record is stopped even in the moment before its process exits.
 
 **Records are kept after teardown, never deleted.** "A bridge to this host was up and is now gone" is a diagnosis; deleting the file makes it indistinguishable from "no bridge was ever configured", and those have different remedies.
 
-The field that matters is `last_registry_at`. `null` means this host has **never** received a registry snapshot from that peer — the exact state issue #55 was reported for, in which none of the peer's agents are addressable while messages still cross the bridge normally in both directions. The four states a reader must be able to tell apart:
+The field that matters is `last_registry_at`. `null` means this host has **never** received a registry snapshot from that peer — the exact state issue #55 was reported for, in which none of the peer's agents are addressable while messages still cross the bridge normally in both directions. The states a reader must be able to tell apart:
 
 | state | reads as | remedy |
 |---|---|---|
 | no record for the host | no bridge was ever started for it here | `spanreed conjoin <host>` |
-| record present, `detached_at` set or `bridge_pid` dead | the bridge died | restart `conjoin` |
+| record present, `bridge_pid` dead | no bridge is running; mail for the host is refused | restart `conjoin` |
+| `connect` record, `detached_at` set, `bridge_pid` live | `conjoin` is reconnecting; mail for the host queues | none needed; check the link if it persists |
 | attached, `last_registry_at` null | the peer is not advertising | check `spanreed list` **on the peer** |
 | attached, `last_registry_agents` 0 | the peer answered and has nothing live | fix the peer's own agents; `peer_registry_rows`/`peer_stale_rows` say whether they exist but fail its liveness check |
 
@@ -174,20 +183,22 @@ real stdio transport.
 
 Resolution, in order:
 
-1. **An exact `agent_id`** — used as-is, **stale included**. An id is canonical, and a session that is merely restarting must keep accepting mail that waits for it. (The sender is still told it was not delivered to a running session; see below.)
+1. **An exact `agent_id`** — used as-is, **stale included**. An id is canonical, and a session that is merely restarting must keep accepting mail that waits for it. (The sender is still told it was not delivered to a running session; see below.) **Except a mirrored `<id>@<host>` row whose owner pid is dead**: no `conjoin` for that host is running, so nothing would forward the mail, and the send **raises**, saying no bridge is running to deliver it ([#34](https://github.com/Monkopedia/spanreed/issues/34)). This is the killed-`conjoin` case, whose rows linger because its exit never ran. A `conjoin` that is only reconnecting keeps its pid, and its rows, alive.
 2. **A display name matching exactly one LIVE agent** — resolves to that agent's id.
 3. **A display name matching several live agents** — ambiguous, raises.
 4. **A display name matching only agents whose session has exited** — **raises**. This is issue #55's silent-loss case: two dead rows shared a display name with a live agent, a send to that name resolved to a dead local inbox, and the sender was told it succeeded. A stopped session is never a name-resolution target; addressing one requires its exact id.
 5. **Anything else** — raises, with a message that distinguishes *no such agent* from *this host has no synced registry for that host*.
 
-**Step 5's message is part of the spec, not an implementation detail.** Before #55 there was one message — "…is not a registered agent_id or display name. Call list_agents to find the recipient's agent_id." — and for an `<id>@<host>` address whose peer had never synced, that remedy is actively misleading: `list_agents` returns nothing for that host and so *confirms* the false conclusion that the agent is gone. Three days were lost to it. An address naming a host is therefore diagnosed against that host's peer record, producing six distinct messages: unknown bare id, no bridge to that host, bridge detached, bridge attached but never synced, bridge synced but advertising zero agents, and bridge healthy with the id genuinely unknown. Only the first still says "Call list_agents".
+**Step 5's message is part of the spec, not an implementation detail.** Before #55 there was one message — "…is not a registered agent_id or display name. Call list_agents to find the recipient's agent_id." — and for an `<id>@<host>` address whose peer had never synced, that remedy is actively misleading: `list_agents` returns nothing for that host and so *confirms* the false conclusion that the agent is gone. Three days were lost to it. An address naming a host is therefore diagnosed against that host's peer record, producing seven distinct messages: unknown bare id, no bridge to that host, no bridge running (its `conjoin` ended), bridge reconnecting with the id absent from its last snapshot, bridge attached but never synced, bridge synced but advertising zero agents, and bridge healthy with the id genuinely unknown. Only the first still says "Call list_agents".
 
 ### Delivery is not resolution
 
 `send_message` returning normally means the message was appended. Whether anyone will read it is a separate question, answered by `delivered_to_live_session`:
 
 - `true` — a live local session is tailing that inbox, or (for a mirrored `<id>@<host>` inbox) an attached bridge will forward it.
-- `false` — the message is **queued**. The recipient's session has exited, or the bridge for its host is not attached. `delivery` explains which.
+- `false` — the message is **queued**. The recipient's session has exited, or the `conjoin` for its host is running but reconnecting (`delivery` begins `QUEUED, BRIDGE RECONNECTING` and says when the link dropped and when it last connected). `delivery` explains which.
+
+A send to a host with no `conjoin` running is refused at resolution (above), so it never reaches a verdict. The one exception is a bridge that stops between the append and the verdict, which reads `NOT DELIVERED: NO BRIDGE IS RUNNING` ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
 
 Queuing rather than refusing is deliberate: a restarting session picks its mail up. Reporting that as plain success is not — the CLI exits **3** for it (`spanreed send`), and the MCP tool's docstring directs the agent to check the flag and say "queued" rather than "sent".
 
@@ -423,7 +434,7 @@ while the bridge is, like any mirrored row: this host has no record for it.
 
 Both self-set presence fields are carried through: `focus` and `status` are mirrored from the peer's entry as-is, so a remote agent's `needs_input`/`blocked` is visible to a local `list_agents` scan. They inherit the same bounded staleness as everything else in the snapshot — a change on the peer (including the `status` reset on re-registration) reaches the mirror on the next registry sync.
 
-`pid`/`pid_start` are the **bridge's**, not the remote process's (whose PID is meaningless locally). So `is_stale` treats a mirrored entry as live exactly while the bridge is alive — if the pipe/bridge dies, every mirrored entry goes stale and remote agents drop out of `list_agents`. The bridge refreshes the set on each registry sync from the peer (adding new agents, removing departed ones).
+`pid`/`pid_start` are the **bridge process's**, not the remote process's (whose PID is meaningless locally). So `is_stale` treats a mirrored entry as live exactly while that process is alive. On the connect end it is `conjoin`, which outlives a dropped link: its mirrored entries stay live and addressable while it reconnects, and it removes every entry it owns when it exits ([#34](https://github.com/Monkopedia/spanreed/issues/34)). If it is killed instead, its entries go stale and drop out of `list_agents`, and a send to one is refused. On the serve end the process ends with its link and removes its entries at teardown. The bridge refreshes the set on each registry sync from the peer (adding new agents, removing departed ones).
 
 ### Inbox-as-outbound-queue
 
@@ -476,7 +487,7 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
 
   On a label that fails validation the receiver **sends nothing further and closes**. Specifically, it does **not** send a `registry` frame — that frame carries agent ids, display names, absolute working directories, pids and focus text, and a peer whose identity was just rejected must not receive it. `hello` is the only frame a refused peer ever sees, and it was already in flight. The refusal is reported on stderr, naming the rule and the `--label` override; stdout is the pipe and carries nothing but frames.
 
-  A receiver that gives up waiting for `hello` (`--handshake-timeout`) has ended that attempt, and the decision is **final**: a `hello` that arrives afterwards is ignored, so it opens no peer record and the `registry` frame behind it mirrors nothing. Otherwise the late peer's agents would be mirrored, and its link recorded as attached, under the pid of a `conjoin` that is alive but no longer connected, and both would read as live (issue #83). A `hello` the receiver accepted before giving up counts as arriving in time, and the link proceeds normally.
+  A receiver that gives up waiting for `hello` (`--handshake-timeout`) has ended that attempt, and the decision is **final**: a `hello` that arrives afterwards is ignored, so it opens no peer record and the `registry` frame behind it mirrors nothing. Otherwise the late peer's agents would be mirrored, and its link recorded as attached, under the pid of a `conjoin` that had given up on that attempt, and both would read as live and connected (issue #83). Likewise a `registry` frame that a link's reader applies after that link's teardown is ignored, so it cannot replace the mirror a later connection owns, or bring back rows that were cleared (issue #81). A `hello` the receiver accepted before giving up counts as arriving in time, and the link proceeds normally.
 - `ping` — keepalive; lets each side detect a dead pipe and lets `connect` trigger reconnect.
 
 ### Address rewriting (done by the sending bridge)
