@@ -508,7 +508,13 @@ class TestIdempotency:
 
         A second worker in this process starts on the same request while the
         first is between reading it and marking it running, and again while
-        the create is under way. The create runs once."""
+        the create is under way. The create runs once.
+
+        The first of those waits on the lock. It is joined at the start of the
+        create, once the first worker has let go of the lock and before it takes
+        it again to store the result, so it always finds the record ``running``.
+        Left to the scheduler, it could find it ``done`` and return the stored
+        result, which is also correct but not what this asserts."""
         sent = frame("create", create_args(str(proj)))
         receipt = target(switched_on).receive(sent)
         assert receipt.action == "run" and receipt.request_id is not None
@@ -522,6 +528,9 @@ class TestIdempotency:
         def counting_create(*args: Any, **kw: Any) -> int:
             runs.append(request_id)
             if len(runs) == 1:
+                for thread in threads:
+                    if thread is not threading.current_thread():
+                        thread.join(timeout=10)  # the lock is free and the record running
                 others.append(second.run(request_id))  # mid-create: the record is running
             return real_create(*args, **kw)
 
