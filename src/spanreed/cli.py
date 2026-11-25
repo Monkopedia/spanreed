@@ -113,7 +113,7 @@ def _refuse_defaulted_pid(agent_id: str) -> str | None:
     """
     live = StateStore().list_agents()
     claude_pid = os.environ.get("CLAUDE_PID")
-    if claude_pid and claude_pid.isdigit() and int(claude_pid) > 0:
+    if claude_pid and claude_pid.isdecimal() and int(claude_pid) > 0:
         ours = [a for a in live if a.pid == int(claude_pid)]
         if len(ours) > 1:
             ids = ", ".join(a.agent_id for a in ours)
@@ -560,22 +560,23 @@ def _ensure_registered(store: StateStore, agent_id: str) -> None:
     documented as useful from a terminal, where nothing has registered — so
     register first, then the caller retries its set.
 
-    Reachable on the cwd-derived fallback: when ``session_agent_identity``
-    resolves a *registered* session, the set it precedes cannot have missed.
-    Not the only way in — ``SPANREED_AGENT_NAME`` is precedence 1 and never
-    consults the registry, so an override session reaches here for its **own**
-    id and then records an ephemeral pid, never anchoring. Pre-existing, and #38
-    owns whether the stub should special-case it.
+    ``os.getppid()``, deliberately, and NOT :func:`session_pid`, under every
+    anchor state. The two ``_ensure_registered`` rows of the ``pid`` invariant
+    table in ``docs/protocol.md`` ("What `pid` means") say why, and
+    ``tests/unit/test_pid_invariant.py`` pins them:
 
-    ``os.getppid()``, deliberately, and NOT :func:`session_pid` — this is the
-    one writer where the rule in ``protocol.md`` must not apply. Reaching here
-    from inside a session means the anchor found nothing, so ``agent_id`` is
-    cwd-derived and by construction *not* this session's. Stamping
-    ``$CLAUDE_PID`` on it would attach our liveness to an entry that is not
-    ours, permanently: it would never decay, ``is_stale`` would confirm it, and
-    the resolver would then find two live entries claiming one pid. A doomed
-    shell pid is the right answer precisely because it fails closed — the stub
-    evaporates when the command does.
+    - **cwd-derived id**: the anchor found no row, so the id is not known to be
+      this session's. It may be another directory's, or our own before anything
+      registered it. Stamping ``$CLAUDE_PID`` on a foreign id would never decay:
+      ``is_stale`` would confirm it, and the resolver would then find two live
+      entries claiming one pid. A shell pid fails closed instead: the stub lives
+      as long as the parent shell, which inside a session is the Bash tool's
+      and exits with the tool call. For a human at a terminal it is their
+      interactive shell, so the stub is listed for as long as that shell runs.
+    - **``SPANREED_AGENT_NAME`` set**: the override names the id, but child
+      processes inherit it and nothing authenticates it, so recording the anchor
+      would let a child session stamp its liveness onto the parent's id. Owner
+      decision, 2026-11-25 (#38).
 
     (This was changed to ``session_pid()`` in an earlier revision of #37 while
     this docstring, which already said why not, was left untouched. Review

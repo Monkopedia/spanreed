@@ -779,9 +779,10 @@ class TestRegisterRecordsTheClaudePid:
 
         An earlier revision of this PR switched it to `session_pid()` and this
         test asserted that — encoding the bug. Reaching that path from inside a
-        session means the anchor found nothing, so the id is cwd-derived and by
-        construction not ours. Stamping `$CLAUDE_PID` there attaches our
-        liveness to a foreign entry permanently: it never decays, `is_stale`
+        session means the anchor found nothing, so the id is cwd-derived and
+        not known to be ours (it may be another directory's). Stamping
+        `$CLAUDE_PID` there attaches our liveness to a foreign entry
+        permanently: it never decays, `is_stale`
         confirms it, and the resolver then sees two live entries claiming one
         pid. A doomed shell pid is right because it fails closed.
         """
@@ -798,6 +799,18 @@ class TestRegisterRecordsTheClaudePid:
         liveness matters, so `getppid()` is the right answer, not a fallback we
         tolerate. This is the path the three auto-register tests exercise."""
         _, out = _run(capsys, ["register"])
+        assert json.loads(out)["pid"] == os.getppid()
+
+    def test_a_non_decimal_digit_anchor_falls_back_instead_of_raising(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#94 settled that a `$CLAUDE_PID` that is not a positive decimal
+        integer matches nothing. `register`'s refusal guard tested it with
+        `isdigit`, which "²" passes and `int()` then rejects, so `register`
+        died with a traceback instead of falling back to `getppid()`."""
+        monkeypatch.setenv("CLAUDE_PID", "²")
+        rc, out = _run(capsys, ["register"])
+        assert rc == 0
         assert json.loads(out)["pid"] == os.getppid()
 
 
