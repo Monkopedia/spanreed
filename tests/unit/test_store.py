@@ -1138,6 +1138,32 @@ class TestStoppingAt:
         assert found is not None and found.stopping_at is not None
         assert found.note == "late junk line"
 
+    def test_mark_does_not_lose_a_note_written_during_it(
+        self, store: StateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#122: the reader thread persisting a note between the mark's read and
+        its write must not be overwritten by the copy read before it."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        link = _peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start)
+        store.write_peer_link(link)
+        noted = link.model_copy(update={"note": "written mid-mark"})
+        writer = threading.Thread(target=store.write_peer_link, args=(noted,))
+        real_list = store.list_peer_links
+
+        def list_then_race() -> list[PeerLink]:
+            links = real_list()
+            if not writer.is_alive() and writer.ident is None:
+                writer.start()
+                writer.join(timeout=0.5)  # blocks on the lock when the mark holds it
+            return links
+
+        monkeypatch.setattr(store, "list_peer_links", list_then_race)
+        store.mark_peer_links_stopping(me, me_start)
+        writer.join()
+        found = store.read_peer_link("adolin")
+        assert found is not None and found.stopping_at is not None
+        assert found.note == "written mid-mark"
+
     def test_a_new_conjoin_overwrites_it(self, store: StateStore) -> None:
         me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
         store.write_peer_link(_peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start))

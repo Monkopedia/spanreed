@@ -79,8 +79,10 @@ _DEFAULT_POLL_INTERVAL_S = 0.1
 # Serializes peer-record writes within one process, so the read-then-write that
 # keeps ``stopping_at`` sticky in ``write_peer_link`` cannot interleave with a
 # bridge's reader thread persisting the same record. The stickiness applies only
-# to a record this process owns, so a process-local lock is enough.
-_PEER_WRITE_LOCK = threading.Lock()
+# to a record this process owns, so a process-local lock is enough. Reentrant
+# because ``mark_peer_links_stopping`` holds it around its own read and the
+# ``write_peer_link`` calls it makes.
+_PEER_WRITE_LOCK = threading.RLock()
 
 
 def default_state_root() -> Path:
@@ -631,11 +633,15 @@ class StateStore:
         Keyed on the owner for the same reason that method is.
         """
         now = datetime.now(UTC)
-        for link in self.list_peer_links():
-            if (link.bridge_pid, link.bridge_pid_start) != (owner_pid, owner_pid_start):
-                continue
-            if link.stopping_at is None:
-                self.write_peer_link(link.model_copy(update={"stopping_at": now}))
+        # Held across the read as well as the write: a note the reader thread
+        # persists between the two would otherwise be overwritten by the copy
+        # read before it (issue #122).
+        with _PEER_WRITE_LOCK:
+            for link in self.list_peer_links():
+                if (link.bridge_pid, link.bridge_pid_start) != (owner_pid, owner_pid_start):
+                    continue
+                if link.stopping_at is None:
+                    self.write_peer_link(link.model_copy(update={"stopping_at": now}))
 
     def list_peer_links(self) -> list[PeerLink]:
         """Every peer record on this bus, attached or not, sorted by host.
