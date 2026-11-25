@@ -3,17 +3,21 @@
 ## 0.4.2
 
 **Upgrading:** update the package and the plugin on every host, the same way as for 0.4.1.
-Nothing else needs to change.
+**Recommended for anyone on 0.4.1 or earlier:** it fixes a regression you probably already
+have (below). Nothing else needs to change.
 
 ### Fixes
 
-- **Tool errors reach the agent in full again.** The bundled `mcp` library moves from 2.0 to
-  2.3 (#103). Since `mcp` 2.1, any error other than a tool error reached the agent only as
-  "Error executing tool <name>", losing the next step spanreed's errors give (call
-  `list_agents`, start the bridge to a named host, why this session can't sleep). Every tool
-  now returns its error as a tool error with the full message. (#104)
+- **Tool errors reach the agent in full again.** `uv tool install` resolves dependencies fresh
+  rather than from spanreed's lock file, so an install of 0.4.1 or earlier made after `mcp`
+  2.1 was published already runs a newer `mcp`. Since `mcp` 2.1, any error other than a tool
+  error reaches the agent only as "Error executing tool <name>", losing the next step
+  spanreed's errors give (call `list_agents`, start the bridge to a named host, why this
+  session can't sleep). Every tool now returns its error as a tool error with the full
+  message. (#104)
 - **Locked dependencies refreshed** within the declared ranges, including `mcp` 2.3,
-  `cryptography` 50 and `pydantic` 2.14. (#48, #103)
+  `cryptography` 50 and `pydantic` 2.14. The lock governs development and CI, not what
+  `uv tool install` gives users. (#48, #103)
 
 ### Behind the scenes
 
