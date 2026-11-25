@@ -260,3 +260,13 @@ class PeerLink(BaseModel):
     """Free-form diagnosis attached by the bridge: a frame that could not be
     parsed, a registry frame that arrived before the handshake, the reason for
     a teardown. Verbose on purpose — this is the line a human pastes."""
+
+    bridge_features: list[str] | None = None
+    """What **this** host's bridge process can carry (#86), e.g.
+    ``["sleeper-ops"]``. ``None`` on a record written by a ``spanreed`` older
+    than the field: a ``conjoin`` that will never read the request spool."""
+
+    peer_features: list[str] | None = None
+    """What the peer listed in its ``hello`` (#86). ``None`` when its ``hello``
+    had no ``features`` field: a peer too old to say, which is not the same
+    claim as an empty list."""

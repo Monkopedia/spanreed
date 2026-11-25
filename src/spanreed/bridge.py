@@ -36,6 +36,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import queue
 import random
 import re
 import shlex
@@ -47,10 +48,18 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import IO, Literal, cast
+from typing import IO, Any, Literal, cast
 
 from spanreed.protocol import Agent, Message, PeerLink
+from spanreed.sleeper_remote import Target, Worker, prune_records
+from spanreed.sleeper_spool import Spool
 from spanreed.store import StateStore, pid_start_time
+
+SLEEPER_OPS = "sleeper-ops"
+
+FEATURES = [SLEEPER_OPS]
+"""What this bridge process can carry, sent in ``hello`` and recorded as
+``bridge_features`` (#86, "Version skew"). Capabilities, never a version."""
 
 
 def _status(text: str) -> None:
@@ -123,6 +132,7 @@ class Bridge:
         recv_timeout: float | None = None,
         hello_timeout: float = 15.0,
         mirror_outlives_link: bool = False,
+        sleeper_worker: Worker | None = None,
     ) -> None:
         self._read = read
         self._write = write
@@ -180,10 +190,31 @@ class Bridge:
         self._end_reason: str | None = None
         # Set by stop(final=True): this teardown is the process exiting.
         self._final = False
+        # Remote sleeper management (#86). The worker belongs to the bridge
+        # PROCESS: `conjoin` passes one that outlives each link and closes it
+        # when it exits. A bridge given none (the serve end, whose process ends
+        # with its link) makes its own and closes it when run() returns.
+        self._worker = sleeper_worker if sleeper_worker is not None else Worker()
+        self._owns_worker = sleeper_worker is None
+        # Set at the hello, once the peer has named itself.
+        self._target: Target | None = None
+        self._spool: Spool | None = None
+        self._peer_features: list[str] | None = None
+        # Answers for the main thread to send, each with the op it answers (a
+        # create's or retire's goes out behind a fresh registry frame). Filled
+        # by the reader (answers from a record) and by the worker.
+        self._results: queue.Queue[tuple[object, dict[str, Any]]] = queue.Queue()
+        # Requests another live process holds, by id: the main thread sends
+        # each one's result once its record is done.
+        self._watch_requests: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._watching: dict[str, dict[str, Any]] = {}
+        # Requests held because the peer did not advertise sleeper-ops; each is
+        # noted on the peer record once.
+        self._held_noted: set[str] = set()
 
     # --- framing (only the main thread writes, so no lock needed) ---
 
-    def _send(self, frame: dict[str, object]) -> bool:
+    def _send(self, frame: dict[str, Any]) -> bool:
         """Write a frame to the pipe. Returns False (and stops) on a dead pipe."""
         try:
             self._write.write((json.dumps(frame) + "\n").encode())
@@ -314,6 +345,7 @@ class Bridge:
                 self._stop.set()
                 self._hello.set()  # unblock run()'s wait so it exits promptly
                 return True
+            peer_features, bad_features = _parse_features(frame.get("features"))
             with self._mirror_lock:
                 if self._torn_down:
                     # run() already gave up on the handshake and returned. A
@@ -321,7 +353,23 @@ class Bridge:
                     # running, and read as live while nothing is connected.
                     return True
                 self.peer_host = host
+                self._peer_features = peer_features
+                self._target = Target(
+                    self.store,
+                    self_host=self.self_host,
+                    peer=host,
+                    role=self.role,
+                    bridge_pid=self._my_pid,
+                    bridge_pid_start=self._my_pid_start,
+                )
+                self._spool = Spool(self.store, host)
                 self._open_link(host)
+            if bad_features:
+                self._note(
+                    f"the peer's hello carried a 'features' field that is not a list of "
+                    f"strings ({str(frame.get('features'))[:120]!r}). It was recorded as "
+                    f"null, so no remote sleeper request is sent to this peer."
+                )
             self._hello.set()
         elif kind == "msg":
             self.store.append_message(Message.model_validate(frame["message"]))
@@ -331,8 +379,62 @@ class Bridge:
             # The peer wants a snapshot now rather than on our next tick.
             # Answered by the main thread; see _registry_requested.
             self._registry_requested.set()
+        elif kind == "sleeper-op":
+            self._receive_sleeper_op(frame)
+        elif kind == "sleeper-op-result":
+            if self._spool is None:
+                self._note(
+                    "a 'sleeper-op-result' frame arrived BEFORE the peer's hello and was dropped."
+                )
+            else:
+                note = self._spool.accept_result(frame)
+                if note is not None:
+                    self._note(note)
         # "ping" needs no action — it just keeps the pipe warm.
         return False
+
+    def _receive_sleeper_op(self, frame: dict[str, Any]) -> None:
+        """A peer asks this host to run a sleeper operation. Never run on this thread (#86).
+
+        :meth:`Target.receive` decides what the frame gets (the validation, the
+        switch, the expiry and the idempotency record), and the reader hands it
+        on: an answer to the main thread, a new request to the worker, a request
+        another live process holds to the main thread's watch.
+        """
+        if self._target is None:
+            self._note(
+                "a 'sleeper-op' frame arrived BEFORE the peer's hello and was dropped unanswered."
+            )
+            return
+        receipt = self._target.receive(frame)
+        op = frame.get("op")
+        if receipt.action == "reply":
+            assert receipt.result is not None
+            self._results.put((op, receipt.result))
+        elif receipt.action == "run":
+            assert receipt.request_id is not None
+            self._worker.submit(self._target, receipt.request_id, self._delivery(op, frame))
+        elif receipt.action == "wait":
+            self._watch_requests.put(frame)
+        elif receipt.note is not None:
+            self._note(receipt.note)
+
+    def _delivery(
+        self, op: object, frame: dict[str, Any]
+    ) -> Callable[[dict[str, Any] | None], None]:
+        """The worker's way back to this link's main thread.
+
+        If the link has ended by then, nothing sends it: the result is in the
+        record, and the resend after a reconnect is answered from there.
+        """
+
+        def deliver(result: dict[str, Any] | None) -> None:
+            if result is not None:
+                self._results.put((op, result))
+            else:
+                self._watch_requests.put(frame)  # another process holds it
+
+        return deliver
 
     def _apply_registry(self, frame: dict[str, object]) -> None:
         """Mirror a peer's registry snapshot locally and record that it arrived."""
@@ -386,6 +488,8 @@ class Bridge:
                 attached_at=now,
                 last_frame_at=now,
                 note=self._deferred_note,
+                bridge_features=list(FEATURES),
+                peer_features=self._peer_features,
             )
             self._deferred_note = None
             self._persist_link()
@@ -458,10 +562,118 @@ class Bridge:
                     self._persist_link()
         return sent
 
+    # --- remote sleeper management (main thread) ---
+
+    def _send_sleeper_results(self) -> None:
+        """Send every answer that is ready, a registry frame ahead of a create's or retire's.
+
+        Frames arrive in order on one pipe, so the requester has mirrored the new
+        sleeper (or dropped the retired one) by the time its CLI returns.
+        """
+        while True:
+            try:
+                op, result = self._results.get_nowait()
+            except queue.Empty:
+                return
+            if op in ("create", "retire") and not self._send_registry():
+                return
+            if not self._send(result):
+                return
+
+    def _check_watched(self) -> None:
+        """Queue the answer to each request another live process held, once it is done."""
+        assert self._target is not None
+        while True:
+            try:
+                frame = self._watch_requests.get_nowait()
+            except queue.Empty:
+                break
+            self._watching[str(frame["request_id"])] = frame
+        for request_id, frame in list(self._watching.items()):
+            result = self._target.result_if_done(request_id)
+            if result is not None:
+                del self._watching[request_id]
+                self._results.put((frame.get("op"), result))
+
+    def _hold(self, unsent: list[str], sent: list[str]) -> None:
+        """Say on the peer record why requests are not being sent. Once per request.
+
+        ``unsent`` are ``.json`` requests, never sent: they expire unsent.
+        ``sent`` are ``.sent`` requests (on attach only), sent over an earlier
+        link and now not resent: whether they ran is not known here.
+        """
+        new_unsent = [rid for rid in unsent if rid not in self._held_noted]
+        new_sent = [rid for rid in sent if rid not in self._held_noted]
+        if not new_unsent and not new_sent:
+            return
+        self._held_noted.update(new_unsent + new_sent)
+        said = (
+            "sent no features in its hello (its spanreed predates remote sleeper management)"
+            if self._peer_features is None
+            else f"listed features {self._peer_features} in its hello, without {SLEEPER_OPS!r}"
+        )
+        where = f"sleeper-ops/out/{self.peer_host}/"
+        parts = [f"{self.peer_host} {said}, so it would ignore sleeper requests."]
+        if new_unsent:
+            parts.append(
+                f"Request(s) {', '.join(new_unsent)} in {where} were NOT sent, and expire unsent."
+            )
+        if new_sent:
+            parts.append(
+                f"Request(s) {', '.join(new_sent)} in {where} were sent over an earlier link and "
+                f"are NOT resent; their outcome is unknown here (check `spanreed sleeper list "
+                f"--host {self.peer_host}` and its audit log)."
+            )
+        parts.append(f"Upgrade spanreed on {self.peer_host} and restart its end of `conjoin`.")
+        self._note(" ".join(parts))
+
+    def _drain_spool(self, *, attach: bool) -> None:
+        """Send this host's requests for the peer; on ``attach``, resend those in flight.
+
+        A request is sent only before its ``expires_at``, and only to a peer
+        that advertised ``sleeper-ops``: an older peer drops the frame without a
+        word, so a request for one is held: one never sent expires unsent, and
+        one already sent over an earlier link is not resent. Expiry is
+        enforced here whatever its CLI does, so a killed CLI's request is never
+        sent late ("Every request expires").
+        """
+        spool = self._spool
+        assert spool is not None
+        spool.expire()
+        if self._peer_features is None or SLEEPER_OPS not in self._peer_features:
+            self._hold(spool.ids(".json"), spool.ids(".sent") if attach else [])
+            return
+        if attach:
+            for frame in spool.resend():
+                if not self._send(frame):
+                    return
+        scan = spool.take_new()
+        for note in scan.notes:
+            self._note(note)
+        for frame in scan.frames:
+            if not self._send(frame):
+                return
+
+    def _sleeper_turn(self, *, attach: bool = False) -> None:
+        """One main-loop turn of remote sleeper management, in both directions."""
+        self._check_watched()
+        self._send_sleeper_results()
+        if not self._stop.is_set():
+            self._drain_spool(attach=attach)
+
     def run(self) -> float:
         """Run until the pipe dies or :meth:`stop` is called. Returns uptime (s)."""
+        try:
+            return self._run()
+        finally:
+            if self._owns_worker:
+                # This process ends with its link: an operation in flight
+                # finishes and stores its result first ("When things break").
+                self._worker.close()
+
+    def _run(self) -> float:
         started = time.monotonic()
-        self._send({"kind": "hello", "host": self.self_host})
+        self._send({"kind": "hello", "host": self.self_host, "features": list(FEATURES)})
         reader = threading.Thread(target=self._reader, daemon=True)
         reader.start()
         if not self._hello.wait(timeout=self.hello_timeout):
@@ -512,9 +724,11 @@ class Bridge:
             # before #55, and it is only half a handshake: it tells the peer
             # about us and leaves us with no way to insist on the reverse.
             self._request_registry()
+            self._sleeper_turn(attach=True)
             last_sync = time.monotonic()
             while not self._stop.is_set():
                 self._forward_outbound()
+                self._sleeper_turn()
                 if self._registry_requested.is_set():
                     # Answer the peer's pull promptly rather than at our next
                     # tick. Sent from this thread, never the reader's, so the
@@ -533,6 +747,9 @@ class Bridge:
                         # keepalive.
                         self._request_registry()
                     self._send({"kind": "ping"})
+                    if self._spool is not None:
+                        with contextlib.suppress(OSError):
+                            self._spool.clean()
                     self._update_link(last_frame_at=self._recv_wallclock())
                     last_sync = now
                 if now - self._last_recv > self.recv_timeout:
@@ -596,6 +813,31 @@ MAX_TIMEOUT = 86400.0
 silent for longer than a day is not a slow link."""
 
 
+def _parse_features(raw: object) -> tuple[list[str] | None, bool]:
+    """A peer's ``hello`` ``features``: the list, and whether it was malformed.
+
+    Absent is ``None``, "too old to say", never an empty list. A value that is
+    not a list of strings is one this version can't model; it reads as ``None``
+    too, since it can't be shown to carry anything, and is reported.
+    """
+    if raw is None:
+        return None, False
+    if isinstance(raw, list) and all(isinstance(f, str) for f in cast("list[object]", raw)):
+        return [str(f) for f in cast("list[object]", raw)], False
+    return None, True
+
+
+def _prune_at_start(store: StateStore) -> None:
+    """Prune idempotency records past retention, as a bridge process starts (R5).
+
+    Before any :class:`Target` exists in this process: ``prune_records`` takes
+    each peer's records lock, and this process must not already hold one.
+    A prune that fails is not a reason to refuse the link.
+    """
+    with contextlib.suppress(OSError):
+        prune_records(store)
+
+
 def serve(self_host: str | None = None, *, timeout: float | None = None) -> int:
     """Run the ``serve`` end: the pipe is this process's stdin/stdout.
 
@@ -605,6 +847,7 @@ def serve(self_host: str | None = None, *, timeout: float | None = None) -> int:
     """
     host = self_host or socket.gethostname()
     store = StateStore()
+    _prune_at_start(store)
     Bridge(
         sys.stdin.buffer,
         sys.stdout.buffer,
@@ -682,17 +925,31 @@ def connect(
             serve_cmd,
         ]
     store = StateStore()
+    _prune_at_start(store)
+    # One worker for the whole `conjoin` process, outliving each link: a
+    # request queued here still runs after a drop, and the resend after the
+    # reconnect is answered from its record (#86).
+    worker = Worker()
 
     def run_once(
         proc: subprocess.Popen[bytes], label: str, store: StateStore, holder: list[Bridge | None]
     ) -> float:
         return _run_bridge_once(
-            proc, label, store, holder, recv_timeout=silence, hello_timeout=hello
+            proc,
+            label,
+            store,
+            holder,
+            recv_timeout=silence,
+            hello_timeout=hello,
+            sleeper_worker=worker,
         )
 
-    return reconnect_loop(
-        argv, label, store, max_reconnects=max_reconnects, peer=host, run_once=run_once
-    )
+    try:
+        return reconnect_loop(
+            argv, label, store, max_reconnects=max_reconnects, peer=host, run_once=run_once
+        )
+    finally:
+        worker.close()
 
 
 _BASE_BACKOFF = 1.0
@@ -712,6 +969,7 @@ def _run_bridge_once(
     *,
     recv_timeout: float = DEFAULT_TIMEOUT,
     hello_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+    sleeper_worker: Worker | None = None,
 ) -> float:
     """Bridge over one spawned peer process until the pipe dies. Returns uptime."""
     assert proc.stdin is not None and proc.stdout is not None
@@ -724,6 +982,7 @@ def _run_bridge_once(
         recv_timeout=recv_timeout,
         hello_timeout=hello_timeout,
         mirror_outlives_link=True,  # reconnect_loop clears them when conjoin exits
+        sleeper_worker=sleeper_worker,
     )
     holder[0] = bridge
     try:

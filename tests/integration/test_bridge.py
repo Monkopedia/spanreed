@@ -1094,6 +1094,12 @@ class TestConfigurableTimeouts:
     the pipe at the old ~15s.
     """
 
+    @pytest.fixture(autouse=True)
+    def _isolated_state_root(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        # connect() and serve() open the default state root and prune its
+        # idempotency records at start (#86); never the developer's.
+        monkeypatch.setenv("SPANREED_STATE_ROOT", str(tmp_path / "state"))
+
     @staticmethod
     def _capture_connect(
         monkeypatch: pytest.MonkeyPatch, **kw: float | None
@@ -1109,8 +1115,10 @@ class TestConfigurableTimeouts:
             run_once(_fake_proc(), label, store, [None])
             return 0
 
-        def fake_once(*_a: object, **kwargs: float) -> float:
-            bridge_kwargs.update(kwargs)
+        def fake_once(*_a: object, **kwargs: object) -> float:
+            # The sleeper worker it passes is checked in test_bridge_sleeper_ops.py.
+            kwargs.pop("sleeper_worker", None)
+            bridge_kwargs.update(cast("dict[str, float]", kwargs))
             return 0.0
 
         monkeypatch.setattr(bridge, "reconnect_loop", fake_loop)
