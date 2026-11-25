@@ -17,11 +17,12 @@ writes to the pipe.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,7 +31,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ValidationError
 
 from spanreed import sleeper_ops
-from spanreed._fsmode import open_private, private_dir, write_private_text
+from spanreed._fsmode import open_private, private_dir, touch_private, write_private_text
 from spanreed.sleepers import SleeperError
 from spanreed.store import StateStore, pid_start_time, process_is_alive
 
@@ -210,6 +211,17 @@ class Target:
             result = self._result(request_id, "invalid", stderr=f"invalid: {exc}")
             self._log_once("invalid", frame, result)
             return Receipt("reply", request_id, result)
+        with self._lock():
+            return self._receive_locked(request_id, frame, op, expires_at, now)
+
+    def _receive_locked(
+        self, request_id: str, frame: dict[str, Any], op: str, expires_at: datetime, now: datetime
+    ) -> Receipt:
+        """:meth:`receive` from the record lookup on, under :meth:`_lock`.
+
+        Reading the record and acting on it is one step, so two bridge processes
+        for this peer can't both find a dead holder and both take the request.
+        """
         record = self._read(request_id)
         if record is not None:
             return self._decide(request_id, record)
@@ -223,8 +235,9 @@ class Target:
             self._log_once("expired", frame, result)
             return Receipt("reply", request_id, result)
         if not self._write_new(request_id, frame, now, "queued"):
-            # Another bridge process for this peer recorded it between our read
-            # and our write. Its record decides, as for any resend.
+            # A record appeared between our read and our write. The lock rules
+            # that out between processes that take it; the create-only write
+            # is the backstop if one didn't. Its record decides, as for any resend.
             record = self._read(request_id)
             assert record is not None
             return self._decide(request_id, record)
@@ -239,7 +252,9 @@ class Target:
         return Receipt("run", request_id)
 
     def _decide(self, request_id: str, record: RequestRecord) -> Receipt:
-        """A request id seen before: the record decides. It never runs twice."""
+        """A request id seen before: the record decides. It never runs twice.
+
+        Called under :meth:`_lock`, with the record read under the same hold."""
         if record.state == "done":
             assert record.result is not None
             self._log(
@@ -288,32 +303,49 @@ class Target:
 
     # --- the worker's half ---
 
-    def run(self, request_id: str) -> dict[str, Any]:
+    def run(self, request_id: str) -> dict[str, Any] | None:
         """Run a queued request and return its result frame, stored in its record.
 
         The expiry is checked again here, since a request may wait behind
         another (R9, decision 8). So is the switch: one turned off while a
         request waited stops it before it starts (open-questions.md, #86).
+
+        Only a record ``queued`` in this bridge process is run. Checking that and
+        marking it ``running`` is one step under :meth:`_lock`, so a second
+        worker, here or in another bridge process, can't start it too. A ``done``
+        record returns its stored result; anything else (``running``, or queued
+        in another process) returns ``None``, runs nothing and sends nothing: the
+        process that holds it answers.
         """
-        record = self._read(request_id)
-        assert record is not None, f"run() of {request_id}, which has no record"
-        if record.state == "done":
-            assert record.result is not None
-            return record.result
-        expires_at = datetime.fromisoformat(str(record.request["expires_at"]))
-        if self._clock() > expires_at:
-            result = self._expired(request_id, expires_at)
-            self._finish(request_id, record, result, "expired")
-            return result
-        access = self.store.get_sleeper_remote_access()
-        if access is None:
-            result = self._refused(request_id)
-            self._finish(request_id, record, result, "refused")
-            return result
-        self._write(request_id, record.model_copy(update={"state": "running"}))
+        with self._lock():
+            record = self._read(request_id)
+            assert record is not None, f"run() of {request_id}, which has no record"
+            if record.state == "done":
+                assert record.result is not None
+                return record.result
+            if record.state != "queued" or (record.bridge_pid, record.bridge_pid_start) != (
+                self.bridge_pid,
+                self.bridge_pid_start,
+            ):
+                return None
+            expires_at = datetime.fromisoformat(str(record.request["expires_at"]))
+            if self._clock() > expires_at:
+                result = self._expired(request_id, expires_at)
+                self._finish(request_id, record, result, "expired")
+                return result
+            access = self.store.get_sleeper_remote_access()
+            if access is None:
+                result = self._refused(request_id)
+                self._finish(request_id, record, result, "refused")
+                return result
+            self._write(request_id, record.model_copy(update={"state": "running"}))
+        # Not under the lock: a retire can take 60 s, and the reader must still
+        # answer resends meanwhile. The record says ``running`` in this process,
+        # which nothing else will run.
         op = str(record.request["op"])
         result = self._execute(request_id, op, record.request["args"], access.path_env or "")
-        self._finish(request_id, record, result, "done")
+        with self._lock():
+            self._finish(request_id, record, result, "done")
         return result
 
     def _execute(self, request_id: str, op: str, raw_args: object, path_env: str) -> dict[str, Any]:
@@ -394,6 +426,28 @@ class Target:
         )
 
     # --- the idempotency record ---
+
+    @contextlib.contextmanager
+    def _lock(self) -> Generator[None, None, None]:
+        """Exclusive ``fcntl.flock`` on ``sleeper-ops/in/<peer>/.lock``.
+
+        Held around every read-then-write of this peer's records, so each state
+        change (new, re-queued, ``running``, ``done``) is decided on the record as
+        it is, not as another bridge process or worker last saw it. Never held
+        while an operation runs. Like a sleeper's lock file it is never deleted.
+        """
+        private_dir(self._dir, parents=True)
+        lock_path = self._dir / ".lock"
+        touch_private(lock_path)
+        fd = os.open(lock_path, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def _path(self, request_id: str) -> Path:
         return self._dir / f"{request_id}.json"

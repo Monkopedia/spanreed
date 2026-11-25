@@ -20,7 +20,8 @@ codex/<name>.log        per-Codex-worker log: startup config, every turn, every
 sleepers/<name>.json    one record per sleeper: the source of truth for its presence
 sleepers/<name>.lock    that sleeper's flock; never deleted, not even by retire
 sleeper-ops/out/<peer>/ requests this host's CLI has asked a peer to run (designed, #86; not built)
-sleeper-ops/in/<peer>/  one idempotency record per request a peer asked this host to run (#86)
+sleeper-ops/in/<peer>/  one idempotency record per request a peer asked this host to run (#86),
+                        and .lock, the flock every change to those records is made under
 logs/sleeper-ops.jsonl  audit log of every remote sleeper operation this host received (#86)
 ```
 

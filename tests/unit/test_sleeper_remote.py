@@ -12,6 +12,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from spanreed import sleeper_ops
 from spanreed.sleeper_remote import RECORD_RETENTION, RequestRecord, Target, prune_records
 from spanreed.store import StateStore
 
@@ -91,7 +93,9 @@ def deliver(t: Target, sent: dict[str, Any]) -> dict[str, Any]:
     receipt = t.receive(sent)
     if receipt.action == "run":
         assert receipt.request_id is not None
-        return t.run(receipt.request_id)
+        result = t.run(receipt.request_id)
+        assert result is not None, "a request this process queued must run here"
+        return result
     assert receipt.action == "reply", receipt
     assert receipt.result is not None
     return receipt.result
@@ -126,7 +130,8 @@ class TestSwitch:
         assert "spanreed sleeper remote-access on" in result["stderr"]
         assert store.sleepers.read("nap") is None
         assert [line["event"] for line in audit(store)] == ["refused"]
-        assert not (store.root / "sleeper-ops" / "in").exists(), "a refusal records nothing"
+        records = list((store.root / "sleeper-ops" / "in").glob("*/*.json"))
+        assert records == [], "a refusal records nothing"
 
     def test_list_is_refused_too(self, store: StateStore) -> None:
         """R2: one gate for everything, reads included."""
@@ -169,7 +174,7 @@ class TestSwitch:
         assert receipt.action == "run" and receipt.request_id
         switched_on.set_sleeper_remote_access(None)
         result = t.run(receipt.request_id)
-        assert result["outcome"] == "refused"
+        assert result is not None and result["outcome"] == "refused"
         assert switched_on.sleepers.read("nap") is None
 
     def test_a_create_uses_the_recorded_path_not_the_bridges(
@@ -371,7 +376,7 @@ class TestExpiry:
         assert receipt.action == "run" and receipt.request_id
         now[0] += timedelta(seconds=31)  # it waited behind another operation
         result = t.run(receipt.request_id)
-        assert result["outcome"] == "expired"
+        assert result is not None and result["outcome"] == "expired"
         assert switched_on.sleepers.read("nap") is None
         assert [line["event"] for line in audit(switched_on)] == ["received", "expired"]
 
@@ -437,6 +442,7 @@ class TestIdempotency:
         assert t.receive(sent).action == "wait"
         assert t.result_if_done(first.request_id) is None
         result = t.run(first.request_id)
+        assert result is not None
         assert t.result_if_done(first.request_id) == result
 
     def test_one_running_in_a_dead_process_is_interrupted_not_rerun(
@@ -458,6 +464,100 @@ class TestIdempotency:
         assert switched_on.sleepers.read("nap") is None
         assert audit(switched_on)[-1]["event"] == "interrupted"
         assert deliver(target(switched_on), sent) == result, "and stays interrupted"
+
+    def test_a_requeue_racing_another_bridge_process_runs_once(
+        self, switched_on: StateStore, proj: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SECURITY. Catches the requeue in ``Target._decide`` not being atomic with
+        its read: with A and B conjoined both ways, B has two bridge processes for
+        A, and both can find a request queued under a dead one and take it over.
+
+        The second bridge process looks at the record while the first has read
+        it but not yet re-owned it. It may run only once, between them."""
+        sent = frame("create", create_args(str(proj)))
+        target(switched_on, bridge_pid=dead_pid(), bridge_pid_start=None).receive(sent)
+        first = target(switched_on)
+        second = target(switched_on, bridge_pid=os.getppid(), bridge_pid_start=None)
+        real_read = first._read  # pyright: ignore[reportPrivateUsage]
+        receipts: list[str] = []
+        threads: list[threading.Thread] = []
+
+        def read_then_let_the_other_look(request_id: str) -> RequestRecord | None:
+            record = real_read(request_id)
+            # The other process's reader gets its turn now. If the lookup and
+            # the requeue are one locked step, it waits for ours (the join
+            # times out) and finds the request held by a live process.
+            other = threading.Thread(target=lambda: receipts.append(second.receive(sent).action))
+            other.start()
+            other.join(timeout=0.5)
+            threads.append(other)
+            monkeypatch.setattr(first, "_read", real_read)
+            return record
+
+        monkeypatch.setattr(first, "_read", read_then_let_the_other_look)
+        receipts.append(first.receive(sent).action)
+        for thread in threads:
+            thread.join(timeout=10)
+        assert sorted(receipts) == ["run", "wait"]
+
+    def test_a_running_request_is_not_run_again_by_a_second_worker(
+        self, switched_on: StateStore, proj: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SECURITY. Catches ``Target.run`` starting a request that is not still
+        ``queued``, or checking that and marking it ``running`` in two steps.
+
+        A second worker in this process starts on the same request while the
+        first is between reading it and marking it running, and again while
+        the create is under way. The create runs once."""
+        sent = frame("create", create_args(str(proj)))
+        receipt = target(switched_on).receive(sent)
+        assert receipt.action == "run" and receipt.request_id is not None
+        request_id = receipt.request_id
+        first, second = target(switched_on), target(switched_on)
+        real_create = sleeper_ops.create
+        runs: list[str] = []
+        others: list[dict[str, Any] | None] = []
+        threads: list[threading.Thread] = []
+
+        def counting_create(*args: Any, **kw: Any) -> int:
+            runs.append(request_id)
+            if len(runs) == 1:
+                others.append(second.run(request_id))  # mid-create: the record is running
+            return real_create(*args, **kw)
+
+        monkeypatch.setattr(sleeper_ops, "create", counting_create)
+        real_read = first._read  # pyright: ignore[reportPrivateUsage]
+
+        def read_then_let_the_other_run(rid: str) -> RequestRecord | None:
+            record = real_read(rid)
+            monkeypatch.setattr(first, "_read", real_read)
+            other = threading.Thread(target=lambda: others.append(second.run(rid)))
+            other.start()
+            other.join(timeout=0.5)
+            threads.append(other)
+            return record
+
+        monkeypatch.setattr(first, "_read", read_then_let_the_other_run)
+        result = first.run(request_id)
+        for thread in threads:
+            thread.join(timeout=10)
+        assert result is not None and result["outcome"] == "ok"
+        assert len(runs) == 1, f"the create ran {len(runs)} times"
+        assert others == [None, None]
+
+    def test_run_refuses_a_request_queued_in_another_live_process(
+        self, switched_on: StateStore, proj: Path
+    ) -> None:
+        """SECURITY. Catches ``Target.run`` not checking the record is queued in
+        *this* bridge process: the one that holds it will run it."""
+        sent = frame("create", create_args(str(proj)))
+        holder = target(switched_on, bridge_pid=os.getppid(), bridge_pid_start=None)
+        receipt = holder.receive(sent)
+        assert receipt.action == "run" and receipt.request_id is not None
+        assert target(switched_on).run(receipt.request_id) is None
+        assert switched_on.sleepers.read("nap") is None
+        result = holder.run(receipt.request_id)
+        assert result is not None and result["outcome"] == "ok"
 
     def test_one_queued_in_a_dead_process_runs_here_if_not_expired(
         self, switched_on: StateStore, proj: Path

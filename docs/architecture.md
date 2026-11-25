@@ -1547,6 +1547,19 @@ it, `state` (`queued`, `running` or `done`),
 and, once done, the full result frame. Keyed by peer and id, because the id is the
 requester's and only unique on its side.
 
+Every change to a record is decided on the record as it is, not as some process last
+read it: reading a record and writing its next state is one step, under an
+exclusive `flock` on `<state>/sleeper-ops/in/<peer>/.lock` (never deleted, like a
+sleeper's lock). That covers a new record, a re-queue from a dead process, the step
+to `running` and the step to `done`; the lock is never held while an operation runs.
+It matters because one peer can have two live bridge processes here: when two hosts
+are conjoined both ways, each has a bridge for the other in each direction. Without
+it, both could find a request queued under a dead process and both take it over, or
+a second worker could start one already running. A new record is also written
+create-only, as a backstop. The worker runs a request only if its record is
+`queued` under its own bridge process; anything else it leaves to the process that
+holds it.
+
 On a `sleeper-op` whose record already exists, the record decides, whatever the
 frame's `expires_at` says:
 - **`done`**: send the stored result again; log `duplicate`. Nothing runs.
