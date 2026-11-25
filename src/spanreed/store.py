@@ -710,9 +710,13 @@ class StateStore:
           describes the row's owner: a ``conjoin`` marks its record stopping a
           few milliseconds before it clears its rows, and the resolver must not
           accept what :meth:`delivery_verdict` then reports as having no bridge
-          (issue #122). The exception to that guarantee: a row another live
-          bridge owns (the ``serve`` end of a bidirectional pair) resolves as
-          before, even when the record reads ``stopped``, and for such a send
+          (issue #122). The exception to that guarantee: a row owned by a live
+          bridge other than the one the record names resolves as before, even
+          when the record reads ``stopped``. Both ends of a bridge write the
+          record, so the record names whichever wrote it last; in a
+          bidirectional pair, for example, the other bridge may be either the
+          ``connect`` end or the ``serve`` end, and a second ``conjoin`` to the
+          same host can be the other one too. For such a send
           :meth:`delivery_verdict`, which judges by the record, may still say
           ``NO BRIDGE IS RUNNING`` although that other bridge forwards the mail.
           See "Two bridges sharing one host's peer record" in
