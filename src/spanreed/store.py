@@ -710,8 +710,13 @@ class StateStore:
           describes the row's owner: a ``conjoin`` marks its record stopping a
           few milliseconds before it clears its rows, and the resolver must not
           accept what :meth:`delivery_verdict` then reports as having no bridge
-          (issue #122). A row another live bridge owns (the ``serve`` end of a
-          bidirectional pair) resolves as before. A bridge that is only reconnecting keeps
+          (issue #122). The exception to that guarantee: a row another live
+          bridge owns (the ``serve`` end of a bidirectional pair) resolves as
+          before, even when the record reads ``stopped``, and for such a send
+          :meth:`delivery_verdict`, which judges by the record, may still say
+          ``NO BRIDGE IS RUNNING`` although that other bridge forwards the mail.
+          See "Two bridges sharing one host's peer record" in
+          ``docs/open-questions.md``. A bridge that is only reconnecting keeps
           its process, and so its rows, alive.
         - ``to_agent`` matches exactly one **live** agent's display name →
           resolve to that agent's id (``send_message("ksrpc", ...)`` works).
