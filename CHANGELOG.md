@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.2
+
+**Upgrading:** update the package and the plugin on every host, the same way as for 0.4.1.
+Nothing else needs to change.
+
+### Fixes
+
+- **Tool errors reach the agent in full again.** The bundled `mcp` library moves from 2.0 to
+  2.3 (#103). Since `mcp` 2.1, any error other than a tool error reached the agent only as
+  "Error executing tool <name>", losing the next step spanreed's errors give (call
+  `list_agents`, start the bridge to a named host, why this session can't sleep). Every tool
+  now returns its error as a tool error with the full message. (#104)
+- **Locked dependencies refreshed** within the declared ranges, including `mcp` 2.3,
+  `cryptography` 50 and `pydantic` 2.14. (#48, #103)
+
+### Behind the scenes
+
+- More tests: the published `spanreed` and `spanreed-mcp` commands are run by name (#21,
+  #112), the instructions a session receives at start are checked against the real tools
+  (#41, #111), and the MCP identity tests run the code path production uses (#45, #102).
+- `store.py` explains correctly why lock-free inbox appends are safe, and what can still tear
+  one: a full disk, or the writer being killed mid-line. (#36, #106, #107, #109, #110)
+- The test suite no longer prints a pytest-asyncio deprecation warning. (#105, #108)
+
 ## 0.4.1
 
 **Upgrading:** update the package and the plugin on every host, as for 0.4.0. Nothing else to
