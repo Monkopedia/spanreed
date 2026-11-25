@@ -35,7 +35,9 @@ audit line are specified in [`architecture.md`](architecture.md#managing-a-peers
 The switch lives in `config.json` under `sleeper_remote_access`, one object for the whole
 machine: `{"enabled": true, "enabled_at": "<UTC>", "path_env": "<PATH>"}`. It is not keyed by
 peer. Anything other than `"enabled": true`, including an absent key or an unreadable
-`config.json`, means off.
+`config.json`, means off. Any process running as the user can write this key directly,
+without `spanreed sleeper remote-access on`; the command's TTY check guards against
+accidents, not against agents (`architecture.md`, decision 7 of #86).
 
 `codex/<name>.log` is written only by `spanreed codex` (see
 [`architecture.md`](architecture.md#codex-workers)). It is append-only, plain text, one timestamped
@@ -402,7 +404,7 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed sleeper wake N` | Wake it by hand, by the same path a message takes. Exit 1 if the wake failed (the reason is printed and recorded) |
 | `spanreed sleeper attach N` | `tmux attach` to the sleeper's current session, whatever its generation |
 | `spanreed sleeper create\|list\|wake\|sleep\|retire --host PEER ... [--timeout S]` | *Designed (#86), not built.* Run the operation on a conjoined peer, through this host's bridge to it. Arguments are sent as typed and validated again by the peer; `create --cwd` must be absolute or start with `~`. `--timeout` is at most 600 s and is also the request's lifetime: it is never sent or resent after it. Output is the peer's, each line prefixed `[PEER] `. Exit 0 ok; 1 it ran on the peer and failed; 2 nothing was run (no bridge, a bridge or peer too old, bad argument, timed out before sending, expired); 3 sent, outcome unknown; 4 refused by the peer. `attach --host` prints the ssh command to run instead |
-| `spanreed sleeper remote-access show\|on\|off` | *Designed (#86), not built.* One switch per machine, off by default: while on, every conjoined peer may manage this host's sleepers, which lets it **run commands as this user** (see `architecture.md`, "What turning it on grants"). `on` refuses unless stdin is a TTY and this host's label is typed back, and records `PATH` for remote creates. Read per request |
+| `spanreed sleeper remote-access show\|on\|off` | *Designed (#86), not built.* One switch per machine, off by default: while on, every conjoined peer may manage this host's sleepers, which lets it **run commands as this user** (see `architecture.md`, "What turning it on grants"). `on` refuses unless stdin is a TTY and this host's label is typed back, a guard against accidents, not against agents, since any process running as the user can write the `config.json` key itself. It records `PATH` for remote creates. Read per request |
 | `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
 
 ## Cross-host bridge wire-format
@@ -505,7 +507,7 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
 - `ping` — keepalive; lets each side detect a dead pipe and lets `connect` trigger reconnect.
 - `sleeper-op` (designed for #86, not built) — "run this sleeper operation on your host." Sent by the **main thread** of the requesting bridge, from its request spool. Fields:
   - `request_id`: exactly 32 lowercase hex characters, minted by the requester's CLI. It becomes a file name on both hosts, so a frame whose id does not match is refused with no reply, logged as `invalid`, and noted on the peer record.
-  - `expires_at`: an ISO 8601 UTC timestamp, the requester's `created_at` plus its timeout (at most 600 s). The requester's bridge never sends or resends the frame after it. The receiver answers a request with no idempotency record and a passed `expires_at` with `expired`, and never runs it; it also answers `expired` for one whose deadline passes while it waits in the queue. An `expires_at` that is missing, unparseable, or more than 600 s plus a clock allowance ahead of the receiver's clock is `invalid` (allowance: open-questions R9).
+  - `expires_at`: an ISO 8601 UTC timestamp, the requester's `created_at` plus its timeout (at most 600 s). The requester's bridge never sends or resends the frame after it. The receiver answers a request with no idempotency record and a passed `expires_at` with `expired`, and never runs it; it also answers `expired` for one whose deadline passes while it waits in the queue. An `expires_at` that is missing, unparseable, or more than 600 s plus a 30 s clock allowance ahead of the receiver's clock is `invalid`.
   - `op` and `args`, as typed by the user, never resolved on the requester:
 
     | `op` | `args` |

@@ -107,39 +107,36 @@ Still open:
 
 Design in [`architecture.md`](architecture.md#managing-a-peers-sleepers-over-conjoin-86), wire
 format in [`protocol.md`](protocol.md#pipe-frames). The owner's decisions of 2026-11-25 are
-quoted there, under "Decisions". They settled the carrier (frames over `conjoin`), the grant
-(one per-machine switch, `spanreed sleeper remote-access on|off|show`, off by default), no cap
-on a remote create beyond a local one, that a person must turn it on, and the first draft's
-R1, R2 and R5 to R8; R3 and R4 were superseded by the single switch. What is left:
+recorded there, under "Decisions", with the words that are his marked as his. They settled the
+carrier (frames over `conjoin`), the grant (one per-machine switch,
+`spanreed sleeper remote-access on|off|show`, off by default), and the first draft's R1, R2 and
+R5 to R8; R3 and R4 were superseded by the single switch. No cap on a remote create beyond a
+local one, and a person at a terminal to turn the switch on, come from a design summary the
+author proposed and the owner answered "yes" (14:47:09Z); the summary is quoted on #86, in the
+comment of 2026-11-25 14:59.
+
+Decided after review of #119:
+
+- **R9. The numbers behind request expiry.** The owner answered "recs fine" to the
+  recommendations (#86, comment of 2026-11-25 14:54): `--timeout` is capped at 600 s, which is
+  also the longest a request lives; the clock allowance for skew between the two hosts is a
+  fixed 30 s; and expiry is checked again when a queued request starts, answering `expired`
+  instead of running it.
+- **R10. The TTY check on `remote-access on`.** Accepted for v1 ("recs fine", same comment), and
+  stated as protection against **accidents, not a boundary against agents**. The switch is a
+  key in `config.json` that any process running as the user can write directly, without the
+  command; and the command itself can be driven through `tmux send-keys` or `script(1)`. Asked
+  whether to accept that, the owner: "I mean this is true of all things, claude can rewrite its
+  own settings in the right environment, this is how the agentic world works and there's no
+  inherent way around it without crazy security controls" (#86, comment of 2026-11-25 14:59).
+  Nothing stronger, such as a root-owned file, is added. `architecture.md`, decision 7.
+
+Still open:
 
 - **Default-on after a few releases?** Deferred by the owner on 2026-11-25: "that sounds fine for
   now, maybe after a few releases we turn it on by default". Revisit once remote management has
   shipped and been used. Turning it on by default would also turn on what "What turning it on
   grants" describes, for every user who runs `conjoin`.
-- **R9. The numbers behind request expiry.** Not decided; added after review 6059741469 found
-  that a killed CLI's request could be sent days later. Three parts:
-  - *The cap on `--timeout`*, which is also the longest a request lives. *Recommendation:* 600
-    s. It is far longer than any operation (a `retire` waits at most 60 s) and far shorter than
-    the seven days a target keeps its records, so a resend can never outlive its record.
-  - *The clock allowance.* The requester stamps `expires_at` by its clock and the target checks
-    it by its own, so skew between the two hosts moves the deadline. *Recommendation:* a fixed
-    30 s. Skew larger than that shows up as `expired` or `invalid` naming both clocks, not as a
-    silent rerun; NTP is assumed and nothing measures it.
-  - *Whether expiry is checked again when a queued request starts.* A request queued on the
-    target behind a long one (R6) may reach the front after its requester has reported "outcome
-    unknown" and stopped waiting. *Recommendation:* check, and answer `expired` without running
-    it, so nothing runs after the person stopped waiting. The cost is that a person who expects
-    a queue must pass a longer `--timeout`.
-- **R10. Is the TTY check on `remote-access on` enough?** Not decided; raised by this revision.
-  Requiring a TTY and a typed label stops an agent from turning the switch on with an ordinary
-  shell command. It does not stop one that gets a terminal on purpose: `tmux send-keys` into a
-  pane, or `script(1)`, and a bypass-mode sleeper needs no persuasion. Options: accept it and
-  say so (as the design now does); also refuse when the environment shows a Claude Code or
-  spanreed session (`CLAUDECODE`, the plugin's variables), which only adds friction since a
-  process can unset them; or require something an agent can't type, such as an OS
-  authentication prompt. *Recommendation:* accept it for the first version and keep the
-  limitation stated, since the owner's answer ("if its just the one, that's fine") was given
-  for this check. Add the environment refusal only if he wants the extra friction.
 
 ## Out-of-scope (for now)
 

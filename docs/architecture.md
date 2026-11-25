@@ -1045,17 +1045,17 @@ without it.
 
 **Status: designed, not built.** Nothing in this section has been run. Facts below
 that come from reading the current code say so; everything that needs a measurement
-is under "Not verified yet (remote management)". Questions the owner's decisions
-don't settle are marked **Open (Rn)** and collected in
-[open-questions.md](open-questions.md#remote-sleeper-management-86-designed-not-built),
-each with the author's recommendation. They are not decided.
+is under "Not verified yet (remote management)". The one question still open,
+whether the switch becomes default-on, is in
+[open-questions.md](open-questions.md#remote-sleeper-management-86-designed-not-built).
+R9 and R10, which this design raised, are decided (decision 8).
 
 #### Decisions
 
 The owner gave these in the spanreed session on 2026-11-25. They are recorded in
-two comments on #86 of that date, both posted by an agent's account, not by the
-owner's own. Only the words in quotation marks are his; the rest is the design
-that his words were an answer to, and says so.
+comments on #86 of that date, all posted by an agent's account, not by the
+owner's own. Only the words attributed to *the owner* are his; the rest is the
+design that his words were an answer to, and says so.
 
 1. **The carrier is new frame kinds over the `conjoin` bridge**, in both directions.
    Not a separate ssh command per operation. *The owner:* "conjoin isn't one way, its
@@ -1071,18 +1071,16 @@ that his words were an answer to, and says so.
    like allow connections opt in, not a per-name list". Offered a single on/off
    switch, under which any machine this one is conjoined with may manage its
    sleepers, he answered "yes". Nothing is keyed on a peer's host label.
-4. **A remote `create` is not capped beyond a local one.** *The owner:* "I'm not sure
-   we should cap, we have a lot of implicit trust because this is running over ssh,
-   its not like someone with ssh access couldn't just ssh through and trigger this
-   stuff themselves, so idk if we need extra restrictions". Told that this holds for
-   the end that dialled but not for the end that was dialled into, he accepted it
-   uncapped, provided that turning it on says plainly that a conjoined peer can then
-   run commands as you (recorded on #86; that condition is the author's wording, not
-   a quote). See "What turning it on grants".
-5. **A person must turn it on.** Asked how many opt-in commands there are, *the
-   owner:* "if its just the one, that's fine". There is one, `remote-access on`, and
-   it refuses unless stdin is a TTY and a confirmation is typed. The TTY check is the
-   author's mechanism, which that answer accepted.
+4. **A remote `create` is not capped beyond a local one.** This and decision 5 are
+   not words of his own. The author proposed this summary of the design: "one
+   per-machine switch, `spanreed sleeper remote-access on|off|show`, off by default.
+   Turning it on requires a person at a terminal. No cap on what remote commands can
+   do, with the docs stating what turning it on means." *The owner* answered "yes"
+   (14:47:09Z). The summary is quoted, and the attribution corrected, in the #86
+   comment of 2026-11-25 14:59. See "What turning it on grants" for what no cap
+   means.
+5. **Turning the switch on takes a person at a terminal.** From the same summary and
+   "yes" as decision 4. Decision 7 says what that check can and cannot do.
 6. **His answers to the questions the first draft left open** (R-numbers as in that
    draft): R1, record `PATH` when the switch is turned on: "sure, record is fine". R2,
    one gate for every operation: "one gate for everything". R3 and R4 (a per-peer or
@@ -1091,6 +1089,21 @@ that his words were an answer to, and says so.
    if so, that's fine"; it does, see "On the target". R7, `attach --host` prints the
    ssh command: "sounds fine". R8, an interrupted operation is reported, never run
    again: "no rerun, correct".
+7. **The terminal check guards against accidents, not against agents.** Any process
+   running as the user can write the `sleeper_remote_access` key in `config.json`
+   directly and never run `remote-access on`, so no check on the command can make
+   "a person turns it on" hold against an agent. Asked whether to accept the check
+   as protection against accidents only, *the owner:* "I mean this is true of all
+   things, claude can rewrite its own settings in the right environment, this is how
+   the agentic world works and there's no inherent way around it without crazy
+   security controls" (14:58:48Z, recorded on #86). Nothing stronger is added, such
+   as a root-owned file. See "What the TTY check does not stop".
+8. **R9 and R10, as recommended.** *The owner* answered "recs fine" to the author's
+   recommendations (recorded on #86, 2026-11-25 14:54): `--timeout` is capped at
+   600 s, the clock allowance is a fixed 30 s, expiry is checked again when a queued
+   request starts, and the TTY check is accepted for v1 with its limits stated
+   (R10). Decision 7, given after, restates those limits to cover the file as well
+   as the command.
 
 **The target resolves everything.** The target's own spanreed runs the operation, so
 paths, `claude` and `PATH` resolve there, and it logs every remote operation. This
@@ -1124,7 +1137,7 @@ spanreed sleeper retire --host PEER X [--timeout S]
   the bridge's own working directory is wherever `conjoin` happened to start. The
   target refuses a relative `cwd`. The requester also refuses one before sending,
   but only so the person hears it sooner; a modified requester can skip that.
-- `--timeout S` is at most 600 s (**Open (R9)**). It is also the request's
+- `--timeout S` is at most 600 s (R9, decision 8). It is also the request's
   lifetime: see "Every request expires".
 - The output is the target's output, printed verbatim, with every line prefixed
   `[PEER] ` so it can't be mistaken for a local result (rule 7: visible, not clean).
@@ -1201,7 +1214,7 @@ sending resolvable after the fact:
 
 **Timeouts:** 30 s by default; 90 s for `retire`, which on the target may wait up
 to `RETIRE_WAIT_S` (60 s) for an awake sleeper to finish its turn. `--timeout S`
-overrides it, up to 600 s (**Open (R9)**). Time spent queued behind another
+overrides it, up to 600 s (R9, decision 8). Time spent queued behind another
 operation on the target counts against it (see "On the target").
 
 **Management never queues across a down bridge.** Unlike mail, a request that
@@ -1226,9 +1239,9 @@ neither of them relying on the CLI:
   to `.abandoned`. A killed CLI's request therefore lives no longer than its
   timeout, and at most 600 s.
 - **The frame carries `expires_at`**, and the target checks it against its own
-  clock, with an allowance for skew between the two hosts (**Open (R9)**; see
-  "Idempotency" and "Validation on receipt"). A request that reaches the
-  target expired, with no record of it there, is answered `expired` and not run.
+  clock, with a fixed 30 s allowance for skew between the two hosts (R9,
+  decision 8; see "Idempotency" and "Validation on receipt"). A request that
+  reaches the target expired, with no record of it there, is answered `expired` and not run.
   This is the backstop for a requester that doesn't enforce its own limit, and
   what makes R5's pruning safe: a record is pruned after 7 days, a request lives at
   most 600 s, so no request that the target accepts can outlive the record that
@@ -1254,7 +1267,7 @@ down under its own operation. Instead:
    behind it. When the worker takes a request off the queue, it checks
    `expires_at` again: one whose deadline passed while it waited is answered
    `expired` and not run, because its requester has already reported "outcome
-   unknown" and stopped waiting (**Open (R9)**). The worker calls the same
+   unknown" and stopped waiting (R9, decision 8). The worker calls the same
    functions the local `spanreed sleeper` commands call, which do all the
    validation themselves (see "Validation on receipt"). Building this means
    splitting each `_sleeper_*` handler into "run, return exit code and text" and
@@ -1273,8 +1286,9 @@ later wake. In a remote create, "the creator" is a bridge process. On the serve 
 that is an ssh-launched command with a stripped `PATH`, which is why `conjoin`
 already has to find the remote `spanreed` with an interactive-shell probe. So a
 remote create resolves `claude` and `spanreed` on **the `PATH` recorded when
-`remote-access on` was run** (R1, decision 6), which a person ran in a real shell on
-this machine. If that `PATH` finds neither, the create fails with the target's
+`remote-access on` was run** (R1, decision 6), normally by a person in a real shell
+on this machine (any process running as the user can also write `path_env` itself;
+decision 7). If that `PATH` finds neither, the create fails with the target's
 message, naming `spanreed sleeper remote-access on` as the way to record it again.
 
 The target is also where a wake from a remote `wake` starts tmux, so a wake
@@ -1312,8 +1326,9 @@ spanreed sleeper remote-access off    # turn it off; takes effect on the next re
   failure, which the registry does not carry.
 - A requester needs no setting of its own to ask.
 
-**`on` requires a person** (decision 5). It refuses, changing nothing, unless stdin
-is a TTY. It then prints what it grants, and turns the switch on only if this
+**`on` asks for a person at a terminal** (decision 5). This guards against
+accidents, not against agents (decision 7). It refuses, changing nothing, unless
+stdin is a TTY. It then prints what it grants, and turns the switch on only if this
 machine's host label is typed back exactly:
 
 ```
@@ -1338,12 +1353,18 @@ records the current `PATH` again. `config.json` holds `sleeper_remote_access` as
 `{"enabled": true, "enabled_at": "<UTC>", "path_env": "<PATH>"}`; anything other
 than `"enabled": true` reads as off.
 
-**What the TTY check does not stop.** It stops an agent from turning the switch on
-with an ordinary shell command, such as one a session runs because a bus message
-asked it to. It does not stop a process that obtains a terminal on purpose: an
-agent can type into a tmux pane with `tmux send-keys`, or run the command under
-`script(1)`, and a bypass-mode sleeper on this machine needs no persuasion to do
-either. **Open (R10)** asks whether that is enough.
+**What the TTY check does not stop.** It is protection against accidents, such as
+a script or a stray command turning the switch on without anyone reading what it
+grants. It is **not a boundary against agents or processes running as this user**,
+and nothing in this design is (decision 7). The switch is a plain key in a file the
+user can write: any such process can set `sleeper_remote_access` in `config.json`
+with `jq` or `python -c` and never run `remote-access on`, and can set `path_env`
+to a directory holding its own `claude` while it is there. That includes a session
+acting on a bus message and a bypass-mode sleeper on this machine. Even through
+the command, a process can get a terminal on purpose: type into a tmux pane with
+`tmux send-keys`, or run it under `script(1)`. The owner accepted this for v1 (R10,
+decision 8; decision 7 for why nothing stronger, such as a root-owned file, is
+added).
 
 **A refused request** gets `outcome: "refused"`, exit 4, and this text, so the
 person reading it knows where the fix is:
@@ -1374,8 +1395,8 @@ and a message:
   user can write.
 
 Decision 4 is to leave this uncapped and say so, here and in what `on` prints. The
-owner's reason, that a peer reached over ssh could do all of this anyway, holds for
-the end that dialled. It does not hold for the other end: the machine this one
+argument that a peer reached over ssh could do all of this anyway holds for the
+end that dialled. It does not hold for the other end: the machine this one
 dialled often has no ssh path back at all (decision 1's Mac behind NAT), and for it
 the switch is the only way in. Nor does any of this stop at the peer's owner: any
 agent or process running as that user on the peer can write the peer's request
@@ -1552,7 +1573,7 @@ call, so the local and remote paths share one set:
   `invalid` and noted on the peer record, and the requester's CLI times out with
   "not answered".
 - **`expires_at`** must parse as a UTC timestamp no more than 600 s plus the clock
-  allowance (**Open (R9)**) ahead of the target's clock. Missing or out of range is
+  allowance (30 s; R9, decision 8) ahead of the target's clock. Missing or out of range is
   `invalid`; passed is `expired`, as above.
 - **`op`** must be one the target knows, and **`args`** must have exactly that op's
   fields with the right types; otherwise `outcome: "invalid"` with the reason.
