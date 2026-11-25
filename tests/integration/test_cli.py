@@ -1065,6 +1065,18 @@ class TestListReportsSyncState:
         _, out = _run(capsys, ["list"])
         assert "DETACHED  adolin" in out
         assert "no longer running, so its mirrored agents are gone" in out
+        assert "mail for this host is REFUSED" in out
+
+    def test_a_dropped_link_with_conjoin_running_is_shown_as_reconnecting(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#34: the state in which mail for the peer queues."""
+        _write_peer("adolin", detached_at=datetime.now(UTC))
+        _, out = _run(capsys, ["list"])
+        assert "RECONNECTING  adolin" in out
+        assert "running, link DOWN and retrying" in out
+        assert "mail for them QUEUES until the reconnect drains it" in out
+        assert "detached at:" in out
 
     def test_the_report_warns_that_last_seen_is_not_liveness(
         self, cli_env: Path, capsys: pytest.CaptureFixture[str]

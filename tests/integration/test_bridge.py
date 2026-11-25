@@ -11,7 +11,10 @@ import contextlib
 import io
 import json
 import os
+import shlex
+import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -25,8 +28,9 @@ import pytest
 
 from spanreed import bridge
 from spanreed.bridge import Bridge, reconnect_loop
+from spanreed.protocol import PeerLink
 from spanreed.sleepers import SleeperRecord
-from spanreed.store import StateStore
+from spanreed.store import StateStore, peer_link_state, pid_start_time
 
 # Aliased once so the private stays private — same pattern as test_cli.py's
 # `_parse_since`: one alias costs a single ignore instead of one per call site.
@@ -1000,7 +1004,9 @@ class TestConnectionStatusLines:
     # The three reasons the review found untested: removing any of them left
     # the suite green. Each test below drives the real Bridge into that state.
 
-    def _connect_bridge(self, tmp_path: Path, **kw: float) -> tuple[Bridge, int]:
+    def _connect_bridge(
+        self, tmp_path: Path, *, recv_timeout: float | None = None, hello_timeout: float = 15.0
+    ) -> tuple[Bridge, int]:
         peer_r, peer_w = os.pipe()
         conn = Bridge(
             os.fdopen(peer_r, "rb"),
@@ -1010,7 +1016,8 @@ class TestConnectionStatusLines:
             role="connect",
             poll_interval=0.05,
             sync_interval=10,
-            **kw,
+            recv_timeout=recv_timeout,
+            hello_timeout=hello_timeout,
         )
         return conn, peer_w
 
@@ -1572,3 +1579,350 @@ def test_an_asleep_sleeper_is_advertised_and_addressable_from_the_peer(tmp_path:
         assert row.sleeper == "asleep"
         store_a.send_message(from_agent="agent-alice", to_agent="agent-nap@hostB", body="wake")
         _wait(lambda: [m.body for m in store_b.recv_messages("agent-nap")] == ["wake"])
+
+
+# ------------------------------------- #34: sends while the bridge is down
+
+
+def test_under_conjoin_a_late_registry_frame_does_not_overwrite_the_mirror(
+    tmp_path: Path,
+) -> None:
+    """#81's guard, on the connect end that keeps its mirror across a drop (#34).
+
+    Under `conjoin` the rows outlive the link, so teardown does not clear them,
+    but a frame the dead link's reader applies afterwards must still be refused:
+    it would replace the snapshot with one from a connection that is gone.
+    """
+    store = StateStore(root=tmp_path / "a")
+    peer_r, peer_w = os.pipe()
+    conn = Bridge(
+        os.fdopen(peer_r, "rb"),
+        io.BytesIO(),
+        "hostA",
+        store,
+        poll_interval=0.05,
+        sync_interval=10,
+        recv_timeout=60,
+        mirror_outlives_link=True,
+    )
+    runner = threading.Thread(target=conn.run, daemon=True)
+    runner.start()
+
+    def registry(agent_id: str) -> bytes:
+        agent = {
+            "agent_id": agent_id,
+            "name": agent_id.removeprefix("agent-"),
+            "working_dir": "/b",
+            "pid": os.getpid(),
+            "pid_start": None,
+            "last_seen": "2026-01-01T00:00:00Z",
+        }
+        return (json.dumps({"kind": "registry", "agents": [agent]}) + "\n").encode()
+
+    def mirrored() -> list[str]:
+        return [a.agent_id for a in store.list_agents(include_stale=True)]
+
+    with os.fdopen(peer_w, "wb") as peer:
+        peer.write((json.dumps({"kind": "hello", "host": "hostB"}) + "\n").encode())
+        peer.write(registry("agent-bob"))
+        peer.flush()
+        _wait(lambda: mirrored() == ["agent-bob@hostB"])
+        conn.stop()
+        runner.join(timeout=5.0)
+        assert not runner.is_alive()
+        assert mirrored() == ["agent-bob@hostB"], "the mirror must outlive the link"
+        peer.write(registry("agent-carol"))
+        peer.flush()
+        time.sleep(0.3)
+    assert mirrored() == ["agent-bob@hostB"]
+
+
+class TestSendsWhileTheBridgeIsDown:
+    """#34. While a `conjoin` for the host runs, mail for its peer queues across a
+    dropped link and the reconnect delivers it. Once no `conjoin` runs -- it
+    exited, or was killed -- mail for the peer is refused."""
+
+    def test_mail_queues_while_conjoin_reconnects_and_the_reconnect_delivers_it(
+        self, tmp_path: Path
+    ) -> None:
+        """`conjoin`'s real reconnect loop, each attempt an in-process link."""
+        store_a = StateStore(root=tmp_path / "a")
+        store_b = StateStore(root=tmp_path / "b")
+        _register_live(store_a, "agent-alice", "alice")
+        _register_live(store_b, "agent-bob", "bob")
+        shutdown = threading.Event()
+        in_backoff = threading.Event()
+        resume = threading.Event()
+        links: list[Bridge] = []
+
+        def run_once(
+            proc: subprocess.Popen[bytes],
+            label: str,
+            store: StateStore,
+            holder: list[Bridge | None],
+        ) -> float:
+            a2b_r, a2b_w = os.pipe()
+            b2a_r, b2a_w = os.pipe()
+            conn_write, serve_write = os.fdopen(a2b_w, "wb"), os.fdopen(b2a_w, "wb")
+            conn = Bridge(
+                os.fdopen(b2a_r, "rb"),
+                conn_write,
+                label,
+                store,
+                poll_interval=0.05,
+                sync_interval=0.2,
+                mirror_outlives_link=True,  # as _run_bridge_once builds it
+            )
+            serve = Bridge(
+                os.fdopen(a2b_r, "rb"),
+                serve_write,
+                "hostB",
+                store_b,
+                role="serve",
+                poll_interval=0.05,
+                sync_interval=0.2,
+            )
+            links.append(conn)
+            served = threading.Thread(target=serve.run, daemon=True)
+            served.start()
+            try:
+                return conn.run()
+            finally:
+                serve.stop()
+                served.join(timeout=3)
+                conn_write.close()  # EOF for both readers
+                serve_write.close()
+
+        def backoff(_delay: float) -> None:
+            in_backoff.set()
+            resume.wait(timeout=10)
+            resume.clear()
+
+        loop = threading.Thread(
+            target=reconnect_loop,
+            args=(["peer"], "hostA", store_a),
+            kwargs={
+                "install_signals": False,
+                "shutdown": shutdown,
+                "spawn": lambda _argv: _fake_proc(),  # pyright: ignore[reportUnknownLambdaType]
+                "run_once": run_once,
+                "wait": backoff,
+            },
+            daemon=True,
+        )
+        loop.start()
+        try:
+            _wait(lambda: _synced(store_a, "hostB"))
+            links[-1].stop()  # the link drops; conjoin is still running
+            assert in_backoff.wait(timeout=5)
+
+            msg = store_a.send_message(
+                from_agent="agent-alice", to_agent="agent-bob@hostB", body="while down"
+            )
+            live, why = store_a.delivery_verdict(msg.to_agent)
+            assert not live
+            assert why.startswith("QUEUED, BRIDGE RECONNECTING")
+            assert "It last connected" in why
+            assert store_b.recv_messages("agent-bob") == []
+
+            resume.set()  # the reconnect succeeds and drains the queue
+            _wait(lambda: [m.body for m in store_b.recv_messages("agent-bob")] == ["while down"])
+            assert len(links) == 2
+        finally:
+            shutdown.set()
+            links[-1].stop()
+            resume.set()
+            loop.join(timeout=5)
+        assert not loop.is_alive()
+
+        # conjoin has exited: its rows are gone and the address is refused.
+        assert [a.agent_id for a in store_a.list_agents(include_stale=True)] == ["agent-alice"]
+        with pytest.raises(ValueError, match="'agent-bob@hostB' is not a registered agent_id"):
+            store_a.send_message(from_agent="agent-alice", to_agent="agent-bob@hostB", body="x")
+
+    @pytest.mark.parametrize("stop", [signal.SIGTERM, signal.SIGKILL], ids=["exited", "killed"])
+    def test_with_no_conjoin_running_mail_for_the_peer_is_refused(
+        self, tmp_path: Path, stop: signal.Signals
+    ) -> None:
+        """A real `spanreed conjoin`, stopped cleanly or killed.
+
+        The killed case is the one that queued before #34: teardown never ran,
+        so the mirrored rows linger with a dead owner pid, and a send to the
+        exact address resolved and was written to an inbox nothing forwards.
+        """
+        root_a, root_b = tmp_path / "a", tmp_path / "b"
+        store_a, store_b = StateStore(root=root_a), StateStore(root=root_b)
+        _register_live(store_a, "agent-alice", "alice")
+        _register_live(store_b, "agent-bob", "bob")
+        cli = f"{shlex.quote(sys.executable)} -m spanreed.cli"
+        serve = (
+            f"SPANREED_STATE_ROOT={shlex.quote(str(root_b))} {cli} conjoin --serve --label hostB"
+        )
+        argv = [sys.executable, "-m", "spanreed.cli", "conjoin", "hostB", "--label", "hostA"]
+        conjoin = subprocess.Popen(
+            [*argv, "--exec", serve],
+            env={**os.environ, "SPANREED_STATE_ROOT": str(root_a)},
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            _wait(lambda: _synced(store_a, "hostB"), timeout=30)
+            os.kill(conjoin.pid, stop)
+            conjoin.wait(timeout=10)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(conjoin.pid, signal.SIGKILL)
+
+        rows = [a.agent_id for a in store_a.list_agents(include_stale=True) if "@" in a.agent_id]
+        assert rows == ([] if stop == signal.SIGTERM else ["agent-bob@hostB"])
+        with pytest.raises(ValueError) as excinfo:
+            store_a.send_message(from_agent="agent-alice", to_agent="agent-bob@hostB", body="x")
+        text = str(excinfo.value)
+        assert "NO BRIDGE IS RUNNING to 'hostB'" in text
+        assert f"process that owned it (pid {conjoin.pid}, role connect)" in text
+        assert not store_a.inbox_path("agent-bob@hostB").exists()
+
+    def test_a_clean_exit_reads_as_stopped_before_the_process_is_gone(self, tmp_path: Path) -> None:
+        """PR #120 second review: a real `spanreed conjoin`, stopped with SIGTERM.
+
+        Its exit clears the mirrored rows and the process lives on for tens of
+        milliseconds. A verdict taken the moment the row disappears used to
+        land in that window and read QUEUED, BRIDGE RECONNECTING, promising a
+        reconnect that was never coming. The record is now marked stopping
+        before the rows go, so the verdict does not depend on when it is taken.
+        """
+        root_a, root_b = tmp_path / "a", tmp_path / "b"
+        store_a, store_b = StateStore(root=root_a), StateStore(root=root_b)
+        _register_live(store_a, "agent-alice", "alice")
+        _register_live(store_b, "agent-bob", "bob")
+        cli = f"{shlex.quote(sys.executable)} -m spanreed.cli"
+        serve = (
+            f"SPANREED_STATE_ROOT={shlex.quote(str(root_b))} {cli} conjoin --serve --label hostB"
+        )
+        argv = [sys.executable, "-m", "spanreed.cli", "conjoin", "hostB", "--label", "hostA"]
+        conjoin = subprocess.Popen(
+            [*argv, "--exec", serve],
+            env={**os.environ, "SPANREED_STATE_ROOT": str(root_a)},
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        def row_present() -> bool:
+            return any(
+                a.agent_id == "agent-bob@hostB" for a in store_a.list_agents(include_stale=True)
+            )
+
+        try:
+            _wait(lambda: _synced(store_a, "hostB"), timeout=30)
+            os.kill(conjoin.pid, signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while row_present() and time.monotonic() < deadline:
+                pass  # no sleep: the verdict must race the exit, as a send would
+            live, why = store_a.delivery_verdict("agent-bob@hostB")
+            conjoin.wait(timeout=10)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(conjoin.pid, signal.SIGKILL)
+
+        assert not row_present()
+        assert not live
+        assert why.startswith("NOT DELIVERED: NO BRIDGE IS RUNNING to 'hostB'"), why
+
+    def test_reconnect_loop_marks_its_records_stopping_before_it_clears_rows(
+        self, tmp_path: Path
+    ) -> None:
+        """The ordering itself, observed at the moment the rows are cleared."""
+        store = StateStore(root=tmp_path)
+        me = os.getpid()
+        me_start = pid_start_time(me)
+        shutdown = threading.Event()
+        seen: list[str] = []
+
+        def run_once(
+            proc: subprocess.Popen[bytes],
+            label: str,
+            store_: StateStore,
+            holder: list[Bridge | None],
+        ) -> float:
+            store_.write_peer_link(
+                PeerLink(
+                    host="hostB",
+                    role="connect",
+                    bridge_pid=me,
+                    bridge_pid_start=me_start,
+                    attached_at=datetime.now(UTC),
+                    detached_at=datetime.now(UTC),
+                )
+            )
+            shutdown.set()
+            return 0.0
+
+        real_clear = store.clear_agents_owned_by
+
+        def spy_clear(owner_pid: int, owner_pid_start: int | None) -> None:
+            link = store.read_peer_link("hostB")
+            assert link is not None
+            seen.append(peer_link_state(link))
+            real_clear(owner_pid, owner_pid_start)
+
+        store.clear_agents_owned_by = spy_clear  # type: ignore[method-assign]
+        reconnect_loop(
+            ["peer"],
+            "hostA",
+            store,
+            install_signals=False,
+            shutdown=shutdown,
+            spawn=lambda _argv: _fake_proc(),  # pyright: ignore[reportUnknownLambdaType]
+            run_once=run_once,
+        )
+        assert seen == ["stopped"]
+
+    def test_a_final_stop_writes_stopping_with_the_detach(self, tmp_path: Path) -> None:
+        """SIGTERM mid-link: one record write carries both, so no reader sees
+        the detached link as reconnecting on the way out."""
+        store_a, store_b, bridge_a, bridge_b = _pair(tmp_path)
+        _register_live(store_b, "agent-bob", "bob")
+        ta = threading.Thread(target=bridge_a.run, daemon=True)
+        tb = threading.Thread(target=bridge_b.run, daemon=True)
+        ta.start()
+        tb.start()
+        try:
+            _wait(lambda: _synced(store_a, "hostB"))
+            bridge_a.stop(final=True)
+            ta.join(timeout=3)
+        finally:
+            bridge_a.stop()
+            bridge_b.stop()
+            tb.join(timeout=3)
+        link = store_a.read_peer_link("hostB")
+        assert link is not None
+        assert link.detached_at is not None
+        assert link.stopping_at == link.detached_at
+        assert peer_link_state(link) == "stopped"
+
+    def test_a_plain_stop_is_a_dropped_link_not_an_exit(self, tmp_path: Path) -> None:
+        store_a, store_b, bridge_a, bridge_b = _pair(tmp_path)
+        _register_live(store_b, "agent-bob", "bob")
+        with _running(bridge_a, bridge_b):
+            _wait(lambda: _synced(store_a, "hostB"))
+        link = store_a.read_peer_link("hostB")
+        assert link is not None
+        assert link.detached_at is not None
+        assert link.stopping_at is None
+
+    def test_the_signal_handler_stops_the_bridge_as_final(self) -> None:
+        shutdown = threading.Event()
+        live_bridge = MagicMock()
+        holder: list[Bridge | None] = [cast("Bridge", live_bridge)]
+        previous_term = signal.getsignal(signal.SIGTERM)
+        previous_int = signal.getsignal(signal.SIGINT)
+        try:
+            bridge._install_signal_handlers(shutdown, holder)  # pyright: ignore[reportPrivateUsage]
+            handler = signal.getsignal(signal.SIGTERM)
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
+        assert shutdown.is_set()
+        live_bridge.stop.assert_called_once_with(final=True)
