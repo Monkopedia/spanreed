@@ -534,7 +534,7 @@ main way status goes stale.
 set_status `needs_input` (you can still proceed) or `blocked` (you're stopped).
   - `idle` — when you finish and are no longer working.
 
-set_status values: idle | working | needs_input | blocked."""
+  - set_status(status)   — status: idle | working | needs_input | blocked"""
 
 
 def _self_entry(store: StateStore, agent_id: str) -> Agent | None:
