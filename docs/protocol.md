@@ -32,8 +32,10 @@ that a new `create` had locked through a new one.
 `sleeper-ops/` and `logs/sleeper-ops.jsonl` belong to managing sleepers over `conjoin`
 (#86), which is designed but not built. Their file states, the idempotency record and the
 audit line are specified in [`architecture.md`](architecture.md#managing-a-peers-sleepers-over-conjoin-86).
-The opt-in lives in `config.json` under `sleeper_remote_access`, an object keyed by peer host
-label; a peer with no key is not allowed, and an unreadable `config.json` allows nobody.
+The switch lives in `config.json` under `sleeper_remote_access`, one object for the whole
+machine: `{"enabled": true, "enabled_at": "<UTC>", "path_env": "<PATH>"}`. It is not keyed by
+peer. Anything other than `"enabled": true`, including an absent key or an unreadable
+`config.json`, means off.
 
 `codex/<name>.log` is written only by `spanreed codex` (see
 [`architecture.md`](architecture.md#codex-workers)). It is append-only, plain text, one timestamped
@@ -399,8 +401,8 @@ The `spanreed` CLI wraps the same operations for shell/script use and is what th
 | `spanreed sleeper retire N` | Delete an asleep sleeper's record and row. Its inbox is kept |
 | `spanreed sleeper wake N` | Wake it by hand, by the same path a message takes. Exit 1 if the wake failed (the reason is printed and recorded) |
 | `spanreed sleeper attach N` | `tmux attach` to the sleeper's current session, whatever its generation |
-| `spanreed sleeper create\|list\|wake\|sleep\|retire --host PEER ... [--timeout S]` | *Designed (#86), not built.* Run the operation on a conjoined peer, through this host's bridge to it. Arguments are sent as typed and checked on the peer; `create --cwd` must be absolute or start with `~`. Output is the peer's, each line prefixed `[PEER] `. Exit 0 ok; 1 it ran on the peer and failed; 2 nothing was sent (no bridge, a bridge or peer too old, bad argument, timed out before sending); 3 sent, outcome unknown; 4 refused by the peer. `attach --host` prints the ssh command to run instead |
-| `spanreed sleeper remote-access [allow\|deny PEER]` | *Designed (#86), not built.* Show, grant or remove a peer's right to manage this host's sleepers. Off for every peer by default; read per request |
+| `spanreed sleeper create\|list\|wake\|sleep\|retire --host PEER ... [--timeout S]` | *Designed (#86), not built.* Run the operation on a conjoined peer, through this host's bridge to it. Arguments are sent as typed and validated again by the peer; `create --cwd` must be absolute or start with `~`. `--timeout` is at most 600 s and is also the request's lifetime: it is never sent or resent after it. Output is the peer's, each line prefixed `[PEER] `. Exit 0 ok; 1 it ran on the peer and failed; 2 nothing was run (no bridge, a bridge or peer too old, bad argument, timed out before sending, expired); 3 sent, outcome unknown; 4 refused by the peer. `attach --host` prints the ssh command to run instead |
+| `spanreed sleeper remote-access show\|on\|off` | *Designed (#86), not built.* One switch per machine, off by default: while on, every conjoined peer may manage this host's sleepers, which lets it **run commands as this user** (see `architecture.md`, "What turning it on grants"). `on` refuses unless stdin is a TTY and this host's label is typed back, and records `PATH` for remote creates. Read per request |
 | `spanreed conjoin HOST` | Bridge this bus to a peer's over a persistent SSH pipe (`--serve` is the remote plumbing end) |
 
 ## Cross-host bridge wire-format
@@ -482,7 +484,7 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
 {"kind": "registry", "agents": [ <Agent, ...> ], "local_rows": 5, "stale_local_rows": 1}
 {"kind": "registry-request"}
 {"kind": "ping"}
-{"kind": "sleeper-op", "request_id": "<32 hex>", "op": "<op>", "args": { ... }, "requested_by": "<free text>"}
+{"kind": "sleeper-op", "request_id": "<32 hex>", "expires_at": "<UTC>", "op": "<op>", "args": { ... }, "requested_by": "<free text>"}
 {"kind": "sleeper-op-result", "request_id": "<32 hex>", "outcome": "<outcome>", "exit": 0, "stdout": "...", "stderr": "...", "records": null}
 ```
 
@@ -503,6 +505,7 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
 - `ping` — keepalive; lets each side detect a dead pipe and lets `connect` trigger reconnect.
 - `sleeper-op` (designed for #86, not built) — "run this sleeper operation on your host." Sent by the **main thread** of the requesting bridge, from its request spool. Fields:
   - `request_id`: exactly 32 lowercase hex characters, minted by the requester's CLI. It becomes a file name on both hosts, so a frame whose id does not match is refused with no reply, logged as `invalid`, and noted on the peer record.
+  - `expires_at`: an ISO 8601 UTC timestamp, the requester's `created_at` plus its timeout (at most 600 s). The requester's bridge never sends or resends the frame after it. The receiver answers a request with no idempotency record and a passed `expires_at` with `expired`, and never runs it; it also answers `expired` for one whose deadline passes while it waits in the queue. An `expires_at` that is missing, unparseable, or more than 600 s plus a clock allowance ahead of the receiver's clock is `invalid` (allowance: open-questions R9).
   - `op` and `args`, as typed by the user, never resolved on the requester:
 
     | `op` | `args` |
@@ -513,7 +516,7 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
 
   - `requested_by`: who asked, as the requester asserts it (`"<user> on <host>"`, plus the agent id when the CLI ran inside a bus session). Logged, never verified, like `from_agent`.
 
-  The receiver checks the opt-in (`config.json` `sleeper_remote_access`, keyed by the `hello` label), writes its idempotency record (`sleeper-ops/in/<peer>/<request_id>.json`), and runs the operation on a worker thread with exactly the checks the local command applies. A request id it has seen before is **never run twice**: a finished one is answered from the record, a running one is answered when it finishes, and one whose runner died is answered `interrupted`.
+  The receiver checks the switch (`config.json` `sleeper_remote_access`, one per machine, not keyed by peer), checks `expires_at`, writes its idempotency record (`sleeper-ops/in/<peer>/<request_id>.json`), and queues the operation for a worker thread that runs one at a time. The receiver **validates every field itself** and relies on no check made by the requester: the `cwd` form, `permission_mode`, the claude-args allowlist, `idle_timeout`, the `--trust` refusals and `name` (the list is in `architecture.md`, "Validation on receipt"). A request id it has seen before is **never run twice**: a finished one is answered from the record, a queued or running one is answered when it finishes, and one whose runner died is answered `interrupted`.
 - `sleeper-op-result` (same) — the answer, sent by the target's main thread. `outcome` is one of:
 
   | `outcome` | meaning | requester exit |
@@ -521,8 +524,9 @@ The pipe carries newline-delimited JSON frames, each with a `kind`:
   | `ok` | ran and succeeded | 0 |
   | `failed` | ran, and the target's own checks refused it or it failed, as locally | 1 |
   | `interrupted` | the target's bridge ended partway through; the effect may be partial | 1 |
-  | `invalid` | malformed `args`, or an `op` the target does not know (e.g. from a newer requester) | 2 |
-  | `refused` | this peer is not allowed to manage the target's sleepers | 4 |
+  | `invalid` | malformed `args` or `expires_at`, or an `op` the target does not know (e.g. from a newer requester) | 2 |
+  | `expired` | its `expires_at` passed before it started; not run | 2 |
+  | `refused` | remote sleeper management is turned off on the target | 4 |
 
   `exit` is the code the same command would have returned locally; `stdout` and `stderr` are its output, printed by the requester with each line prefixed `[PEER] `. `records` is the target's `sleeper list --json` array for `op: "list"` and `null` otherwise. After a `create` or `retire`, the target sends a `registry` frame **before** the result, so the requester's mirror is current by the time its CLI returns. The requester writes the result to `sleeper-ops/out/<peer>/<request_id>.reply.json` only if a matching `.sent` file exists; any other result is noted and dropped.
 

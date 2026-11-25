@@ -105,52 +105,40 @@ Still open:
 ## Remote sleeper management (#86, designed, not built)
 
 Design in [`architecture.md`](architecture.md#managing-a-peers-sleepers-over-conjoin-86), wire
-format in [`protocol.md`](protocol.md#pipe-frames). The owner settled the carrier (frames over
-`conjoin`), the opt-in (off by default, granted on the managed machine) and resolution (on the
-target) on 2026-11-25. These are the questions those decisions leave open. Each has the author's
-recommendation; **none is decided.**
+format in [`protocol.md`](protocol.md#pipe-frames). The owner's decisions of 2026-11-25 are
+quoted there, under "Decisions". They settled the carrier (frames over `conjoin`), the grant
+(one per-machine switch, `spanreed sleeper remote-access on|off|show`, off by default), no cap
+on a remote create beyond a local one, that a person must turn it on, and the first draft's
+R1, R2 and R5 to R8; R3 and R4 were superseded by the single switch. What is left:
 
 - **Default-on after a few releases?** Deferred by the owner on 2026-11-25: "that sounds fine for
   now, maybe after a few releases we turn it on by default". Revisit once remote management has
-  shipped and been used.
-- **R1. Where a remote `create` gets its `PATH`.** A local create resolves `claude` and
-  `spanreed` on the creator's `PATH`. Remotely the creator is a bridge process, and on the serve
-  end that is an ssh-launched command with a stripped `PATH`, so `claude` is often not found.
-  Options: the bridge process's own `PATH`; an interactive-shell probe on the target per create
-  (as `conjoin` does to find `spanreed`); or a `PATH` recorded when the owner runs `spanreed
-  sleeper remote-access allow PEER` in a real shell on the target. *Recommendation:* the last. It
-  is captured by a person on the right machine, needs no shell-specific probe, and the failure
-  message can name the command that refreshes it.
-- **R2. Is `list` behind the opt-in too?** It only reads, and asleep sleepers are already
-  advertised in the registry. But a record also holds `cwd`, `claude_args`, `path_env` and the
-  last wake failure, which the registry does not carry. *Recommendation:* yes, one gate for all
-  five operations; a peer that is not allowed gets `refused` for `list` as for the rest.
-- **R3. One grant per peer, or per operation?** E.g. allow `wake`/`sleep`/`list` but not
-  `create`/`retire`. *Recommendation:* per peer, all operations, for the first version. `create`
-  is the large grant, and it is already bounded by the same allowlist and refusals as a local
-  one (decision 3); a per-operation split can be added later without changing the frames.
-- **R4. Is the peer's host label enough to key the grant on?** The label is what the peer says
-  in `hello`. The serve end's peer was authenticated by ssh; the connect end's peer is whatever
-  host it dialled, and could claim any label. *Recommendation:* key on the label. Routing and
-  inbox injection already trust it, so a grant keyed on it adds no trust that a bridge does not
-  already extend, and the design says so rather than implying more.
-- **R5. How long the request spool and the target's idempotency records are kept.**
-  *Recommendation:* the requester's `.abandoned` files and orphaned replies for one day; the
-  target's idempotency records for seven days, pruned by its bridge at start. A request resent
-  after its record is pruned would run again, so the window has to outlast any realistic
-  reconnect.
-- **R6. Operations run one at a time per bridge.** A 60 s `retire` delays a `wake` queued behind
-  it. *Recommendation:* serial for the first version. The sleeper locks would make concurrency
-  safe, but serial makes the audit log read in the order things happened, and the delay is
-  visible in the requester's wait.
-- **R7. What `attach --host` does.** *Recommendation:* ask the target for the record and print
-  `ssh -t PEER tmux attach -t <session>`, exiting 2. Running ssh itself would be the per-command
-  ssh carrier the owner ruled out, and it fails on exactly the hosts that ruling was for.
-- **R8. An operation interrupted by its bridge dying.** The target sees a `running` record whose
-  process is gone. Options: report `interrupted` and let a person check; or run it again.
-  *Recommendation:* report, never re-run. The operations are not idempotent (a re-run `create`
-  fails on its own name), and a partly done `retire` or `--trust` is safer looked at than
-  repeated.
+  shipped and been used. Turning it on by default would also turn on what "What turning it on
+  grants" describes, for every user who runs `conjoin`.
+- **R9. The numbers behind request expiry.** Not decided; added after review 6059741469 found
+  that a killed CLI's request could be sent days later. Three parts:
+  - *The cap on `--timeout`*, which is also the longest a request lives. *Recommendation:* 600
+    s. It is far longer than any operation (a `retire` waits at most 60 s) and far shorter than
+    the seven days a target keeps its records, so a resend can never outlive its record.
+  - *The clock allowance.* The requester stamps `expires_at` by its clock and the target checks
+    it by its own, so skew between the two hosts moves the deadline. *Recommendation:* a fixed
+    30 s. Skew larger than that shows up as `expired` or `invalid` naming both clocks, not as a
+    silent rerun; NTP is assumed and nothing measures it.
+  - *Whether expiry is checked again when a queued request starts.* A request queued on the
+    target behind a long one (R6) may reach the front after its requester has reported "outcome
+    unknown" and stopped waiting. *Recommendation:* check, and answer `expired` without running
+    it, so nothing runs after the person stopped waiting. The cost is that a person who expects
+    a queue must pass a longer `--timeout`.
+- **R10. Is the TTY check on `remote-access on` enough?** Not decided; raised by this revision.
+  Requiring a TTY and a typed label stops an agent from turning the switch on with an ordinary
+  shell command. It does not stop one that gets a terminal on purpose: `tmux send-keys` into a
+  pane, or `script(1)`, and a bypass-mode sleeper needs no persuasion. Options: accept it and
+  say so (as the design now does); also refuse when the environment shows a Claude Code or
+  spanreed session (`CLAUDECODE`, the plugin's variables), which only adds friction since a
+  process can unset them; or require something an agent can't type, such as an OS
+  authentication prompt. *Recommendation:* accept it for the first version and keep the
+  limitation stated, since the owner's answer ("if its just the one, that's fine") was given
+  for this check. Add the environment refusal only if he wants the extra friction.
 
 ## Out-of-scope (for now)
 

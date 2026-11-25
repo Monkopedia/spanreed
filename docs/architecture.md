@@ -500,8 +500,8 @@ and the idle timeout never does.
   accepted ("Yeah"). See "What counts as read".
 
 - **Managing sleepers across `conjoin` is wanted, after local sleepers work.**
-  This is decision 8, tracked in #86. Its design, and the owner's three decisions
-  on it (2026-11-25), are under "Managing a peer's sleepers over `conjoin`".
+  This is decision 8, tracked in #86. Its design, and the owner's decisions on
+  it (2026-11-25), are under "Managing a peer's sleepers over `conjoin`".
 
 Also the author's, for the owner to see: no ssh agent in a woken sleeper (see
 "Environment"), and a signal-first exit.
@@ -1052,21 +1052,53 @@ each with the author's recommendation. They are not decided.
 
 #### Decisions
 
-**The owner's, in the spanreed session on 2026-11-25**, recorded on #86 (comment of
-2026-11-25, posted by an agent, not by the owner's own account):
+The owner gave these in the spanreed session on 2026-11-25. They are recorded in
+two comments on #86 of that date, both posted by an agent's account, not by the
+owner's own. Only the words in quotation marks are his; the rest is the design
+that his words were an answer to, and says so.
 
 1. **The carrier is new frame kinds over the `conjoin` bridge**, in both directions.
    Not a separate ssh command per operation. *The owner:* "conjoin isn't one way, its
    two way … there may not be a bidirectional ssh pipe, this must be a frame over
    conjoin". Either end of a bridge can manage the other end's sleepers, including
    an end with no ssh path back (a Mac behind NAT that dials out).
-2. **Off by default, and opted into on the machine whose sleepers are managed.** A
-   peer cannot grant itself the right. Whether it becomes default-on after a few
-   releases is deferred (open-questions.md).
-3. **The target resolves everything.** The target's own spanreed runs the
-   operation, so paths, `claude` and `PATH` resolve there. A remote `create` can do
-   no more than a local one: the same claude-args allowlist and `--trust` refusals
-   apply. The target logs every remote operation.
+2. **Off by default, and turned on at the machine whose sleepers are managed.** Asked
+   by the author whether opt-in on the managed machine was the right way to authorize
+   this, *the owner:* "that sounds fine for now, maybe after a few releases we turn it
+   on by default". Whether it becomes default-on is deferred (open-questions.md).
+3. **The grant is one per-machine switch, not a per-peer list.** *The owner:* "wait
+   are we granting access based on peer name or just opting in? I thought it was more
+   like allow connections opt in, not a per-name list". Offered a single on/off
+   switch, under which any machine this one is conjoined with may manage its
+   sleepers, he answered "yes". Nothing is keyed on a peer's host label.
+4. **A remote `create` is not capped beyond a local one.** *The owner:* "I'm not sure
+   we should cap, we have a lot of implicit trust because this is running over ssh,
+   its not like someone with ssh access couldn't just ssh through and trigger this
+   stuff themselves, so idk if we need extra restrictions". Told that this holds for
+   the end that dialled but not for the end that was dialled into, he accepted it
+   uncapped, provided that turning it on says plainly that a conjoined peer can then
+   run commands as you (recorded on #86; that condition is the author's wording, not
+   a quote). See "What turning it on grants".
+5. **A person must turn it on.** Asked how many opt-in commands there are, *the
+   owner:* "if its just the one, that's fine". There is one, `remote-access on`, and
+   it refuses unless stdin is a TTY and a confirmation is typed. The TTY check is the
+   author's mechanism, which that answer accepted.
+6. **His answers to the questions the first draft left open** (R-numbers as in that
+   draft): R1, record `PATH` when the switch is turned on: "sure, record is fine". R2,
+   one gate for every operation: "one gate for everything". R3 and R4 (a per-peer or
+   per-operation grant, and trusting the peer's label) are superseded by decision 3.
+   R5, the retention periods: "yes". R6, one operation at a time: "does this queue?
+   if so, that's fine"; it does, see "On the target". R7, `attach --host` prints the
+   ssh command: "sounds fine". R8, an interrupted operation is reported, never run
+   again: "no rerun, correct".
+
+**The target resolves everything.** The target's own spanreed runs the operation, so
+paths, `claude` and `PATH` resolve there, and it logs every remote operation. This
+was the author's proposal in the first of those sessions, and the owner did not
+object. It is not his decision. The first draft of this section listed it as one,
+together with the claim that a remote `create` "can do no more than a local one".
+That claim is true but misleading, since a local `create` can do anything its user
+can, and decision 4 replaces it.
 
 #### The commands
 
@@ -1085,11 +1117,15 @@ spanreed sleeper retire --host PEER X [--timeout S]
 - Every argument is sent **as typed** and interpreted on the target. The requester
   does not expand `~`, resolve `--cwd`, parse `--idle-timeout`, or check
   `CLAUDE_ARGS` against the allowlist: each of those means something different on
-  the other machine. The target runs exactly the checks a local `create` runs.
+  the other machine. **The target validates every argument itself** (see
+  "Validation on receipt"); nothing the requester checks is relied on.
 - **`--cwd` must be absolute or start with `~`** in a remote create, and `~` is the
   target user's home. A relative path has nothing to be relative to on the target:
   the bridge's own working directory is wherever `conjoin` happened to start. The
-  requester refuses a relative `--cwd` before sending anything.
+  target refuses a relative `cwd`. The requester also refuses one before sending,
+  but only so the person hears it sooner; a modified requester can skip that.
+- `--timeout S` is at most 600 s (**Open (R9)**). It is also the request's
+  lifetime: see "Every request expires".
 - The output is the target's output, printed verbatim, with every line prefixed
   `[PEER] ` so it can't be mistaken for a local result (rule 7: visible, not clean).
   `list --json` prints the target's JSON unprefixed.
@@ -1098,14 +1134,14 @@ spanreed sleeper retire --host PEER X [--timeout S]
   failed, exactly as the same command would locally (a held name, a refused
   `claude` flag, no such sleeper), or was `interrupted`; `2` nothing was run
   (no bridge to `PEER`, a bridge or peer too old, a bad argument caught here or
-  answered `invalid` there, a timeout before sending); `3` it was sent
+  answered `invalid` or `expired` there, a timeout before sending); `3` it was sent
   and no answer came in time, so **the outcome is unknown**; `4` the target refused
-  it because remote management isn't allowed for this peer.
+  it because remote management is turned off there.
 
 **`attach` cannot work over a bridge.** It is an interactive tmux client, and the
-bridge carries frames, not a terminal. **Open (R7):** `sleeper attach --host PEER X`
-asks the target for the sleeper's record (a `list`) and **prints the command to run
-instead**, exiting 2:
+bridge carries frames, not a terminal. Per R7 (decision 6), `sleeper attach --host
+PEER X` asks the target for the sleeper's record (a `list`) and **prints the command
+to run instead**, exiting 2:
 
 ```
 [adolin] sleeper X is awake in tmux session spanreed-X-7. Attach from a shell on adolin:
@@ -1125,8 +1161,8 @@ waits for a reply file. Paths are under the state root, owner-only like the rest
 
 ```
 sleeper-ops/out/<peer>/<request_id>.json        a request waiting to be sent
-sleeper-ops/out/<peer>/<request_id>.sent        sent (or being sent); resent on reconnect
-sleeper-ops/out/<peer>/<request_id>.abandoned   the CLI gave up; never sent again
+sleeper-ops/out/<peer>/<request_id>.sent        sent (or being sent); resent on reconnect until it expires
+sleeper-ops/out/<peer>/<request_id>.abandoned   given up on, by the CLI or at expiry; never sent again
 sleeper-ops/out/<peer>/<request_id>.reply.json  the target's answer
 ```
 
@@ -1142,36 +1178,66 @@ sending resolvable after the fact:
    started by an older spanreed: restart `conjoin`), or when the peer didn't
    advertise `sleeper-ops` in its `hello` (see "Version skew"). No request is ever
    written for a bridge that cannot carry it.
-2. The CLI mints `request_id`, 32 lowercase hex characters (`uuid4().hex`), and
-   writes `<request_id>.json` (temp file, then rename).
+2. The CLI mints `request_id`, 32 lowercase hex characters (`uuid4().hex`), stamps
+   `created_at` and `expires_at` (`created_at` plus the timeout, UTC), and writes
+   `<request_id>.json` (temp file, then rename).
 3. The bridge's main thread scans `out/<peer>/` on every loop turn, as it does the
-   outbound inboxes. For each `.json` it **renames it to `.sent` first**, then
-   sends the `sleeper-op` frame. Only one process wins a rename, so two bridges to
-   the same peer can't both send it.
+   outbound inboxes. For each `.json` whose `expires_at` has not passed, it
+   **renames it to `.sent` first**, then sends the `sleeper-op` frame. Only one
+   process wins a rename, so two bridges to the same peer can't both send it.
 4. The bridge's reader thread receives `sleeper-op-result`, checks that
    `<request_id>.sent` exists, and writes `<request_id>.reply.json`. A result for
    an id it has no `.sent` file for is noted on the peer record and dropped.
 5. The CLI polls for the reply. On one, it prints it, deletes both files, and exits
    with the mapped code.
-6. **On timeout**, the CLI renames its own file to `.abandoned`. If `.json` →
+6. **At `expires_at`**, the CLI renames its own file to `.abandoned`. If `.json` →
    `.abandoned` succeeds, the bridge never claimed it: **nothing was sent**, exit
    2. If only `.sent` → `.abandoned` succeeds, it was sent: the CLI looks for a
    reply once more (it may have landed in between), and otherwise reports **sent,
    outcome unknown**, exit 3, naming `spanreed sleeper list --host PEER` and the
-   target's audit log as the way to find out.
+   target's audit log as the way to find out. If neither rename succeeds, the
+   bridge has already expired the file (below), and the CLI reports outcome
+   unknown, exit 3, since it can no longer tell whether it was sent.
 
 **Timeouts:** 30 s by default; 90 s for `retire`, which on the target may wait up
 to `RETIRE_WAIT_S` (60 s) for an awake sleeper to finish its turn. `--timeout S`
-overrides it.
+overrides it, up to 600 s (**Open (R9)**). Time spent queued behind another
+operation on the target counts against it (see "On the target").
 
 **Management never queues across a down bridge.** Unlike mail, a request that
 can't be sent now fails now (step 1) or at its timeout (step 6). A `create` that
 fires hours later, when someone reconnects, would surprise whoever had given up on
-it. The `.sent` resend below exists only while the CLI is still waiting.
+it.
+
+#### Every request expires
+
+Step 6 runs only while the CLI is alive. A CLI killed by Ctrl-C, `SIGKILL` or a
+closed terminal leaves its `.json` or `.sent` file behind, and without a limit the
+bridge would send the one, or resend the other on every reconnect, hours or days
+later. Cleanup alone doesn't prevent that, and once the target has pruned its
+idempotency record (R5) a resend would run the operation a second time. So the
+expiry is enforced by the bridge on the requester and checked again by the target,
+neither of them relying on the CLI:
+
+- **The requester's bridge never sends or resends a request past its
+  `expires_at`.** It checks before each send and each reconnect resend. Once a
+  `.json` or `.sent` file is more than 60 s past its `expires_at` (the grace lets a
+  living CLI do step 6 itself, so its exit code stays exact), the bridge renames it
+  to `.abandoned`. A killed CLI's request therefore lives no longer than its
+  timeout, and at most 600 s.
+- **The frame carries `expires_at`**, and the target checks it against its own
+  clock, with an allowance for skew between the two hosts (**Open (R9)**; see
+  "Idempotency" and "Validation on receipt"). A request that reaches the
+  target expired, with no record of it there, is answered `expired` and not run.
+  This is the backstop for a requester that doesn't enforce its own limit, and
+  what makes R5's pruning safe: a record is pruned after 7 days, a request lives at
+  most 600 s, so no request that the target accepts can outlive the record that
+  would recognise it as a resend.
 
 **Cleanup:** `.abandoned` files and orphaned replies are removed by the bridge when
-they are older than a day. **Open (R5)** covers how long they and the target's
-records are kept.
+they are older than a day. The target's idempotency records are kept for seven days
+and pruned by its bridge at start. Both periods are R5's, accepted by the owner
+(decision 6).
 
 #### On the target: who runs the operation
 
@@ -1180,15 +1246,20 @@ run it. A `retire` can block for 60 s, and a blocked reader stops reading pings,
 so this end's own watchdog (`recv_timeout`, 15 s by default) would tear the link
 down under its own operation. Instead:
 
-1. The reader validates the frame (below), applies the opt-in check, writes the
-   **idempotency record**, logs `received`, and queues the request for a
-   **worker thread** owned by this bridge process.
-2. The worker runs operations **one at a time, in arrival order** (**Open (R6)**),
-   by calling the same functions the local `spanreed sleeper` commands call, with
-   the same checks: the claude-args allowlist, `--permission-mode` against `claude
-   --help`, the home-folder refusal for `--trust`, the held-name rule. Building
-   this means splitting each `_sleeper_*` handler into "run, return exit code and
-   text" and "print it", so the remote path cannot drift from the local one.
+1. The reader validates the frame (below), checks the switch, checks expiry,
+   writes the **idempotency record**, logs `received`, and queues the request for
+   a **worker thread** owned by this bridge process.
+2. The worker runs operations **one at a time, in arrival order** (R6, decision 6).
+   A second operation that arrives while one is running **waits** in the queue
+   behind it. When the worker takes a request off the queue, it checks
+   `expires_at` again: one whose deadline passed while it waited is answered
+   `expired` and not run, because its requester has already reported "outcome
+   unknown" and stopped waiting (**Open (R9)**). The worker calls the same
+   functions the local `spanreed sleeper` commands call, which do all the
+   validation themselves (see "Validation on receipt"). Building this means
+   splitting each `_sleeper_*` handler into "run, return exit code and text" and
+   "print it", so the remote path cannot drift from the local one, and moving into
+   the "run" half every check argparse makes today.
 3. The worker stores the result in the idempotency record, logs `done`, and hands
    the result to the main thread, which sends it. After a `create` or `retire`, the
    main thread sends a fresh `registry` frame **before** the result. Frames arrive
@@ -1201,61 +1272,114 @@ down under its own operation. Instead:
 later wake. In a remote create, "the creator" is a bridge process. On the serve end
 that is an ssh-launched command with a stripped `PATH`, which is why `conjoin`
 already has to find the remote `spanreed` with an interactive-shell probe. So a
-remote create would commonly fail with "claude not found on PATH" on the serve end,
-and on the connect end it would inherit whatever `PATH` started `conjoin`. **Open
-(R1):** where a remote create gets its `PATH` from. The recommendation is the
-opt-in command below: it is run by a person, in a real shell, on the target, so it
-records that shell's `PATH` alongside the grant, and a remote create resolves
-`claude` and `spanreed` on it. If that `PATH` finds neither, the create fails with
-the target's message, naming `remote-access allow` as the way to refresh it.
+remote create resolves `claude` and `spanreed` on **the `PATH` recorded when
+`remote-access on` was run** (R1, decision 6), which a person ran in a real shell on
+this machine. If that `PATH` finds neither, the create fails with the target's
+message, naming `spanreed sleeper remote-access on` as the way to record it again.
 
 The target is also where a wake from a remote `wake` starts tmux, so a wake
 requested over the serve end has the same ssh-scope exposure as a wake caused by
 mail arriving there (`KillUserProcesses`, under "Not verified yet").
 
-#### Opting in, on the managed machine
+#### Turning it on, at the managed machine
 
 **Not a `conjoin` flag.** The serve end of a bridge is launched by the *other*
 machine: `conjoin HOST` builds the remote command line itself (`bridge.py`,
 `connect`, from `serve_cmd`). A flag on `conjoin --serve` would be chosen by the
-peer, which is exactly the self-grant decision 2 forbids. A flag on the connect
-end would be honest but would cover only one of the two roles, and the opt-in would
-then depend on which machine happened to dial.
+peer, which would let a peer turn it on for itself. A flag on the connect end would
+cover only one of the two roles, and whether it was on would then depend on which
+machine happened to dial.
 
-**A per-peer setting in the target's `config.json`**, managed with:
+**One switch per machine** (decision 3), kept in this machine's `config.json`:
 
 ```
-spanreed sleeper remote-access                  # show who may manage this host's sleepers
-spanreed sleeper remote-access allow PEER       # allow PEER to create/wake/sleep/retire/list here
-spanreed sleeper remote-access deny PEER        # remove the grant
+spanreed sleeper remote-access show   # on or off, when it was turned on, and the PATH recorded
+spanreed sleeper remote-access on     # needs a person at a terminal; see below
+spanreed sleeper remote-access off    # turn it off; takes effect on the next request
 ```
 
-- The grant is keyed by the peer's **host label**, the same value routing and inbox
-  names already trust (**Open (R4)** on whether that is enough).
-- **It is read from disk for every request**, so `allow` and `deny` take effect on
-  the next request with no bridge restart. An unreadable or malformed `config.json`
-  reads as `{}` today (`store.py`, `_read_config`), which here means **no grant**:
-  the check fails closed.
-- **It covers all five operations, `list` included** (**Open (R2)**, **Open
-  (R3)**).
+- **Off by default.** While it is on, **every machine conjoined with this one**, in
+  either direction, may create, wake, sleep, retire and list this machine's
+  sleepers. There is no list of peers, and nothing is keyed on a peer's host label,
+  so a peer that claims a false label in `hello` gains nothing here that it
+  wouldn't have under its real one.
+- **It is read from disk for every request**, so `on` and `off` take effect on the
+  next request with no bridge restart. An operation already running when it is
+  turned off finishes. An unreadable or malformed `config.json` reads as `{}` today
+  (`store.py`, `_read_config`), which here means **off**: the check fails closed.
+- **It covers all five operations, `list` included** (R2, decision 6). `list` only
+  reads, but a record holds `cwd`, `claude_args`, `path_env` and the last wake
+  failure, which the registry does not carry.
 - A requester needs no setting of its own to ask.
+
+**`on` requires a person** (decision 5). It refuses, changing nothing, unless stdin
+is a TTY. It then prints what it grants, and turns the switch on only if this
+machine's host label is typed back exactly:
+
+```
+$ spanreed sleeper remote-access on
+Remote sleeper management lets EVERY machine conjoined with this one (adolin), in
+either direction, create, wake, sleep, retire and list sleepers here. That means
+any of them can RUN COMMANDS AS YOU on adolin, including a machine adolin dialled
+with `conjoin` that has no ssh access to adolin, and any agent or process running
+as you on such a machine. A remote create is not limited beyond a local one: it
+can make a bypassPermissions sleeper and mark its folder trusted, pass an inline
+--mcp-config whose command Claude runs when the sleeper wakes, or point
+--debug-file at any file you can write.
+
+It stays on until `spanreed sleeper remote-access off`.
+PATH recorded for remote creates: /home/u/.local/bin:/usr/local/bin:/usr/bin
+
+Type this machine's label (adolin) to turn it on:
+```
+
+`off` and `show` need no TTY: turning it off is always safe. Running `on` again
+records the current `PATH` again. `config.json` holds `sleeper_remote_access` as
+`{"enabled": true, "enabled_at": "<UTC>", "path_env": "<PATH>"}`; anything other
+than `"enabled": true` reads as off.
+
+**What the TTY check does not stop.** It stops an agent from turning the switch on
+with an ordinary shell command, such as one a session runs because a bus message
+asked it to. It does not stop a process that obtains a terminal on purpose: an
+agent can type into a tmux pane with `tmux send-keys`, or run the command under
+`script(1)`, and a bypass-mode sleeper on this machine needs no persuasion to do
+either. **Open (R10)** asks whether that is enough.
 
 **A refused request** gets `outcome: "refused"`, exit 4, and this text, so the
 person reading it knows where the fix is:
 
 ```
-[adolin] refused: adolin does not allow sleeper management from kaladin.
-  To allow it, run this ON adolin:  spanreed sleeper remote-access allow kaladin
+[adolin] refused: remote sleeper management is turned off on adolin.
+  To turn it on, run this ON adolin, in a terminal:  spanreed sleeper remote-access on
 ```
 
 The target logs the refusal too.
 
-**What the opt-in does and does not stop.** The connect end of a bridge has ssh
-access to the serve end's account, so it could already run `spanreed sleeper
-create` there by hand; for that direction the grant is a guard against doing it by
-accident over the bus, not against a determined peer. The other direction is
-different: the serve end often has no ssh path to the connect end at all (decision
-1's Mac behind NAT), and there the grant is the only way in.
+#### What turning it on grants
+
+**It grants running commands as this machine's user, to every conjoined peer.** A
+remote `create` is checked exactly as a local one, and a local `create` limits
+nothing its user chooses, because locally the creator is the owner. The claude-args
+allowlist limits what the *sleeper* may be given beyond its permission mode; it was
+never meant to limit the *creator*. So a peer can, with nothing more than a create
+and a message:
+
+- **create a `bypassPermissions` sleeper** (`PERMISSION_MODES`, `sleepers.py`) with
+  `--trust` on any project folder, then mail it instructions;
+- **pass `--mcp-config` an inline JSON string** (allowlisted; `claude --help` says
+  it takes "JSON files or strings") naming a command, such as `sh`, which Claude
+  starts at the sleeper's first wake, whatever its permission mode. That it starts
+  without a prompt is reasoned, not measured;
+- **pass `--debug-file PATH`** (allowlisted), which writes to any path the target
+  user can write.
+
+Decision 4 is to leave this uncapped and say so, here and in what `on` prints. The
+owner's reason, that a peer reached over ssh could do all of this anyway, holds for
+the end that dialled. It does not hold for the other end: the machine this one
+dialled often has no ssh path back at all (decision 1's Mac behind NAT), and for it
+the switch is the only way in. Nor does any of this stop at the peer's owner: any
+agent or process running as that user on the peer can write the peer's request
+spool. The earlier draft called the grant "bounded" by the allowlist; it is not.
 
 #### The audit log
 
@@ -1263,18 +1387,21 @@ Every remote operation the target sees is logged at
 `<state>/logs/sleeper-ops.jsonl`, owner-only, append-only, one JSON object per
 line, readable with `jq`. A request writes **at least two lines** with one
 `request_id`: `received` (before anything runs, so an operation that crashes the
-bridge still leaves a trace) and one outcome line. A refused or invalid request
-writes one line.
+bridge still leaves a trace) and one outcome line. A refused, invalid or
+expired-on-arrival request writes one line.
 
 ```json
-{"ts": "2026-11-25T18:04:11Z", "event": "received", "peer": "kaladin", "role": "serve", "bridge_pid": 4242, "request_id": "3f1c…", "op": "create", "args": {"name": "X", "cwd": "~/git/proj", "permission_mode": "acceptEdits", "model": null, "idle_timeout": "15m", "trust": true, "claude_args": ["--mcp-config", "/home/u/servers.json"]}, "requested_by": "jmonk on kaladin (agent-planner)"}
+{"ts": "2026-11-25T18:04:11Z", "event": "received", "peer": "kaladin", "role": "serve", "bridge_pid": 4242, "request_id": "3f1c…", "expires_at": "2026-11-25T18:04:40Z", "op": "create", "args": {"name": "X", "cwd": "~/git/proj", "permission_mode": "acceptEdits", "model": null, "idle_timeout": "15m", "trust": true, "claude_args": ["--mcp-config", "/home/u/servers.json"]}, "requested_by": "jmonk on kaladin (agent-planner)"}
 {"ts": "2026-11-25T18:04:12Z", "event": "done", "peer": "kaladin", "role": "serve", "bridge_pid": 4242, "request_id": "3f1c…", "op": "create", "outcome": "ok", "exit": 0, "summary": "created sleeper X (agent-X), ASLEEP"}
 ```
 
-- `event`: `received`, `done`, `refused`, `invalid`, `duplicate` (answered from the
-  idempotency record without running again), `interrupted`.
+- `event`: `received`, `done`, `refused`, `invalid`, `expired` (not run because its
+  `expires_at` had passed, on arrival or while queued), `duplicate` (answered from
+  the idempotency record without running again), `interrupted`.
+- `peer` is the host label the peer gave in `hello`. It is self-asserted and
+  identifies nothing; it is logged so a person can tell links apart.
 - `args` is logged **in full**, including every `claude_args` value, since those
-  are what a remote create grants. They are paths and flags; spanreed never puts a
+  are how a remote create runs commands here. They are paths and flags; spanreed never puts a
   credential in them.
 - `requested_by` is **asserted by the requester and verified by nothing**, like a
   message's `from_agent`. It records which local user (and agent, if the CLI ran
@@ -1290,7 +1417,7 @@ target's log is the authoritative one. Rotation follows the activity log's answe
 Two new kinds, sent by either end:
 
 ```json
-{"kind": "sleeper-op", "request_id": "<32 hex>", "op": "create", "args": {...}, "requested_by": "<free text>"}
+{"kind": "sleeper-op", "request_id": "<32 hex>", "expires_at": "<UTC>", "op": "create", "args": {...}, "requested_by": "<free text>"}
 {"kind": "sleeper-op-result", "request_id": "<32 hex>", "outcome": "ok", "exit": 0, "stdout": "...", "stderr": "...", "records": null}
 ```
 
@@ -1328,8 +1455,8 @@ management (its spanreed predates it). Upgrade spanreed on adolin and restart it
 
 `hello` is the right place, not the `registry` frame, because what it states is a
 property of the running bridge process, fixed for its lifetime, and known before
-anything else is exchanged. Whether the peer has **granted** this host access is
-deliberately **not** advertised: the grant is re-read per request, and the refusal
+anything else is exchanged. Whether the peer has **turned remote access on** is
+deliberately **not** advertised: the switch is re-read per request, and the refusal
 reply is the authoritative answer.
 
 A newer peer may later send an `op` this version doesn't know. The target answers
@@ -1340,20 +1467,30 @@ itself is one it understands.
 
 Resending is how a request survives a dropped pipe, so the target must recognise a
 resend. It keeps one **idempotency record** per request at
-`<state>/sleeper-ops/in/<peer>/<request_id>.json`: the request, `received_at`, the
-pid and start time of the bridge process running it, `state` (`running` or `done`),
+`<state>/sleeper-ops/in/<peer>/<request_id>.json`: the request (including its
+`expires_at`), `received_at`, the pid and start time of the bridge process running
+it, `state` (`queued`, `running` or `done`),
 and, once done, the full result frame. Keyed by peer and id, because the id is the
 requester's and only unique on its side.
 
-On a `sleeper-op` whose record already exists:
+On a `sleeper-op` whose record already exists, the record decides, whatever the
+frame's `expires_at` says:
 - **`done`**: send the stored result again; log `duplicate`. Nothing runs.
-- **`running` in a live process** (this one, or an earlier bridge process for the
+- **`queued` or `running` in a live process** (this one, or an earlier bridge process for the
   same peer that hasn't exited yet): send nothing now. This bridge watches the
   record and sends the result when it turns `done`.
 - **`running` in a dead process**: the operation was interrupted partway. Answer
   `outcome: "interrupted"`, exit 1, with the text "the bridge on adolin ended while
   running this; its effect may be partial. Check `spanreed sleeper list --host
-  adolin`." **It is not run again** (**Open (R8)**).
+  adolin`." **It is not run again** (R8, decision 6).
+- **`queued` in a dead process**: it never started. Answer `outcome: "expired"` if
+  its `expires_at` has passed; otherwise queue it again under this process.
+
+On a `sleeper-op` with **no** record and an `expires_at` that has passed by the
+target's clock, the target writes a `done` record with `outcome: "expired"`, logs
+`expired`, and answers that. It never runs it. Because no request lives longer than
+600 s and records are kept seven days, a request whose record was pruned can only
+arrive long expired, so it cannot run twice (see "Every request expires").
 
 Why this matters for more than tidiness: the operations are **not** naturally
 idempotent. A `create` that succeeded, resent after a drop and run again, would
@@ -1363,8 +1500,9 @@ fail with "name already held" and report a failure for something that worked.
 
 - **The bridge drops while a request is in flight.** On the requester, the file
   stays `.sent`. When the bridge reconnects (`conjoin`'s reconnect loop), the main
-  thread **resends every `.sent` request that is not abandoned**, and the target
-  answers from its idempotency record. If the CLI's timeout passes first, it says
+  thread **resends every `.sent` request that has not expired**, and the target
+  answers from its idempotency record. A `.sent` past its `expires_at` is never
+  resent, whether or not its CLI is still alive. If the CLI's timeout passes first, it says
   "sent, outcome unknown" (exit 3). On the target, a bridge that is told to stop
   waits for its in-flight operation to finish and stores the result before
   exiting, bounded by that operation's own limit (at most `RETIRE_WAIT_S` plus a
@@ -1381,6 +1519,13 @@ fail with "name already held" and report a failure for something that worked.
   up to 60 s on the target, as locally, then fails with the local message. The
   requester's 90 s default covers that wait.
 - **Duplicated on reconnect.** Covered by the idempotency record above.
+- **The requesting CLI is killed** before its timeout. Its `.json` or `.sent` file
+  stays, but the bridge sends it only until `expires_at` and then renames it
+  `.abandoned` (see "Every request expires"). It never fires after the timeout the
+  person chose.
+- **A second operation while one is running.** It waits on the target's queue
+  while the bridge is up (R6). While the bridge is down, it fails at once on the
+  requester (spool step 1).
 - **Issue #34** (a dropped bridge deletes the peer's mirrored agents, so mail to
   them is refused while it is down). Management never resolves through the
   registry: the target looks the sleeper up by name in its own records. So #34
@@ -1394,21 +1539,46 @@ fail with "name already held" and report a failure for something that worked.
 
 #### Validation on receipt
 
-The `request_id` becomes a file name on both machines, so it is checked like an
-agent id is (#12): exactly 32 lowercase hex characters. A `sleeper-op` with a bad
-id gets **no reply**, since there is no safe name to reply under; it is logged as
-`invalid` and noted on the peer record, and the requester's CLI times out with "not
-answered". A bad `op` or malformed `args` gets `outcome: "invalid"` with the
-reason. `name` goes through `validate_agent_id`, as locally. Like every frame, a
-`sleeper-op` the receiver cannot model is dropped and noted and never stops the
-reader (the #55 rule).
+**The target trusts nothing the requester checked.** The requester may be older,
+newer or modified, and it skips argparse's checks entirely, since only `args`
+crosses the pipe. Today some of the local checks live only in argparse: the
+permission mode is checked by `choices=PERMISSION_MODES` (`cli.py`) and nowhere in
+`_sleeper_create`. Building this moves every check into the function both paths
+call, so the local and remote paths share one set:
+
+- **`request_id`** becomes a file name on both machines, so it is checked like an
+  agent id is (#12): exactly 32 lowercase hex characters. A `sleeper-op` with a bad
+  id gets **no reply**, since there is no safe name to reply under; it is logged as
+  `invalid` and noted on the peer record, and the requester's CLI times out with
+  "not answered".
+- **`expires_at`** must parse as a UTC timestamp no more than 600 s plus the clock
+  allowance (**Open (R9)**) ahead of the target's clock. Missing or out of range is
+  `invalid`; passed is `expired`, as above.
+- **`op`** must be one the target knows, and **`args`** must have exactly that op's
+  fields with the right types; otherwise `outcome: "invalid"` with the reason.
+- **`name`** goes through `validate_agent_id`, as locally.
+- **`cwd`** must be absolute or start with `~`, checked on the string as received,
+  before `~` is expanded; a relative path is refused rather than resolved against
+  the bridge's working directory. Then it must be a directory, as locally.
+- **`permission_mode`** must be one of `PERMISSION_MODES`, the static list taken
+  from `claude --help` (Claude Code 2.1.283) in `sleepers.py`. It is not checked
+  against the installed `claude`.
+- **`claude_args`** go through `check_claude_args`, the same allowlist as a local
+  create, and **`idle_timeout`** through `parse_duration`.
+- **`trust`** goes through `trust_folder`, with its home-folder refusal.
+
+Failing any of the checks from `name` on is `outcome: "failed"`, exit 1, with the
+message the local command prints. Like every frame, a `sleeper-op` the receiver
+cannot model is dropped and noted and never stops the reader (the #55 rule). None
+of these checks narrows what a valid create can do (see "What turning it on
+grants").
 
 #### Not verified yet (remote management)
 
 Nothing here has been built or run. To measure in the implementation PR:
 - **The `PATH` a remote create sees** on each end: what the serve end's ssh-launched
   environment holds on kaladin, adolin and the Mac, and whether the `PATH` recorded
-  by `remote-access allow` (if R1 goes that way) finds `claude` from there.
+  by `remote-access on` finds `claude` from there.
 - **What happens to the serve end when ssh drops.** The design assumes the serve
   process sees EOF and can finish an in-flight operation before exiting. Whether
   sshd sends it `SIGHUP` first, and how long it then has, is unmeasured.
