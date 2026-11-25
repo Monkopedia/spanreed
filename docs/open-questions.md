@@ -158,12 +158,6 @@ Still open:
   - *`requested_by` that is missing or not a string.* The design lists no check for it.
     Recommendation, built: `invalid`, like any other field the target cannot model. It is
     logged, never trusted, so this costs a correct requester nothing.
-  - *The clock allowance applies to the upper bound only.* protocol.md applies the 30 s
-    allowance to how far ahead `expires_at` may be; architecture.md's "checks it against its
-    own clock, with a fixed 30 s allowance" could be read as also allowing 30 s past it.
-    Built per protocol.md: a request whose `expires_at` has passed by the target's clock is
-    `expired`, with no allowance, so the target never starts one after its requester has given
-    up waiting. Recommendation: keep, and tighten architecture.md's sentence to match.
   - *A request re-queued from a dead bridge process writes no audit line of its own.* Its
     `received` line came from the dead process, and its outcome line names the bridge that ran
     it. Recommendation: keep; add a `requeued` event if a log ever proves hard to follow.

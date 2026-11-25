@@ -1273,9 +1273,11 @@ neither of them relying on the CLI:
   to `.abandoned`. A killed CLI's request therefore lives no longer than its
   timeout, and at most 600 s.
 - **The frame carries `expires_at`**, and the target checks it against its own
-  clock, with a fixed 30 s allowance for skew between the two hosts (R9,
-  decision 8; see "Idempotency" and "Validation on receipt"). A request that
-  reaches the target expired, with no record of it there, is answered `expired` and not run.
+  clock (R9, decision 8; see "Idempotency" and "Validation on receipt"). A fixed
+  30 s allowance for skew between the two hosts applies only to how far ahead
+  `expires_at` may be; a deadline that has passed by the target's clock is passed,
+  with no allowance. A request that reaches the target expired, with no record of
+  it there, is answered `expired` and not run.
   This is the backstop for a requester that doesn't enforce its own limit, and
   what makes R5's pruning safe: a record is pruned after 7 days, a request lives at
   most 600 s, so no request that the target accepts can outlive the record that
