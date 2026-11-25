@@ -603,7 +603,8 @@ by simulating the write); `CLAUDE_CONFIG_DIR`; macOS.
 Looked at on kaladin, Claude Code 2.1.283, while designing "Adopting a running agent"
 (architecture.md, PR #129). Observations of the live machine, not experiments. Those
 marked *review* were measured by the reviewer of #129 in review 6061036209, those marked
-*review 2* in review 6061240029, and those marked *review 3* in review 6061400830.
+*review 2* in review 6061240029, those marked *review 3* in review 6061400830, and
+those marked *review 4* in review 6061584298.
 
 - **The pilots.** From the registry and `~/.claude/sessions/<pid>.json`. Each id is
   derived from its cwd, each display name is the directory's basename, and each runs
@@ -653,6 +654,11 @@ marked *review* were measured by the reviewer of #129 in review 6061036209, thos
   transcript under `~/.claude/projects`: `completed` 21283, `killed` 1095, `failed` 770,
   `stopped` 103. A background agent stopped with TaskStop (`a28d631e716ca262c`) got a
   `killed` notification carrying its `<tool-use-id>`.
+- **The sleeper lock is not re-entrant within a process** (*review 4*).
+  `sleepers.lock()` opens a new fd and `flock`s it on each call. With one fd of the
+  lock file held under `LOCK_EX`, a second `flock(LOCK_EX | LOCK_NB)` from the same
+  process on a fresh fd of the same file returned `EWOULDBLOCK`, so the blocking call
+  the lock uses would wait forever.
 
 Not checked: whether a session file is removed at exit, whether its `sessionId` changes
 after `/clear`, and whether its `cwd` follows the session or stays where it started.

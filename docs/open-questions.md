@@ -307,8 +307,13 @@ design doc is written as if every recommendation is taken.
   previous recovery could not tell "`create` killed before it began ending the session"
   from "killed while the session was ending", and prescribed opposite actions for the
   two; that the `frozen_monitor` write was not ordered before the `SIGSTOP`; and that the
-  recovery ran its 30 s wait inside whichever sender triggered it. The design now:
-  - `create` installs its SIGINT/SIGTERM/SIGHUP handler before it writes the record.
+  recovery ran its 30 s wait inside whichever sender triggered it. Revised again after
+  review 6061584298, which found that a handler taking the sleeper lock could fire while
+  `create` already held it and wait on itself forever. The design now:
+  - `create` installs its SIGINT/SIGTERM/SIGHUP handler before it writes the record. The
+    handler only records the signal; `create` acts on it at fixed checkpoints, all
+    outside the lock (after step 2's release, before step 3 takes the lock, after step
+    3's release, throughout step 4, and just before step 5's marker write).
   - Step 3 writes `adopted.frozen_monitor` (pid, start time, `F`) under the lock and only
     then sends `SIGSTOP`, so a stopped Monitor is always on record.
   - Step 5 writes a **phase marker**, `adopted.ending` (time, and the descendants it will
@@ -316,18 +321,20 @@ design doc is written as if every recommendation is taken.
   - A record in `sleeping` at generation 0 with a dead runner is an interrupted adoption,
     and only that. Its **recovery** branches on the marker. With no marker and the
     session alive, it aborts: resume the recorded Monitor, delete the record, wait 30 s,
-    list every line since `S`. With the marker, the session is ending: wait for it to exit
-    (SIGKILL it and the recorded descendants if it outlives 15 s), then complete the
-    commit (`read_through`, `asleep`, wake if unread); the record is kept.
+    list every line since `S`. With the marker, the session is ending: send it SIGTERM
+    (the recovery cannot tell whether `create` had), SIGKILL it and the recorded
+    descendants if it outlives 15 s from that SIGTERM, then complete the commit
+    (`read_through`, `asleep`, wake if unread); the record is kept.
   - The listing of an abort goes to the activity log and an abort report,
     `sleepers/<name>.adopt-aborted.json`, which `sleeper list` shows until it is dismissed
     or the next adoption commits; and to the output when there is one.
 
-  Three points need a decision.
+  Four points need a decision.
   (i) **A signal after the phase marker** cannot be undone, because the session is
-  already being ended. *Recommendation:* hold it, finish the bounded commit (about 15 s
-  plus the escalation), then exit with the signal's status. The alternative is to exit at
-  once and leave the record to the recovery.
+  already being ended. *Recommendation:* leave it recorded (from the marker write on,
+  `create` reaches no checkpoint that acts on it), finish the bounded commit (about 15 s
+  plus the escalation), then exit with the signal's status. The alternative is to exit
+  at once, at a check after the marker write, and leave the record to the recovery.
   (ii) **Who runs the recovery.** It waits up to 30 s plus an exit, and the wake path
   runs inside every inbox writer (MCP `send_message`, `spanreed send`, a Codex worker's
   reply, a `conjoin` bridge's frame loop), so it must not run there. Options:
@@ -346,8 +353,20 @@ design doc is written as if every recommendation is taken.
   (iii) **No phase marker, but the session has already exited** (a person ended it
   after `create` was killed). Nothing `create` started is left to undo, and the
   conversation is complete. *Recommendation:* commit, as in the marker branch, so the
-  agent becomes a sleeper (this is shape A). The alternative, abort, deletes the record
+  agent becomes a sleeper (this is shape A), first killing the recorded Monitor if it is
+  still there and stopped. The alternative, abort, deletes the record
   and leaves a stale row whose mail queues with nothing to wake it.
+  (iv) **An old phase marker with the session still alive.** If `create` died between
+  the marker write and its first SIGTERM, the session was never signalled, and the
+  recovery may run hours later, on the next mail, while a person is using the pane (the
+  pilots run in the owner's own tmux panes). The recovery always sends SIGTERM first
+  with the full 15 s grace. The open part is whether it re-checks idleness first when
+  the marker is older than 15 s plus the escalation. *Recommendation:* re-run step 4's
+  idle and background-work checks (no transcript write since the marker's time); if the
+  session is busy, run the abort path instead of ending it (the session was almost
+  certainly never signalled, since Claude Code exits on SIGTERM, Test 8). The
+  alternative is to end it regardless, which is simpler but can cut off a person's turn
+  long after the session was judged idle.
 
 ## Out-of-scope (for now)
 

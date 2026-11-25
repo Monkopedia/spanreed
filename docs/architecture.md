@@ -1934,8 +1934,9 @@ and no `Stop.background_tasks` (it has no `SPANREED_SLEEPER`), so `create` has t
    `InboxPosition` that `read_through` already uses. Only lines at or before `S` can
    ever be treated as history ("Where `read_through` starts").
 2. **Write the record.** First, still before the write, install the interrupt handler
-   (see "If `create` is interrupted" below), so that no moment exists in which the record
-   is on disk and a Ctrl-C would leave it there. Then write: `state=sleeping`,
+   (see "If `create` is interrupted" below), so that no signal that arrives once the
+   record is on disk goes unrecorded. The handler only records the signal; `create`
+   acts on it at the checkpoints listed there, all outside the lock. Then write: `state=sleeping`,
    `generation` 0, `runner_pid` set to this process, `claude_pid`/`claude_pid_start`
    set to the live session, `S`, and `read_through` set to a **provisional** position
    computed now (see below). The registry row keeps the live pid, with the sleeper
@@ -2028,8 +2029,8 @@ Exclusion in the rest of that window comes from the record: `sleeping` with a li
 - *The risk is ending a session mid-turn.* Test 8 measured SIGTERM only at idle. C
   therefore refuses, twice, while the session looks busy (A2).
 
-**The abort path.** Step 4 takes it when the session is busy, the interrupt handler
-takes it when `create` is told to stop, and the recovery below takes it when `create`
+**The abort path.** Step 4 takes it when the session is busy, a checkpoint takes it
+when `create` was told to stop ("If `create` is interrupted"), and the recovery below takes it when `create`
 was killed before the phase marker. The Monitor must be resumed, because it is the live
 session's only way to hear mail, and resuming it releases every line it had not yet read
 as one burst. That is every line appended since the freeze mark `F`, and also any line
@@ -2076,17 +2077,55 @@ high-water mark), and A5's listing names it again. Whether the abort should also
 these lines, and whether aborting is right at all, is A2.
 
 **If `create` is interrupted.** `create` installs a handler for SIGINT, SIGTERM and
-SIGHUP at one point only: at step 2, **before it writes the record**. From then on:
-- **Until step 3 has written `adopted.frozen_monitor`**, nothing has been stopped. The
-  handler deletes the record under the lock, writes no abort report (no mail can have
-  missed the session), and exits with the signal's status.
-- **From that write until the phase marker `adopted.ending` is written** (step 5), the
-  handler runs the abort path (with a `SIGCONT` to a Monitor that was never stopped
-  changing nothing), and then exits with the signal's status. The session is not left
-  deaf.
-- **From the phase marker to the end of step 6**, the session is being ended, and an
-  abort cannot undo that. The signal is held, the bounded commit finishes, and `create`
-  then exits with the signal's status (A15).
+SIGHUP at one point only: at step 2, **before it writes the record**. Before that, a
+signal has its default effect: `create` ends, its flock goes with it, and no record
+exists.
+
+**The handler only records the signal.** It sets a flag (the first signal's number;
+later ones change nothing), and returns. It takes no lock, deletes nothing, sends no
+signal and makes no blocking call. This matters because the handler runs in `create`'s
+main thread, between two bytecodes of whatever `create` was doing, and `create` holds
+the sleeper lock at step 1, across step 2's write, across steps 3.2 to 3.4, and across
+step 5's marker write. `sleepers.lock()` opens a new fd and `flock`s it on every call
+(`sleepers.py`), and a second `flock(LOCK_EX)` from the same process on a new fd waits
+for the first (measured by the reviewer of #129, findings.md). A handler that took the lock inside
+one of those windows would wait forever while holding it, and every sender to the id
+would hang in `_wake` behind it.
+
+`create` acts on the flag at these **checkpoints**, each of which is reached with the
+lock not held:
+- **K1:** right after step 2 releases the lock.
+- **K2:** after step 3.1 finds the Monitor, before step 3.2 takes the lock.
+- **K3:** right after step 3.4 releases the lock.
+- **K4:** throughout step 4: the wait `Q` polls the flag (at least every 0.5 s), and the
+  flag is checked again after the idle re-check.
+- **K5:** after step 5 lists the descendants, immediately before it takes the lock to
+  write the phase marker.
+
+At a checkpoint with the flag set:
+- **K1 or K2** (`adopted.frozen_monitor` not yet written): nothing has been stopped.
+  `create` takes the lock, deletes the record, releases it, writes no abort report (no
+  mail can have missed the session), and exits with the signal's status.
+- **K3 to K5** (`frozen_monitor` written, phase marker not): `create` runs the abort
+  path, with the reason "interrupted by signal N", and exits with the signal's status.
+  The session is not left deaf.
+
+A signal that arrives inside a locked window is therefore acted on at the next
+checkpoint, which follows the window's release directly. The windows are a record write
+and, in step 3, one `SIGSTOP`. A signal received after K5 (from the marker write on)
+comes too late to abort: the session is being ended. `create` finishes step 5 and the
+bounded commit, then exits with the signal's status (A15 (i)). A signal received while
+the abort path runs (from step 4's busy check or from a checkpoint) is recorded and
+changes nothing; the abort finishes and `create` exits non-zero. SIGKILL remains the way
+to stop `create` at once, and the recovery below covers it.
+
+**Why this cannot deadlock.** The only code that takes the sleeper lock in `create` is
+its main line: steps 1, 2, 3.2–3.4, 5's marker write, 6, the K1/K2 deletion and the
+abort path's step 2. Each of those takes the lock, does a bounded write (and in step 3
+one `SIGSTOP`), and releases it, and none calls another of them while holding it; the
+checkpoints that start the deletion or the abort path all sit outside the lock. The
+handler takes nothing. So `create` never waits on a lock it holds itself, and its only
+waits on the lock are on other processes, which hold it for a bounded write each.
 
 **SIGKILL** (or a crash, or the OOM killer) runs no handler. It leaves a record that the
 wake path can recognise and that nothing else produces: **an adopted record in state
@@ -2113,17 +2152,30 @@ A **recovery** finishes what `create` started. It branches on the phase marker:
   session". The send that triggered the recovery, if one did, was appended after `F`, so
   it comes out in the burst and is covered by the listing.
 - **The phase marker is present:** the session is ending, and the record is **not**
-  deleted. The recovery waits for `from_pid` to exit. If it is still alive 15 s after the
-  marker's time, the recovery sends it SIGKILL, and then SIGKILL to every descendant in
-  the marker still running with an unchanged start time, as step 5 does. It then does
-  step 6: under the lock, computes `read_through` against the now-complete transcript and
+  deleted. If `from_pid` is still alive (same start time), the recovery cannot tell
+  whether `create` sent its SIGTERM before it died, so it **always sends SIGTERM itself**
+  and allows the full 15 s grace from then, never from the marker's time: SIGTERM is the
+  measured clean exit (Test 8), and SIGKILL's effect on the transcript was never
+  measured. If the marker is older than 15 s plus the escalation (so `create` died well
+  before it could have finished signalling, and a person may have used the pane since),
+  the recovery first re-runs step 4's idle and background-work checks, requiring no
+  transcript write since the marker's time; whether it should, and what a busy result
+  does, is A15 (iv). Then, if the session is still alive 15 s after the recovery's
+  SIGTERM, it sends SIGKILL, and then SIGKILL to every descendant in the marker still
+  running with an unchanged start time, as step 5 does. It then does step 6: under the lock, computes `read_through` against the now-complete transcript and
   `S`, rewrites the row as a sleeper row, sets `asleep`, and wakes the sleeper through
   the ordinary wake path if any line after `read_through` is unread. Nothing is listed,
   because nothing aborted: the replay covers every line after `S`.
 - **No phase marker, and the session already gone** (it exited on its own, or a person
   ended it, after `create` was killed): nothing `create` started is left to undo, and the
   conversation is complete. That is shape A. Recommended (A15): commit, as in the branch
-  above, so the agent ends up a sleeper rather than neither live nor a sleeper. The
+  above, so the agent ends up a sleeper rather than neither live nor a sleeper. There is
+  no marker listing descendants here, but `adopted.frozen_monitor` may name a Monitor
+  that is still stopped: a stopped `tail` holds a pending SIGTERM without acting on it,
+  and it runs in its own process group (#88), so it can outlive the session with the
+  inbox open and trip step 1's check (a) on any later adoption of this id. So before it
+  commits, if `frozen_monitor` is present and its pid and start time still match, the
+  recovery sends it SIGKILL (which ends a stopped process) and polls until it is gone. The
   alternative is to treat it as an abort and delete the record, which leaves a stale row
   whose mail queues with nothing to wake it.
 
