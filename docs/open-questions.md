@@ -106,7 +106,7 @@ Still open:
 - **`list_agents` does not mark a reconnecting peer's agents** (from #34, recommendation: leave as is). While `conjoin` reconnects, the peer's mirrored rows read as live in `list_agents`, because the decision keeps them addressable. Nothing on the `Agent` record says the link is down; `list_peers`, `spanreed list` (`RECONNECTING`) and the send verdict do. Recommendation: leave the record unchanged, since the send verdict already tells the sender the mail is only queued.
 - **A peer that comes back under a different host label** (from #34, recommendation: accept). `conjoin` owns every row it mirrored, under every label a peer has declared to it, until it exits. If the peer reconnects under a new `--label` or hostname, the old label's rows stay addressable and queue mail nothing will forward until `conjoin` exits. Recommendation: accept; relabelling a peer mid-run is rare and restarting `conjoin` clears it.
 
-## Remote sleeper management (#86, designed, not built)
+## Remote sleeper management (#86, being built)
 
 Design in [`architecture.md`](architecture.md#managing-a-peers-sleepers-over-conjoin-86), wire
 format in [`protocol.md`](protocol.md#pipe-frames). The owner's decisions of 2026-11-25 are
@@ -141,6 +141,32 @@ Decided after review of #119:
 
 Still open:
 
+- **Calls stage 1 had to make where the design is silent** (#86 stage 1, the target's side).
+  Each is built as recommended, so the code has a default; each is the owner's to change.
+  - *Where the switch is read relative to the idempotency record.* The design lists "checks the
+    switch, checks expiry, writes the record" for a new request, and says an existing record
+    "decides, whatever the frame's `expires_at` says", without saying whether it also decides
+    whatever the switch says. Recommendation, built: a resend of a request already recorded is
+    answered from its record even if the switch has since been turned off, since answering
+    `refused` for a create that ran would report it as never allowed. The switch is read
+    wherever a request could *start*: a new request, one re-queued from a dead bridge process,
+    and when the worker takes one off the queue.
+  - *A request waiting in the queue when the switch is turned off.* The design says an
+    operation already running finishes, and is silent on one still queued. Recommendation,
+    built: it is answered `refused` and not run, the same re-check the worker makes for expiry.
+    It fails closed, and it means a create never runs without the `PATH` the switch recorded.
+  - *`requested_by` that is missing or not a string.* The design lists no check for it.
+    Recommendation, built: `invalid`, like any other field the target cannot model. It is
+    logged, never trusted, so this costs a correct requester nothing.
+  - *The clock allowance applies to the upper bound only.* protocol.md applies the 30 s
+    allowance to how far ahead `expires_at` may be; architecture.md's "checks it against its
+    own clock, with a fixed 30 s allowance" could be read as also allowing 30 s past it.
+    Built per protocol.md: a request whose `expires_at` has passed by the target's clock is
+    `expired`, with no allowance, so the target never starts one after its requester has given
+    up waiting. Recommendation: keep, and tighten architecture.md's sentence to match.
+  - *A request re-queued from a dead bridge process writes no audit line of its own.* Its
+    `received` line came from the dead process, and its outcome line names the bridge that ran
+    it. Recommendation: keep; add a `requeued` event if a log ever proves hard to follow.
 - **Default-on after a few releases?** Deferred by the owner on 2026-11-25: "that sounds fine for
   now, maybe after a few releases we turn it on by default". Revisit once remote management has
   shipped and been used. Turning it on by default would also turn on what "What turning it on

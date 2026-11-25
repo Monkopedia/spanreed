@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 from datetime import UTC, datetime, timedelta
@@ -884,6 +885,7 @@ def _cmd_sleeper(args: argparse.Namespace) -> int:
         "_run": _sleeper_run,
         "_activity": _sleeper_activity,
         "sleep": _sleeper_sleep,
+        "remote-access": _sleeper_remote_access,
     }
     try:
         return handlers[args.sleeper_cmd](args)
@@ -965,6 +967,96 @@ def _sleeper_sleep(args: argparse.Namespace) -> int:
 
 def _sleeper_retire(args: argparse.Namespace) -> int:
     return sleeper_ops.retire(StateStore(), args.name, print)
+
+
+def _remote_access_grant(label: str, path_env: str) -> str:
+    """What ``remote-access on`` prints before asking: what turning it on grants."""
+    return (
+        f"Remote sleeper management lets EVERY machine conjoined with this one ({label}), in\n"
+        f"either direction, create, wake, sleep, retire and list sleepers here. That means\n"
+        f"any of them can RUN COMMANDS AS YOU on {label}, including a machine {label} dialled\n"
+        f"with `conjoin` that has no ssh access to {label}, and any agent or process running\n"
+        f"as you on such a machine. A remote create is not limited beyond a local one: it\n"
+        f"can make a bypassPermissions sleeper and mark its folder trusted, pass an inline\n"
+        f"--mcp-config whose command Claude runs when the sleeper wakes, or point\n"
+        f"--debug-file at any file you can write.\n"
+        f"\n"
+        f"Conjoining with someone means trusting their entire bus and network: a machine\n"
+        f"conjoined only to one of your peers can reach {label} through it, if that peer's\n"
+        f"switch is on too.\n"
+        f"\n"
+        f"It stays on until `spanreed sleeper remote-access off`.\n"
+        f"PATH recorded for remote creates: {path_env}\n"
+    )
+
+
+def _sleeper_remote_access(args: argparse.Namespace) -> int:
+    """``remote-access show|on|off``: the one per-machine switch (#86).
+
+    ``on`` needs stdin to be a terminal and this machine's label typed back.
+    That guards against accidents, not against agents: any process running as
+    this user can write the ``config.json`` key itself (#86 decision 7).
+    """
+    store = StateStore()
+    label = socket.gethostname()
+    if args.action == "show":
+        access = store.get_sleeper_remote_access()
+        if access is None:
+            print(
+                f"remote sleeper management on {label}: OFF\n"
+                f"  No conjoined machine may create, wake, sleep, retire or list sleepers here.\n"
+                f"  To turn it on, run `spanreed sleeper remote-access on` in a terminal here."
+            )
+            return 0
+        since = (
+            f"{access.enabled_at.isoformat()} ({format_age(access.enabled_at)})"
+            if access.enabled_at
+            else "an unrecorded time"
+        )
+        print(
+            f"remote sleeper management on {label}: ON since {since}\n"
+            f"  Every machine conjoined with this one may create, wake, sleep, retire and\n"
+            f"  list sleepers here, which lets it run commands as you.\n"
+            f"  PATH recorded for remote creates: {access.path_env or '(none recorded)'}\n"
+            f"  `spanreed sleeper remote-access off` turns it off."
+        )
+        return 0
+    if args.action == "off":
+        was_on = store.get_sleeper_remote_access() is not None
+        store.set_sleeper_remote_access(None)
+        print(
+            f"remote sleeper management on {label}: OFF"
+            + ("" if was_on else " (it was already off)")
+            + "\n  Conjoined machines can no longer manage sleepers here; an operation "
+            "already running finishes."
+        )
+        return 0
+    if not sys.stdin.isatty():
+        print(
+            "spanreed sleeper remote-access on: refused, nothing changed: stdin is not a "
+            "terminal. Turning this on lets every conjoined machine run commands as you, so "
+            "it asks a person to read what it grants and confirm. Run it yourself, in a "
+            "terminal on this machine.",
+            file=sys.stderr,
+        )
+        return 1
+    path_env = os.environ.get("PATH", "")
+    print(_remote_access_grant(label, path_env))
+    print(f"Type this machine's label ({label}) to turn it on: ", end="", flush=True)
+    typed = sys.stdin.readline().rstrip("\r\n")
+    if typed != label:
+        print(
+            f"spanreed sleeper remote-access on: not turned on, nothing changed: you typed "
+            f"{typed!r}, not {label!r}.",
+            file=sys.stderr,
+        )
+        return 1
+    store.set_sleeper_remote_access(path_env)
+    print(
+        f"remote sleeper management on {label}: ON. "
+        f"`spanreed sleeper remote-access off` turns it off."
+    )
+    return 0
 
 
 # ---------------------------------------------------------------- argparse
@@ -1205,6 +1297,12 @@ def build_parser() -> argparse.ArgumentParser:
         "sleep", help="Put a sleeper to sleep at the end of its turn (stops its background work)"
     )
     p_sleep.add_argument("name")
+    p_remote = sleeper_sub.add_parser(
+        "remote-access",
+        help="Show, or turn on or off, whether conjoined machines may manage sleepers here "
+        "(off by default; on lets them run commands as you)",
+    )
+    p_remote.add_argument("action", choices=("show", "on", "off"))
     sleeper_sub.add_parser("_activity", help=argparse.SUPPRESS)
     p_run = sleeper_sub.add_parser("_run", help=argparse.SUPPRESS)
     p_run.add_argument("name")

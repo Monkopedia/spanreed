@@ -452,7 +452,8 @@ Resolved since:
 transcript read-check, waking on mail, the runner, and the Monitor's replay.
 Stage 3: the turn hooks, idle detection, `request_sleep`, and ending Claude.
 Measured end to end in findings Tests 12 and 13. Managing sleepers across
-`conjoin` (#86) is designed, not built; see "Managing a peer's sleepers over `conjoin`".
+`conjoin` (#86) is being built in stages, and nothing reaches a peer yet; see
+"Managing a peer's sleepers over `conjoin`".
 The resume mechanics are measured in
 [findings.md](findings.md#test-6-can-a-claude-session-in-tmux-be-exited-and-resumed-by-session-id-2026-11-13).
 Anything not measured is listed under "Not verified yet" rather than stated as fact.
@@ -1041,16 +1042,22 @@ What changes:
 **Managing a sleeper on another machine** (create, wake, sleep, retire and list it
 from here) is the owner's decision 8 on #85: "Get everything working first, then
 let's worry about it, but I would like support for management over conjoin". It is
-**designed, not built**; see the next section. Mail already wakes a remote sleeper
-without it.
+**designed, and being built in stages**; see the next section. Mail already wakes a
+remote sleeper without it.
 
 ### Managing a peer's sleepers over `conjoin` (#86)
 
-**Status: designed, not built.** Nothing in this section has been run. Facts below
-that come from reading the current code say so; everything that needs a measurement
-is under "Not verified yet (remote management)". The one question still open,
-whether the switch becomes default-on, is in
-[open-questions.md](open-questions.md#remote-sleeper-management-86-designed-not-built).
+**Status: partly built; nothing reaches a peer yet.** Stage 1 built the target's
+side, tested without a second machine: `spanreed sleeper remote-access`, the
+operations shared with the local commands (`sleeper_ops.py`), and the handling of a
+`sleeper-op` frame on the target, with its validation, expiry, idempotency record
+and audit log (`sleeper_remote.py`). The bridge does not carry the frames yet, so no
+request can arrive: that, `features` in `hello`, and the requester's spool and
+`--host` commands are later stages. Facts below that come from reading the code say
+so; everything that needs a measurement is under "Not verified yet (remote
+management)". The question of default-on, and the calls stage 1 had to make where
+this section is silent, are in
+[open-questions.md](open-questions.md#remote-sleeper-management-86-being-built).
 R9 and R10, which this design raised, are decided (decision 8).
 
 #### Decisions
@@ -1382,7 +1389,9 @@ Type this machine's label (adolin) to turn it on:
 `off` and `show` need no TTY: turning it off is always safe. Running `on` again
 records the current `PATH` again. `config.json` holds `sleeper_remote_access` as
 `{"enabled": true, "enabled_at": "<UTC>", "path_env": "<PATH>"}`; anything other
-than `"enabled": true` reads as off.
+than `"enabled": true` reads as off, and `off` removes the key. The label typed
+back is this machine's hostname (`socket.gethostname()`), the label its `conjoin
+--serve` end gives in `hello`; a `conjoin --label` override does not change it.
 
 **What the TTY check does not stop.** It is protection against accidents, such as
 a script or a stray command turning the switch on without anyone reading what it
@@ -1673,7 +1682,7 @@ spanreed sleeper retire X     # exits it if awake, deletes the record, removes t
 ```
 
 With `--host PEER`, `create`, `list`, `wake`, `sleep` and `retire` run on a
-conjoined peer instead (designed, not built; see "Managing a peer's sleepers over
+conjoined peer instead (designed, not built yet; see "Managing a peer's sleepers over
 `conjoin`"). `attach --host` prints the command to run on the peer.
 
 `create` refuses a name already held by a live agent or an existing sleeper (the

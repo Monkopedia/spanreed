@@ -1445,3 +1445,95 @@ class TestSleeperTrust:
         assert self._create(cli_env, "--trust") == 1
         assert "--trust:" in capsys.readouterr().err
         assert StateStore().sleepers.read("nap") is None
+
+
+class _Terminal:
+    """A stdin that says it is a terminal, with a line already typed."""
+
+    def __init__(self, typed: str) -> None:
+        self._typed = typed
+
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self) -> str:
+        return self._typed
+
+
+class _Pipe(_Terminal):
+    """The same typed line, from a pipe."""
+
+    def isatty(self) -> bool:
+        return False
+
+
+class TestSleeperRemoteAccess:
+    """``spanreed sleeper remote-access show|on|off``, the #86 switch."""
+
+    @pytest.fixture(autouse=True)
+    def label(self, monkeypatch: pytest.MonkeyPatch) -> str:
+        monkeypatch.setattr(cli.socket, "gethostname", lambda: "adolin")
+        return "adolin"
+
+    def test_show_says_off_by_default(
+        self, cli_env: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert cli.main(["sleeper", "remote-access", "show"]) == 0
+        assert "remote sleeper management on adolin: OFF" in capsys.readouterr().out
+        assert StateStore().get_sleeper_remote_access() is None
+
+    def test_on_refuses_without_a_terminal(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """SECURITY (an accident guard, #86 decision 7). Catches removal of the
+        ``isatty`` check: the right label is piped in, so without the check the
+        switch would be turned on."""
+        monkeypatch.setattr(sys, "stdin", _Pipe("adolin\n"))
+        assert cli.main(["sleeper", "remote-access", "on"]) == 1
+        captured = capsys.readouterr()
+        assert "stdin is not a terminal" in captured.err
+        assert "RUN COMMANDS AS YOU" not in captured.out, "refused before asking"
+        assert StateStore().get_sleeper_remote_access() is None
+        assert not (StateStore().root / "config.json").exists(), "nothing changed"
+
+    def test_on_needs_the_label_typed_back(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(sys, "stdin", _Terminal("yes\n"))
+        assert cli.main(["sleeper", "remote-access", "on"]) == 1
+        assert "you typed 'yes', not 'adolin'" in capsys.readouterr().err
+        assert StateStore().get_sleeper_remote_access() is None
+
+    def test_on_states_the_grant_and_records_path(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("PATH", "/home/u/.local/bin:/usr/bin")
+        monkeypatch.setattr(sys, "stdin", _Terminal("adolin\n"))
+        assert cli.main(["sleeper", "remote-access", "on"]) == 0
+        out = capsys.readouterr().out
+        assert "any of them can RUN COMMANDS AS YOU on adolin" in out
+        assert "trusting their entire bus and network" in out
+        assert "PATH recorded for remote creates: /home/u/.local/bin:/usr/bin" in out
+        assert "Type this machine's label (adolin) to turn it on:" in out
+        access = StateStore().get_sleeper_remote_access()
+        assert access is not None
+        assert access.path_env == "/home/u/.local/bin:/usr/bin"
+        assert access.enabled_at is not None
+        config = json.loads((StateStore().root / "config.json").read_text())
+        assert config["sleeper_remote_access"]["enabled"] is True
+
+        assert cli.main(["sleeper", "remote-access", "show"]) == 0
+        shown = capsys.readouterr().out
+        assert "remote sleeper management on adolin: ON since" in shown
+        assert "PATH recorded for remote creates: /home/u/.local/bin:/usr/bin" in shown
+
+    def test_off_needs_no_terminal_and_turns_it_off(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        StateStore().set_sleeper_remote_access("/usr/bin")
+        monkeypatch.setattr(sys, "stdin", _Pipe(""))
+        assert cli.main(["sleeper", "remote-access", "off"]) == 0
+        assert "remote sleeper management on adolin: OFF\n" in capsys.readouterr().out
+        assert StateStore().get_sleeper_remote_access() is None
+        assert cli.main(["sleeper", "remote-access", "off"]) == 0
+        assert "(it was already off)" in capsys.readouterr().out
