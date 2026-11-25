@@ -79,8 +79,10 @@ _DEFAULT_POLL_INTERVAL_S = 0.1
 # Serializes peer-record writes within one process, so the read-then-write that
 # keeps ``stopping_at`` sticky in ``write_peer_link`` cannot interleave with a
 # bridge's reader thread persisting the same record. The stickiness applies only
-# to a record this process owns, so a process-local lock is enough.
-_PEER_WRITE_LOCK = threading.Lock()
+# to a record this process owns, so a process-local lock is enough. Reentrant
+# because ``mark_peer_links_stopping`` holds it around its own read and the
+# ``write_peer_link`` calls it makes.
+_PEER_WRITE_LOCK = threading.RLock()
 
 
 def default_state_root() -> Path:
@@ -273,6 +275,21 @@ class AgentIdHeld(RuntimeError):
         )
         super().__init__(f"{holder.agent_id} is held by {held_by}")
         self.holder = holder
+
+
+REMOTE_ACCESS_KEY = "sleeper_remote_access"
+"""The ``config.json`` key of the remote sleeper management switch (#86)."""
+
+
+class RemoteAccess(BaseModel):
+    """The switch while it is on: when it was turned on, and the ``PATH`` recorded then.
+
+    Either may be ``None`` if the key was written by hand without it; a remote
+    create then fails, naming ``remote-access on`` as the way to record a ``PATH``.
+    """
+
+    enabled_at: datetime | None
+    path_env: str | None
 
 
 class StateStore:
@@ -631,11 +648,15 @@ class StateStore:
         Keyed on the owner for the same reason that method is.
         """
         now = datetime.now(UTC)
-        for link in self.list_peer_links():
-            if (link.bridge_pid, link.bridge_pid_start) != (owner_pid, owner_pid_start):
-                continue
-            if link.stopping_at is None:
-                self.write_peer_link(link.model_copy(update={"stopping_at": now}))
+        # Held across the read as well as the write: a note the reader thread
+        # persists between the two would otherwise be overwritten by the copy
+        # read before it (issue #122).
+        with _PEER_WRITE_LOCK:
+            for link in self.list_peer_links():
+                if (link.bridge_pid, link.bridge_pid_start) != (owner_pid, owner_pid_start):
+                    continue
+                if link.stopping_at is None:
+                    self.write_peer_link(link.model_copy(update={"stopping_at": now}))
 
     def list_peer_links(self) -> list[PeerLink]:
         """Every peer record on this bus, attached or not, sorted by host.
@@ -684,8 +705,14 @@ class StateStore:
           :meth:`delivery_verdict`.) The exception is a mirrored ``<id>@<host>``
           row whose owning bridge process is gone: no ``conjoin`` for that host
           is running, so nothing would ever forward the mail, and it is refused
-          (issue #34). A bridge that is only reconnecting keeps its process, and
-          so its rows, alive.
+          (issue #34). So is one whose host's peer record already reads
+          ``stopped`` while the row's owner still lives, when that record
+          describes the row's owner: a ``conjoin`` marks its record stopping a
+          few milliseconds before it clears its rows, and the resolver must not
+          accept what :meth:`delivery_verdict` then reports as having no bridge
+          (issue #122). A row another live bridge owns (the ``serve`` end of a
+          bidirectional pair) resolves as before. A bridge that is only reconnecting keeps
+          its process, and so its rows, alive.
         - ``to_agent`` matches exactly one **live** agent's display name →
           resolve to that agent's id (``send_message("ksrpc", ...)`` works).
         - several live agents share the name → ambiguous, raise.
@@ -702,7 +729,7 @@ class StateStore:
         agents = self.list_agents(include_stale=True)
         exact = next((a for a in agents if a.agent_id == to_agent), None)
         if exact is not None:
-            if "@" in to_agent and is_stale(exact):
+            if "@" in to_agent and (is_stale(exact) or self._owning_link_stopped(exact)):
                 raise ValueError(self._no_bridge_running_error(to_agent))
             return to_agent
         by_name = [a for a in agents if a.name == to_agent]
@@ -721,6 +748,24 @@ class StateStore:
         if by_name:
             raise ValueError(self._stale_name_error(to_agent, by_name))
         raise ValueError(self._unknown_recipient_error(to_agent, agents).strip())
+
+    def _owning_link_stopped(self, row: Agent) -> bool:
+        """True iff ``row``'s host's peer record reads ``stopped`` and describes
+        the bridge that owns ``row``.
+
+        The record is keyed only by host, and both ends of a bridge write it,
+        so a bidirectional pair of ``conjoin``s gives one host two bridges
+        sharing it: this host's ``connect`` and the ``serve`` the peer's
+        ``conjoin`` started here. A row mirrored by the other, live bridge says
+        nothing about the record's bridge stopping (#127 review).
+        """
+        host = row.agent_id.rpartition("@")[2]
+        link = self.read_peer_link(host) if _HOST_FILENAME_RE.fullmatch(host) else None
+        return (
+            link is not None
+            and (row.pid, row.pid_start) == (link.bridge_pid, link.bridge_pid_start)
+            and peer_link_state(link) == "stopped"
+        )
 
     @staticmethod
     def _stale_name_error(to_agent: str, dead_rows: list[Agent]) -> str:
@@ -1260,9 +1305,52 @@ class StateStore:
         """Enable/disable activity logging bus-wide (persisted in config.json)."""
         self._set_config_flag("activity_log", enabled)
 
+    def get_sleeper_remote_access(self) -> RemoteAccess | None:
+        """The remote sleeper management switch, or ``None`` when it is off (#86).
+
+        Off unless ``config.json`` holds ``sleeper_remote_access`` with
+        ``"enabled": true``. An absent key, any other value, and an unreadable
+        or malformed ``config.json`` all read as off: the check fails closed.
+        Read from disk on every call, so ``on`` and ``off`` take effect on the
+        next request without restarting a bridge.
+        """
+        value = self._read_config().get(REMOTE_ACCESS_KEY)
+        if not isinstance(value, dict):
+            return None
+        fields = cast("dict[str, object]", value)
+        if fields.get("enabled") is not True:
+            return None
+        enabled_at = fields.get("enabled_at")
+        path_env = fields.get("path_env")
+        try:
+            at = datetime.fromisoformat(enabled_at) if isinstance(enabled_at, str) else None
+        except ValueError:
+            at = None
+        return RemoteAccess(enabled_at=at, path_env=path_env if isinstance(path_env, str) else None)
+
+    def set_sleeper_remote_access(self, path_env: str | None) -> None:
+        """Turn the switch on, recording ``path_env`` for remote creates, or off (``None``).
+
+        Off removes the key, which reads as off like anything else that is not
+        ``"enabled": true``. The terminal check is the CLI's, not this method's.
+        """
+        config = self._read_config()
+        if path_env is None:
+            config.pop(REMOTE_ACCESS_KEY, None)
+        else:
+            config[REMOTE_ACCESS_KEY] = {
+                "enabled": True,
+                "enabled_at": datetime.now(UTC).isoformat(),
+                "path_env": path_env,
+            }
+        self._write_config(config)
+
     def _set_config_flag(self, key: str, value: bool) -> None:
         config = self._read_config()
         config[key] = value
+        self._write_config(config)
+
+    def _write_config(self, config: dict[str, object]) -> None:
         tmp = self._config_path.with_suffix(".json.tmp")
         write_private_text(tmp, json.dumps(config, indent=2))
         tmp.replace(self._config_path)

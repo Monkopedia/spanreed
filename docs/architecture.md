@@ -452,7 +452,8 @@ Resolved since:
 transcript read-check, waking on mail, the runner, and the Monitor's replay.
 Stage 3: the turn hooks, idle detection, `request_sleep`, and ending Claude.
 Measured end to end in findings Tests 12 and 13. Managing sleepers across
-`conjoin` (#86) is designed, not built; see "Managing a peer's sleepers over `conjoin`".
+`conjoin` (#86) is being built in stages, and nothing reaches a peer yet; see
+"Managing a peer's sleepers over `conjoin`".
 Adopting a running agent as a sleeper is designed, not built; see "Adopting a running
 agent".
 The resume mechanics are measured in
@@ -1047,16 +1048,22 @@ What changes:
 **Managing a sleeper on another machine** (create, wake, sleep, retire and list it
 from here) is the owner's decision 8 on #85: "Get everything working first, then
 let's worry about it, but I would like support for management over conjoin". It is
-**designed, not built**; see the next section. Mail already wakes a remote sleeper
-without it.
+**designed, and being built in stages**; see the next section. Mail already wakes a
+remote sleeper without it.
 
 ### Managing a peer's sleepers over `conjoin` (#86)
 
-**Status: designed, not built.** Nothing in this section has been run. Facts below
-that come from reading the current code say so; everything that needs a measurement
-is under "Not verified yet (remote management)". The one question still open,
-whether the switch becomes default-on, is in
-[open-questions.md](open-questions.md#remote-sleeper-management-86-designed-not-built).
+**Status: partly built; nothing reaches a peer yet.** Stage 1 built the target's
+side, tested without a second machine: `spanreed sleeper remote-access`, the
+operations shared with the local commands (`sleeper_ops.py`), and the handling of a
+`sleeper-op` frame on the target, with its validation, expiry, idempotency record
+and audit log (`sleeper_remote.py`). The bridge does not carry the frames yet, so no
+request can arrive: that, `features` in `hello`, and the requester's spool and
+`--host` commands are later stages. Facts below that come from reading the code say
+so; everything that needs a measurement is under "Not verified yet (remote
+management)". The question of default-on, and the calls stage 1 had to make where
+this section is silent, are in
+[open-questions.md](open-questions.md#remote-sleeper-management-86-being-built).
 R9 and R10, which this design raised, are decided (decision 8).
 
 #### Decisions
@@ -1272,9 +1279,11 @@ neither of them relying on the CLI:
   to `.abandoned`. A killed CLI's request therefore lives no longer than its
   timeout, and at most 600 s.
 - **The frame carries `expires_at`**, and the target checks it against its own
-  clock, with a fixed 30 s allowance for skew between the two hosts (R9,
-  decision 8; see "Idempotency" and "Validation on receipt"). A request that
-  reaches the target expired, with no record of it there, is answered `expired` and not run.
+  clock (R9, decision 8; see "Idempotency" and "Validation on receipt"). A fixed
+  30 s allowance for skew between the two hosts applies only to how far ahead
+  `expires_at` may be; a deadline that has passed by the target's clock is passed,
+  with no allowance. A request that reaches the target expired, with no record of
+  it there, is answered `expired` and not run.
   This is the backstop for a requester that doesn't enforce its own limit, and
   what makes R5's pruning safe: a record is pruned after 7 days, a request lives at
   most 600 s, so no request that the target accepts can outlive the record that
@@ -1388,7 +1397,9 @@ Type this machine's label (adolin) to turn it on:
 `off` and `show` need no TTY: turning it off is always safe. Running `on` again
 records the current `PATH` again. `config.json` holds `sleeper_remote_access` as
 `{"enabled": true, "enabled_at": "<UTC>", "path_env": "<PATH>"}`; anything other
-than `"enabled": true` reads as off.
+than `"enabled": true` reads as off, and `off` removes the key. The label typed
+back is this machine's hostname (`socket.gethostname()`), the label its `conjoin
+--serve` end gives in `hello`; a `conjoin --label` override does not change it.
 
 **What the TTY check does not stop.** It is protection against accidents, such as
 a script or a stray command turning the switch on without anyone reading what it
@@ -1544,6 +1555,20 @@ it, `state` (`queued`, `running` or `done`),
 and, once done, the full result frame. Keyed by peer and id, because the id is the
 requester's and only unique on its side.
 
+Every change to a record is decided on the record as it is, not as some process last
+read it: reading a record and writing its next state is one step, under an
+exclusive `flock` on `<state>/sleeper-ops/in/<peer>/.lock` (never deleted, like a
+sleeper's lock). That covers a new record, a re-queue from a dead process, the step
+to `running`, the step to `done`, and the bridge's start-up prune of records older
+than seven days; the lock is never held while an operation runs.
+It matters because one peer can have two live bridge processes here: when two hosts
+are conjoined both ways, each has a bridge for the other in each direction. Without
+it, both could find a request queued under a dead process and both take it over, or
+a second worker could start one already running. A new record is also written
+create-only, as a backstop. The worker runs a request only if its record is
+`queued` under its own bridge process; anything else it leaves to the process that
+holds it.
+
 On a `sleeper-op` whose record already exists, the record decides, whatever the
 frame's `expires_at` says:
 - **`done`**: send the stored result again; log `duplicate`. Nothing runs.
@@ -1612,10 +1637,12 @@ fail with "name already held" and report a failure for something that worked.
 
 **The target trusts nothing the requester checked.** The requester may be older,
 newer or modified, and it skips argparse's checks entirely, since only `args`
-crosses the pipe. Today some of the local checks live only in argparse: the
-permission mode is checked by `choices=PERMISSION_MODES` (`cli.py`) and nowhere in
-`_sleeper_create`. Building this moves every check into the function both paths
-call, so the local and remote paths share one set:
+crosses the pipe. Every check is therefore made in the function both paths call
+(`sleeper_ops.py`), so the local and remote paths share one set. Until #86 stage 1
+the permission mode was checked only by argparse's `choices=PERMISSION_MODES`
+(`cli.py`); argparse still checks it, for its help text, but no longer alone. The
+`name` given to `wake`, `sleep` and `retire` is checked too, since it becomes a
+file name and a local command never needed to check it:
 
 - **`request_id`** becomes a file name on both machines, so it is checked like an
   agent id is (#12): exactly 32 lowercase hex characters. A `sleeper-op` with a bad
@@ -2439,7 +2466,7 @@ spanreed sleeper retire X     # exits it if awake, deletes the record, removes t
 ```
 
 With `--host PEER`, `create`, `list`, `wake`, `sleep` and `retire` run on a
-conjoined peer instead (designed, not built; see "Managing a peer's sleepers over
+conjoined peer instead (designed, not built yet; see "Managing a peer's sleepers over
 `conjoin`"). `attach --host` prints the command to run on the peer.
 
 `create` refuses a name already held by a live agent or an existing sleeper (the
@@ -2677,7 +2704,7 @@ Global identity is `agent-X@homehost`; on its home host the agent is the bare `a
 - **No cross-host heartbeat.** Remote-agent liveness is just "present in the peer's latest registry snapshot," which the peer computes with the local PID + start-time check. The snapshot's *age* is recorded on the peer record, so a caller can see how old that evidence is rather than assuming it is current. The bridge process's PID backs the mirrored entries. On the connect end that is `conjoin`, so the remote agents stay in `list_agents` while it reconnects and vanish when it exits or dies; on the serve end, whose process ends with its link, they vanish with the link.
 - **Store-and-forward across disconnects, while `conjoin` runs.** The rule, decided by the owner on 2026-11-25 ([#34](https://github.com/Monkopedia/spanreed/issues/34)), turns on whether a `conjoin` process for that host is running, not on whether its link is up:
   - **`conjoin` running, link down** (its reconnect loop is retrying): **queue.** The peer's mirrored agents stay addressable for the life of that `conjoin` process, sends go into the outbound `*@peer` inbox, and the reconnect drains them: the bridge advances its saved cursor (the existing `cursors/` mechanism) only after a confirmed send, so it resumes from that cursor. The delivery verdict says the message is queued because the bridge is reconnecting, and when it last connected. A dropped link does not clear the mirrored rows; `conjoin` clears every row it owns when it exits.
-  - **No `conjoin` running for that host** (stopped, crashed or killed): **refuse**, saying no bridge is running to deliver it. A killed `conjoin` never runs its exit, so its rows linger in the registry with a dead owner pid; the resolver refuses an exact `agent-X@peer` address whose row's owner is dead rather than queuing into an inbox nothing forwards until a `conjoin` to that host is started again ([protocol.md, "Recipient resolution"](protocol.md#recipient-resolution)).
+  - **No `conjoin` running for that host** (stopped, crashed or killed): **refuse**, saying no bridge is running to deliver it. A killed `conjoin` never runs its exit, so its rows linger in the registry with a dead owner pid; the resolver refuses an exact `agent-X@peer` address whose row's owner is dead, or whose host's peer record already reads stopped and names that owner (a clean exit marks it just before clearing the rows; a row another live bridge mirrored, such as the `serve` end of a two-way pair sharing the record, still resolves), rather than queuing into an inbox nothing forwards until a `conjoin` to that host is started again ([protocol.md, "Recipient resolution"](protocol.md#recipient-resolution)). That check narrows the stopping window but cannot close it: the sender and `conjoin` are separate processes and no lock spans both, so a `conjoin` that stops between resolution and the append lets the send through. That send is accepted, its verdict says no bridge is running once the stop has marked the record, and the next `conjoin` to that host forwards it ([protocol.md, "Delivery is not resolution"](protocol.md#delivery-is-not-resolution)).
 
 ### Launch and prerequisites (empirically settled)
 
