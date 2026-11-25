@@ -40,10 +40,18 @@ usage like a prompt you typed.)
 - **Threading.** Native messages are plain text with no correlation id. Spanreed
   carries `msg_id` / `in_reply_to` and a blocking `wait_for_reply`, which is
   what request/response between agents is built on.
-- **Durable mail.** Native same-machine delivery needs a live peer bound to a
-  socket, so nothing holds mail for a session that does not exist yet. (A
-  cross-machine message to a peer listed `offline` *is* queued until its machine
-  reconnects.) Spanreed inboxes are files, so mail waits either way.
+- **Sleepers.** A [sleeper](../README.md#sleepers-experimental)'s Claude exits
+  when it is idle, freeing its memory, and stays on the bus by name; the next
+  message resumes the same conversation in tmux. Native messaging has nothing that
+  brings an exited conversation back when mail arrives.
+- **Durable mail, on one machine.** Native same-machine delivery needs a live peer
+  bound to a socket, so nothing holds mail for a session that does not exist yet.
+  Spanreed inboxes are files, so mail to a local agent waits while it isn't
+  running, including a sleeper that is asleep. Across machines the comparison runs
+  the other way: a native cross-machine message to a peer listed `offline` *is*
+  queued until its machine reconnects, but while a `conjoin` bridge is down the far
+  host's agents drop off spanreed's bus and sends to them fail
+  ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
 - **Fleet state.** `focus`, `status`, and the [activity log](architecture.md#activity-log-presence-history)
   — a pull-based read on what every agent is doing and a history of it. Native's
   closest primitive is a one-shot idle notice.

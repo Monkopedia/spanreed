@@ -1,6 +1,6 @@
 # Spanreed
 
-A message bus for Claude Code sessions, and for Codex workers alongside them. On top of
+A message bus for Claude Code sessions, and (experimentally) for Codex workers alongside them. On top of
 plain messaging it does two things Claude Code doesn't: **sleepers**, agents that exit
 when idle and resume the same conversation when mail arrives, and **messaging between
 machines over SSH**, with no Remote Control and nothing routed through Anthropic.
@@ -16,14 +16,18 @@ Spanreed is for what it doesn't cover:
 
 - **[Sleepers](#sleepers-experimental).** A sleeper's Claude exits when it is idle,
   freeing its memory, and stays on the bus by name. The next message resumes the same
-  conversation in tmux and is delivered there. Native messaging can only reach a
-  session that is running.
+  conversation in tmux and is delivered there. Native messaging has nothing that
+  brings an exited conversation back when mail arrives.
 - **[Cross-machine without Remote Control](#cross-host-experimental).** `spanreed
   conjoin` bridges two machines over SSH and never touches Anthropic's servers.
   Native cross-machine messaging needs Remote Control at both ends: a paid claude.ai
   sign-in, not an API key, Bedrock, Vertex or Foundry, and on Team or Enterprise only
   once an Owner enables it.
-- **Durable mail.** Inboxes are files, so mail waits for an agent that isn't running.
+- **Durable mail, on one machine.** Inboxes are files, so mail to a local agent waits
+  while it isn't running, including a sleeper that is asleep. Across machines it does
+  not yet: while a `conjoin` bridge is down, the far host's agents drop off the bus and
+  sends to them fail ([#34](https://github.com/Monkopedia/spanreed/issues/34)). Native
+  cross-machine messaging does queue for an offline peer.
 - **Threading.** Messages carry `msg_id` and `in_reply_to`, and `wait_for_reply`
   blocks on the answer, which request/response between agents is built on.
 - **[Codex workers](#codex-workers-experimental)**, which have no native address.
@@ -34,7 +38,7 @@ The full comparison, the version details, and a hazard to know before moving a f
 to native messaging (sessions in mixed permission modes stop hearing each other) are
 in [docs/native-messaging.md](docs/native-messaging.md).
 
-> **Status**: alpha. Published on PyPI (`spanreed-bus`) and in daily use. Sleepers and cross-host messaging are newer and marked experimental below. Not on the official Claude Code marketplace.
+> **Status**: alpha. Published on PyPI (`spanreed-bus`) and in daily use. Sleepers, cross-host messaging, and Codex workers are newer and marked experimental below; Codex workers have only been exercised end to end against a stub. Not on the official Claude Code marketplace.
 
 Named after the [spanreed](https://stormlightarchive.fandom.com/wiki/Spanreed): a paired magical writing tool from the Stormlight Archive that transmits text across vast distances. One side writes, the other side reads.
 
@@ -166,6 +170,8 @@ This opens a persistent SSH pipe to the peer and mirrors each side's agents into
 Check it with `spanreed list`, whose `PEERS` section shows every bridge and when each last synced its registry. Read that before concluding a peer's agent is gone: registry sync and message transport are independent, so a bridge can carry mail while leaving the far side unaddressable, and `list_agents` looks identical in both cases. The `list_peers` MCP tool exposes the same records to agents.
 
 Prerequisites: `spanreed-bus` ≥ 0.0.4 on both hosts, and key-based non-interactive SSH (it reconnects unattended, so it can't answer a password prompt). Full setup, the most common SSH gotcha (non-default key name), and how to update `spanreed` on a peer host: [`docs/cross-host.md`](docs/cross-host.md). Design in [`docs/architecture.md`](docs/architecture.md#cross-host-the-ssh-bus-bridge).
+
+**Mail does not wait for a bridge that is down.** When the pipe drops, the peer's agents are removed from `list_agents` and a send to an `agent-xxxx@host` address fails until the bridge reconnects and re-syncs ([#34](https://github.com/Monkopedia/spanreed/issues/34)). Mail already accepted while the bridge was up is kept and sent on reconnect.
 
 Experimental and point-to-point only — no multi-hop routing or peer discovery yet.
 
