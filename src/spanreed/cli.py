@@ -113,7 +113,7 @@ def _refuse_defaulted_pid(agent_id: str) -> str | None:
     """
     live = StateStore().list_agents()
     claude_pid = os.environ.get("CLAUDE_PID")
-    if claude_pid and claude_pid.isdigit() and int(claude_pid) > 0:
+    if claude_pid and claude_pid.isdecimal() and int(claude_pid) > 0:
         ours = [a for a in live if a.pid == int(claude_pid)]
         if len(ours) > 1:
             ids = ", ".join(a.agent_id for a in ours)
