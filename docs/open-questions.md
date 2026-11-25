@@ -102,6 +102,56 @@ Still open:
 - **Registry-sync cadence**: poll interval / change-detection for the `registry` frame; tradeoff between freshness and chatter. #55 added a `registry-request` pull that re-fires each tick *only* while a side has never received a snapshot, so the steady-state cadence is unchanged; whether the push should become change-driven rather than timed is still open.
 - **Queue-vs-refuse for a stale exact id** (decided in #55, flagged for review): `send_message` to a display *name* that matches only stopped sessions now **raises** — that was the silent-loss case. To an exact `agent_id` whose session has exited it still **queues**, because mail waiting for a restarting session is a documented property, and the sender is told (`delivered_to_live_session: false`, CLI exit 3). The alternative — refuse both — would lose mail across a restart. If the owner wants refusal there too, this is the knob.
 
+## Remote sleeper management (#86, designed, not built)
+
+Design in [`architecture.md`](architecture.md#managing-a-peers-sleepers-over-conjoin-86), wire
+format in [`protocol.md`](protocol.md#pipe-frames). The owner settled the carrier (frames over
+`conjoin`), the opt-in (off by default, granted on the managed machine) and resolution (on the
+target) on 2026-11-25. These are the questions those decisions leave open. Each has the author's
+recommendation; **none is decided.**
+
+- **Default-on after a few releases?** Deferred by the owner on 2026-11-25: "that sounds fine for
+  now, maybe after a few releases we turn it on by default". Revisit once remote management has
+  shipped and been used.
+- **R1. Where a remote `create` gets its `PATH`.** A local create resolves `claude` and
+  `spanreed` on the creator's `PATH`. Remotely the creator is a bridge process, and on the serve
+  end that is an ssh-launched command with a stripped `PATH`, so `claude` is often not found.
+  Options: the bridge process's own `PATH`; an interactive-shell probe on the target per create
+  (as `conjoin` does to find `spanreed`); or a `PATH` recorded when the owner runs `spanreed
+  sleeper remote-access allow PEER` in a real shell on the target. *Recommendation:* the last. It
+  is captured by a person on the right machine, needs no shell-specific probe, and the failure
+  message can name the command that refreshes it.
+- **R2. Is `list` behind the opt-in too?** It only reads, and asleep sleepers are already
+  advertised in the registry. But a record also holds `cwd`, `claude_args`, `path_env` and the
+  last wake failure, which the registry does not carry. *Recommendation:* yes, one gate for all
+  five operations; a peer that is not allowed gets `refused` for `list` as for the rest.
+- **R3. One grant per peer, or per operation?** E.g. allow `wake`/`sleep`/`list` but not
+  `create`/`retire`. *Recommendation:* per peer, all operations, for the first version. `create`
+  is the large grant, and it is already bounded by the same allowlist and refusals as a local
+  one (decision 3); a per-operation split can be added later without changing the frames.
+- **R4. Is the peer's host label enough to key the grant on?** The label is what the peer says
+  in `hello`. The serve end's peer was authenticated by ssh; the connect end's peer is whatever
+  host it dialled, and could claim any label. *Recommendation:* key on the label. Routing and
+  inbox injection already trust it, so a grant keyed on it adds no trust that a bridge does not
+  already extend, and the design says so rather than implying more.
+- **R5. How long the request spool and the target's idempotency records are kept.**
+  *Recommendation:* the requester's `.abandoned` files and orphaned replies for one day; the
+  target's idempotency records for seven days, pruned by its bridge at start. A request resent
+  after its record is pruned would run again, so the window has to outlast any realistic
+  reconnect.
+- **R6. Operations run one at a time per bridge.** A 60 s `retire` delays a `wake` queued behind
+  it. *Recommendation:* serial for the first version. The sleeper locks would make concurrency
+  safe, but serial makes the audit log read in the order things happened, and the delay is
+  visible in the requester's wait.
+- **R7. What `attach --host` does.** *Recommendation:* ask the target for the record and print
+  `ssh -t PEER tmux attach -t <session>`, exiting 2. Running ssh itself would be the per-command
+  ssh carrier the owner ruled out, and it fails on exactly the hosts that ruling was for.
+- **R8. An operation interrupted by its bridge dying.** The target sees a `running` record whose
+  process is gone. Options: report `interrupted` and let a person check; or run it again.
+  *Recommendation:* report, never re-run. The operations are not idempotent (a re-run `create`
+  fails on its own name), and a partly done `retire` or `--trust` is safer looked at than
+  repeated.
+
 ## Out-of-scope (for now)
 
 - Persistence across machine reboots
