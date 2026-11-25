@@ -1,75 +1,40 @@
 # Spanreed
 
-An inter-agent message bus for local Claude Code sessions. Run one Claude session per repo; let them coordinate.
+A message bus for Claude Code sessions, and for Codex workers alongside them. On top of
+plain messaging it does two things Claude Code doesn't: **sleepers**, agents that exit
+when idle and resume the same conversation when mail arrives, and **messaging between
+machines over SSH**, with no Remote Control and nothing routed through Anthropic.
 
-> ## ⚠️ Read this first: Claude Code does most of this natively now
->
-> Since **Claude Code v2.1.224** (v2.1.234 on native Windows; v2.1.248 for
-> same-machine messaging on Bedrock / Agent Platform / Foundry or with
-> feature-flag fetching off), sessions can message each other with no plugin,
-> no MCP server, and no registry: `ListAgents` finds your other sessions and
-> `SendMessage` delivers text to one by name, over a per-session socket. An idle
-> session is woken with the message; a busy one reads it between tool calls.
-> See [Message your other Claude Code sessions](https://code.claude.com/docs/en/cross-session-messaging).
->
-> **Same-machine only, on most setups.** Native cross-*machine* messaging routes
-> through Anthropic servers and requires
-> [Remote Control](https://code.claude.com/docs/en/remote-control) connected at
-> *both* ends — which needs a claude.ai sign-in on a paid plan, and is
-> unavailable with an API key, on Bedrock / Vertex / Foundry, or with
-> `ANTHROPIC_BASE_URL` pointed anywhere but `api.anthropic.com`. On Team and
-> Enterprise it is **off until an Owner enables it**, and an organization can
-> disable it outright. Where that applies, native messaging stops at the machine
-> boundary and [`spanreed conjoin`](#cross-host-experimental) — an SSH bridge
-> that never touches Anthropic servers — is the only cross-host option here.
->
-> **That is spanreed's core — discovery, delivery, and waking an idle peer — and
-> it was the hardest part to build.** If that is all you came here for, use the
-> native feature. It needs no install and no MCP tool surface, and it ships with
-> inbound controls (`crossSessionInbound`), per-sender rate limiting, and loop
-> protection that this project does not have. (It is not free: `ListAgents` and
-> `SendMessage` are always-on built-ins, and a delivered message counts toward
-> usage like a prompt you typed.)
->
-> **What it does not do**, and why this repo still exists:
->
-> - **Non-Claude agents.** Native messaging addresses Claude Code sessions only.
->   A [Codex worker](docs/architecture.md#codex-workers) has no socket and no row
->   in `ListAgents`; spanreed gives it a bus address, a mailbox, and a wake.
-> - **Threading.** Native messages are plain text with no correlation id. Spanreed
->   carries `msg_id` / `in_reply_to` and a blocking `wait_for_reply`, which is
->   what request/response between agents is built on.
-> - **Durable mail.** Native same-machine delivery needs a live peer bound to a
->   socket, so nothing holds mail for a session that does not exist yet. (A
->   cross-machine message to a peer listed `offline` *is* queued until its machine
->   reconnects.) Spanreed inboxes are files, so mail waits either way.
-> - **Fleet state.** `focus`, `status`, and the [activity log](docs/architecture.md#activity-log-presence-history)
->   — a pull-based read on what every agent is doing and a history of it. Native's
->   closest primitive is a one-shot idle notice.
-> - **Cross-host on a managed account**, per the paragraph above.
->
-> **One migration hazard worth knowing before you try it.** With no
-> `crossSessionInbound` value set, Claude Code decides per message from the two
-> sessions' permission modes, sorting every session into one of two classes:
-> bypassing permission prompts, or prompting — where `auto`, `acceptEdits`, and
-> `dontAsk` all count as *prompting*. A message is **held** behind an approval
-> dialog exactly when the two classes differ, in *both* directions, and the
-> dialog drops the message after five minutes by default (`dialogExpiry`). A
-> fleet that is uniformly one class is fine; a **mixed** fleet stops talking to
-> whichever sessions are the odd one out. The sending Claude is told when a
-> same-machine message is held — though a `claude -p` sender needs v2.1.271 or
-> later to get that notice, and a `-p` receiver can't show the dialog at all, so
-> it holds for the deadline and then drops. Setting `crossSessionInbound:
-> accept` is the fix, and it is worth setting deliberately rather than
-> discovering.
->
-> **Not yet measured here:** whether native messaging holds up under this project's
-> own traffic pattern — bursts of multi-kilobyte review reports between ~20 agents —
-> given its per-sender rate limit and 50-message queue cap. Until that is tested,
-> treat the overlap above as read from Anthropic's documentation rather than
-> demonstrated. If you are choosing between them, test before you migrate.
+## Why spanreed, when Claude Code messages natively
 
-> **Status**: alpha. Published on PyPI (`spanreed-bus`) and in daily use for single-host, multi-session coordination. Cross-host messaging (`spanreed conjoin`) is experimental — see [Cross-host](#cross-host-experimental). Not yet on the official Claude Code marketplace.
+Since v2.1.224, Claude Code sessions on one machine can message each other with no
+plugin (`ListAgents` and `SendMessage`). **If all you need is running Claude sessions
+on one machine talking to each other, use that.** It needs no install and has inbound
+controls and rate limits this project lacks.
+
+Spanreed is for what it doesn't cover:
+
+- **[Sleepers](#sleepers-experimental).** A sleeper's Claude exits when it is idle,
+  freeing its memory, and stays on the bus by name. The next message resumes the same
+  conversation in tmux and is delivered there. Native messaging can only reach a
+  session that is running.
+- **[Cross-machine without Remote Control](#cross-host-experimental).** `spanreed
+  conjoin` bridges two machines over SSH and never touches Anthropic's servers.
+  Native cross-machine messaging needs Remote Control at both ends: a paid claude.ai
+  sign-in, not an API key, Bedrock, Vertex or Foundry, and on Team or Enterprise only
+  once an Owner enables it.
+- **Durable mail.** Inboxes are files, so mail waits for an agent that isn't running.
+- **Threading.** Messages carry `msg_id` and `in_reply_to`, and `wait_for_reply`
+  blocks on the answer, which request/response between agents is built on.
+- **[Codex workers](#codex-workers-experimental)**, which have no native address.
+- **Fleet state:** each agent's `focus` and `status`, and an
+  [activity log](docs/architecture.md#activity-log-presence-history).
+
+The full comparison, the version details, and a hazard to know before moving a fleet
+to native messaging (sessions in mixed permission modes stop hearing each other) are
+in [docs/native-messaging.md](docs/native-messaging.md).
+
+> **Status**: alpha. Published on PyPI (`spanreed-bus`) and in daily use. Sleepers and cross-host messaging are newer and marked experimental below. Not on the official Claude Code marketplace.
 
 Named after the [spanreed](https://stormlightarchive.fandom.com/wiki/Spanreed): a paired magical writing tool from the Stormlight Archive that transmits text across vast distances. One side writes, the other side reads.
 
@@ -124,6 +89,58 @@ In terminal A, ask Claude to talk to the other session:
 > Ask agent at repo-b what version of Node it's using.
 
 Claude in repo-A discovers the peer, sends the question, the peer answers, the answer comes back. The conversation is visible in both transcripts.
+
+## Sleepers (experimental)
+
+A **sleeper** is a Claude Code session spanreed runs inside tmux. When it is idle,
+or asks to, its Claude exits and frees its memory, but it stays on the bus by
+name. The next message to it **resumes the same conversation** in tmux and is
+delivered there. Sleepers survive a reboot: the record is a file, and the next
+message wakes it. It needs `tmux`, and the plugin **updated to the version that
+matches** the `spanreed` package (the plugin's turn hooks are how a sleeper knows
+it is idle).
+
+```bash
+spanreed sleeper create --name helper --cwd ~/some/project \
+    --permission-mode acceptEdits --model claude-opus-5-5 --idle-timeout 15m --trust
+spanreed send --to helper --body "..."   # wakes it; it answers in tmux
+spanreed sleeper list                     # state, settings, any wake failures
+spanreed sleeper attach helper            # watch or type into it while awake
+spanreed sleeper sleep helper             # put it to sleep at the end of its turn
+spanreed sleeper retire helper            # remove it (its inbox is kept)
+```
+
+The permission mode and model are fixed at create and passed on every launch. So
+is anything after `--`, verbatim, which is how to give a sleeper its own MCP
+servers or prompt text without writing into its folder (use absolute paths):
+
+```bash
+spanreed sleeper create --name helper --cwd ~/some/worktree --permission-mode acceptEdits \
+    -- --mcp-config ~/sleepers/helper-mcp.json --append-system-prompt-file ~/sleepers/helper.md
+```
+
+Without `--model` it gets the model in your Claude Code settings, which may not
+be the one you usually pass on the command line.
+
+Things to know:
+
+- **The first launch in a folder Claude Code has never trusted stops at its
+  "do you trust this folder?" dialog.** Pass `--trust` to `create` to mark the
+  folder trusted up front, as accepting the dialog would (it writes that one key
+  to `~/.claude.json`). Without it, `create` and `sleeper list` warn, and you can
+  `spanreed sleeper attach <name>` and accept it once.
+- **Idle means no turn running and no background work.** A dev server or a
+  `tail -f` it left running keeps it awake until it stops the work or calls the
+  `request_sleep` tool (which stops it), or you run `spanreed sleeper sleep`.
+- **A wake that fails is never silent.** An expired Claude Code login, a rate
+  limit, or a missing `tmux` leaves it asleep with `needs_input` on the bus and
+  the reason in `spanreed sleeper list`. Its mail stays unread for the next wake.
+- **No ssh agent inside a sleeper.** It starts from a clean environment, so
+  `git push` over ssh from inside one fails.
+
+Mail reaches a sleeper on another host over `conjoin` and wakes it there, but
+creating or managing one remotely is not built yet (#86). Design:
+[docs/architecture.md](docs/architecture.md#sleepers-agents-that-sleep-and-wake-on-mail).
 
 ## How it works
 
@@ -208,58 +225,6 @@ live `codex app-server` on a machine where one is installed. Expect the doctor
 to find things. See [docs/architecture.md](docs/architecture.md) §"Codex
 workers" for the design and
 [docs/findings.md](docs/findings.md) for what was actually measured.
-
-## Sleepers (experimental)
-
-A **sleeper** is a Claude Code session spanreed runs inside tmux. When it is idle,
-or asks to, its Claude exits and frees its memory, but it stays on the bus by
-name. The next message to it **resumes the same conversation** in tmux and is
-delivered there. Sleepers survive a reboot: the record is a file, and the next
-message wakes it. It needs `tmux`, and the plugin **updated to the version that
-matches** the `spanreed` package (the plugin's turn hooks are how a sleeper knows
-it is idle).
-
-```bash
-spanreed sleeper create --name helper --cwd ~/some/project \
-    --permission-mode acceptEdits --model claude-opus-5-5 --idle-timeout 15m --trust
-spanreed send --to helper --body "..."   # wakes it; it answers in tmux
-spanreed sleeper list                     # state, settings, any wake failures
-spanreed sleeper attach helper            # watch or type into it while awake
-spanreed sleeper sleep helper             # put it to sleep at the end of its turn
-spanreed sleeper retire helper            # remove it (its inbox is kept)
-```
-
-The permission mode and model are fixed at create and passed on every launch. So
-is anything after `--`, verbatim, which is how to give a sleeper its own MCP
-servers or prompt text without writing into its folder (use absolute paths):
-
-```bash
-spanreed sleeper create --name helper --cwd ~/some/worktree --permission-mode acceptEdits \
-    -- --mcp-config ~/sleepers/helper-mcp.json --append-system-prompt-file ~/sleepers/helper.md
-```
-
-Without `--model` it gets the model in your Claude Code settings, which may not
-be the one you usually pass on the command line.
-
-Things to know:
-
-- **The first launch in a folder Claude Code has never trusted stops at its
-  "do you trust this folder?" dialog.** Pass `--trust` to `create` to mark the
-  folder trusted up front, as accepting the dialog would (it writes that one key
-  to `~/.claude.json`). Without it, `create` and `sleeper list` warn, and you can
-  `spanreed sleeper attach <name>` and accept it once.
-- **Idle means no turn running and no background work.** A dev server or a
-  `tail -f` it left running keeps it awake until it stops the work or calls the
-  `request_sleep` tool (which stops it), or you run `spanreed sleeper sleep`.
-- **A wake that fails is never silent.** An expired Claude Code login, a rate
-  limit, or a missing `tmux` leaves it asleep with `needs_input` on the bus and
-  the reason in `spanreed sleeper list`. Its mail stays unread for the next wake.
-- **No ssh agent inside a sleeper.** It starts from a clean environment, so
-  `git push` over ssh from inside one fails.
-
-Mail reaches a sleeper on another host over `conjoin` and wakes it there, but
-creating or managing one remotely is not built yet (#86). Design:
-[docs/architecture.md](docs/architecture.md#sleepers-agents-that-sleep-and-wake-on-mail).
 
 ## Update
 
