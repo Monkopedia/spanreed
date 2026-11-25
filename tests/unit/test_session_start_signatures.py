@@ -68,6 +68,11 @@ _DOCUMENTED_TOOLS = frozenset(
     }
 )
 
+# Advertised only by _STATUS_INSTRUCTION, so only when status tracking is on.
+# Expected in exactly that render: a tracking-on context that lost the line, or
+# a tracking-off one that leaked it, fails the parse guard below.
+_GATED_TOOLS = frozenset({"set_status"})
+
 # A backticked span, which is how the context presents every parameter and
 # value it names in prose: "pass the `since_msg_id` cursor", "set_status
 # `working`". Prose words are never backticked, so ordinary English ("arrived
@@ -149,9 +154,13 @@ def test_the_parse_saw_every_tool_it_should_have(rendered: str) -> None:
     every signature assertion below still passes, because they only check what
     they managed to find.
     """
-    assert set(_documented(rendered)) == _DOCUMENTED_TOOLS, (
+    # The fixture has already pinned _STATUS_INSTRUCTION's presence to the
+    # tracking state, so this is the tracking state.
+    gated = _GATED_TOOLS if _STATUS_INSTRUCTION in rendered else frozenset[str]()
+    assert set(_documented(rendered)) == _DOCUMENTED_TOOLS | gated, (
         "the parse does not match the tools the context is expected to advertise. "
-        "Either a tool was added/removed from the context (update _DOCUMENTED_TOOLS) "
+        "Either a tool was added/removed from the context (update _DOCUMENTED_TOOLS "
+        "or _GATED_TOOLS) "
         "or a bullet was reformatted so the regex no longer matches it (fix the "
         "formatting, or the regex)."
     )
