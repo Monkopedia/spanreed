@@ -518,7 +518,7 @@ source of truth, and it survives a reboot:
 | `name`, `agent_id` | `agent_id` is `agent-<name>`, validated by `validate_agent_id`. An adopted record keeps the id it had (designed, not built; see "Adopting a running agent"), so code must read the field, never derive it from the name |
 | `cwd` | the directory Claude runs in |
 | `session_id` | a UUID chosen at create; `--session-id` on the first launch, `--resume` after that. An adopted record takes the existing conversation's id, so its first launch is already `--resume` |
-| `adopted` | absent unless adopted (designed, not built): when, the pid it took over from, and how `read_through` was chosen |
+| `adopted` | absent unless adopted (designed, not built): when, the pid it took over from, and how `read_through` was chosen; during the handover, the stopped Monitor and the freeze mark |
 | `permission_mode` | fixed at create; passed on every launch |
 | `model`, `claude_args` | fixed at create; `--model` and the extra `claude` arguments given after `--`, passed on every launch after spanreed's own flags |
 | `idle_timeout_s` | default 900 (15 min), set per sleeper |
@@ -1671,7 +1671,7 @@ Nothing here has been built or run. To measure in the implementation PR:
 come from reading the code or looking at this machine say so. Anything that needs a
 measurement is under "Not verified yet (adoption)". What was observed on this machine
 is in [findings.md](findings.md#observations-for-adopting-a-running-agent-2026-11-25),
-not here. The points the request does not settle are A1–A14 in
+not here. The points the request does not settle are A1–A15 in
 [open-questions.md](open-questions.md#adopting-a-running-agent-as-a-sleeper-designed-not-built),
 each with a recommendation. This section describes the design **as recommended**, and
 names the question each choice depends on.
@@ -1874,17 +1874,36 @@ and no `Stop.background_tasks` (it has no `SPANREED_SLEEPER`), so `create` has t
    - **The session looks idle** (A2): its transcript has not been written in the last
      60 s, and its last record ends a turn (no `tool_use` waiting for its result, no
      user record waiting for a reply).
-   - **No background work is seen** (A13, as recommended: adoption waits for
-     background work, it does not stop it). Seen means either a descendant of the
-     session's pid other than its MCP servers, its inbox Monitor and their children
-     (a background shell, a build, a foreground tool's process), or a subagent
-     transcript (`<project>/<session-id>/subagents/agent-*.jsonl`) written in the last
-     60 s. **Neither check sees everything.** The live session has no
-     `Stop.background_tasks` to read, because its hooks don't report turns. A
-     background shell writes nothing to the transcript until it ends, so only its
-     process shows it. A subagent runs inside the `claude` process and writes only to
-     its own transcript, so one that is waiting on a long model call can look idle.
-     These are best-effort guards against accidents, and they fail toward refusing.
+   - **No background work is in flight** (A13, as recommended: adoption waits for
+     background work, it does not stop it). The live session has no
+     `Stop.background_tasks` to read, because its hooks don't report turns, so this is
+     judged from outside, by two checks:
+     - **Primary: a launch with no completion, in the session's own transcript.**
+       Every background launch writes a `tool_result` there: "Async agent launched"
+       for a background agent, "Command running in background with ID: …" for a
+       background Bash. Every completion comes back as a `<task-notification>` (a
+       `user` record, or a `queued_command` attachment) carrying the launch's
+       `<tool-use-id>` and a `<status>`. A launch whose `tool_use_id` has no matching
+       notification is work in flight. Only launches written since the current process
+       started count: the session file's `procStart` (equal to the row's `pid_start`)
+       gives that time, and a resumed conversation can hold launches from an earlier
+       process, which are not running. The inbox Monitor is long-running by design and
+       is excluded by its command (`spanreed inbox-watch`). The same pairing is applied
+       to subagent transcripts (`<project>/<session-id>/subagents/agent-*.jsonl`)
+       written since the process started, for work a subagent launched. This signal
+       was measured by the reviewer of #129 on one session's transcript (findings.md);
+       whether every kind of background work leaves both records is under "Not
+       verified yet".
+     - **Backstop: descendant processes.** Any descendant of the session's pid other
+       than its MCP servers, its inbox Monitor and their children (a background shell,
+       a build, a foreground tool's process).
+
+     Either check finding something refuses, and `create` says what it found (the
+     launch's tool and command or description, or the process). **A miss is not
+     safe:** work that neither check sees is killed at step 5, a background shell by
+     SIGTERM/SIGKILL and a subagent with the `claude` process it runs in. Its result
+     never comes back, and the resumed conversation holds a launch with no completion.
+     Only a false positive fails safe, by refusing.
 
    Then record the **inbox snapshot** `S`: the inbox's current length, as the
    `InboxPosition` that `read_through` already uses. Only lines at or before `S` can
@@ -1896,25 +1915,32 @@ and no `Stop.background_tasks` (it has no `SPANREED_SLEEPER`), so `create` has t
    record, so name lookup keeps working. From this moment a sender sees `sleeping`
    with a live runner, and only appends. A wake, by mail or by hand, does nothing.
    Then **release the lock.**
-3. **Stop deliveries to the live session.** `create` finds the session's Monitor (a
-   descendant of its pid running `tail -n 0 -F <this inbox>`) and sends it `SIGSTOP`.
-   From here on, mail is appended to the inbox and nothing hands it to the live
-   session. `SIGSTOP` is used rather than killing it so that an abort (step 4) can undo
-   it: `SIGCONT` resumes `tail` at its file offset, and it delivers whatever arrived in
-   the meantime. No Monitor found means none is delivering, and the step is skipped.
-   More than one is refused at step 1.
+3. **Stop deliveries to the live session.** First install the interrupt handler (see
+   "If `create` is interrupted" below). Then `create` finds the session's Monitor (a
+   descendant of its pid running `tail -n 0 -F <this inbox>`), records the inbox's
+   length as the **freeze mark** `F`, and sends the Monitor `SIGSTOP`. It also writes
+   the Monitor's pid, its start time and `F` into the record (`adopted.frozen_monitor`),
+   so that a `create` killed outright leaves a trace (see below). From here on, mail is
+   appended to the inbox and nothing hands it to the live session. `SIGSTOP` is used
+   rather than killing the Monitor so that an abort (step 4) can undo it: `SIGCONT`
+   resumes `tail` at its file offset. But a stopped `tail` buffers nothing and reads
+   nothing; on `SIGCONT` it reads every line appended since `F` at once, and emits them
+   as **one burst** (measured by the reviewer of #129, findings.md). Claude Code merges
+   such a burst into one event and cuts it at about 3,000 characters, and the lines past
+   the cut never reach Claude (Test 9). So an abort can make the live session miss mail;
+   see "The abort path". No Monitor found means none is delivering, and the step is
+   skipped. More than one is refused at step 1.
 4. **Re-check idle, after a quiet period.** Wait `Q` (recommended: 10 s, so a Monitor
    event queued just before the freeze has time to start its turn), then run the step-1
    idle and background-work checks again, requiring no transcript write since the
-   freeze. **If anything is active, abort** (A2): `SIGCONT` the Monitor, delete the
-   record under the lock (which removes the marker, leaving the live row as it was),
-   and exit non-zero saying the session became busy. Nothing was lost: the live
-   session's Monitor delivers what arrived during the freeze.
+   freeze. **If anything is active, abort** (A2), as "The abort path" below describes,
+   and exit non-zero saying the session became busy.
 5. **End the live session**, as in "The exit": list its descendants, send SIGTERM,
    then SIGKILL after 15 s, then SIGKILL to any descendants still running whose start
    time is unchanged. The stopped Monitor is one of them; SIGKILL ends a stopped
    process. It is not this process's child, so "gone" is polled by pid and start time.
-   Background work is **not** knowingly stopped: by step 4 none was seen (A13).
+   Background work is **not** knowingly stopped: by step 4 none was found in flight
+   (A13). What a miss costs is stated at step 1.
 6. **Under the lock, commit**: compute `read_through` against the now-complete
    transcript and `S`, rewrite the row as a sleeper row (`pid` 0, `pid_start` −1,
    display name from the record), and set `state=asleep`. If any line after
@@ -1931,11 +1957,17 @@ on.
 
 - *Double run:* none. The record exists, with a live runner, before the session is
   signalled, and nothing can wake the sleeper until step 6.
-- *Mail that is never seen:* none. Every inbox line after `S` that the transcript does
-  not show as delivered is replayed (lines from step 3 on cannot have been delivered).
-  Before step 3 the live session receives mail normally. Mail the live session had
-  queued but never turned into a turn has no delivered record, so it is replayed. A
-  line before `S` that the live session missed is history (A5), and `create` lists it.
+- *Mail that is never seen, when the adoption commits:* none. Every inbox line after `S`
+  that the transcript does not show as delivered is replayed, one line at a time, as
+  every sleeper replay is. Lines appended after the freeze cannot reach the live
+  session, so all of them are replayed unless they were delivered before it. (A line
+  already in the Monitor's pipe when `SIGSTOP` lands can still be delivered; the turn
+  it starts is what the step-4 re-check sees.) Before step 3 the live session receives
+  mail normally. Mail the live session had queued but never turned into a turn has no
+  delivered record, so it is replayed. A line before `S` that the live session missed
+  is history (A5), and `create` lists it.
+- *Mail when the adoption aborts:* see "The abort path". The guarantee there is weaker:
+  nothing is dropped **silently**, but mail can miss the live session.
 - *What is not guaranteed: a turn cut off by step 5.* A message that reached a turn
   counts as read once that turn has a real assistant record, so if step 5 ends that
   turn, the message is not replayed and the work on it is lost. Steps 3 and 4 make
@@ -1944,21 +1976,77 @@ on.
   outside (A2), a foreground tool call may write nothing to the transcript while it
   runs, and a turn can also start from something other than mail (a person typing in
   the pane, a background task finishing) in the moment between step 4 and step 5.
-  The claim is therefore: **no message goes unseen, and a message is lost mid-work
-  only if a turn starts or runs undetected through the step-4 re-check.**
-- *Bounded:* about `Q` plus an exit, at most 15 s plus the escalation. No process
-  outlives the command, so it fits "no persistent process" without needing the runner
-  analogy.
-- *If `create` dies between steps 2 and 6*, the record says `sleeping` with a dead
-  runner. If the session is still alive, the orphan rule blocks a wake and reports it.
-  Its message should say "adoption interrupted", not "runner died". Its Monitor may
-  still be stopped: the report says so, and that `kill -CONT <pid>` resumes it. If the
-  session has exited too, the next mail wakes the sleeper normally from the provisional
-  `read_through`. Mail may be replayed then, but none is lost.
+  The claim is therefore: **when an adoption commits, no message goes unseen, and a
+  message is lost mid-work only if a turn starts or runs undetected through the step-4
+  re-check.**
+- *Bounded:* about `Q` plus an exit, at most 15 s plus the escalation. An abort adds
+  the wait `W` below. No process outlives the command, so it fits "no persistent
+  process" without needing the runner analogy.
+- *If `create` dies*: see "If `create` is interrupted" below.
 - *A session that has already exited* (shape A) is the same command without steps 3
   to 5.
 - *The risk is ending a session mid-turn.* Test 8 measured SIGTERM only at idle. C
   therefore refuses, twice, while the session looks busy (A2).
+
+**The abort path.** Step 4 takes it when the session is busy, and the interrupt handler
+takes it when `create` is told to stop. The Monitor must be resumed, because it is the
+live session's only way to hear mail, and resuming it releases every line appended since
+the freeze mark `F` as one burst. Test 9 measured that a burst is merged into one event
+and cut at about 3,000 characters, so a handful of long messages during a 10–25 s freeze
+is enough to lose some. Nothing in the live session re-sends them, and the agent is not
+told which ones it missed. There is no way, from outside the session, to make `tail`
+deliver them one at a time. So the abort path does not promise delivery. It promises that
+every line is accounted for:
+
+1. `SIGCONT` the Monitor (if step 3 stopped one).
+2. Under the lock, delete the record. That removes the sleeper marker and leaves the live
+   row as it was.
+3. Wait `W` (recommended: 30 s, so the burst's turn has time to write a real assistant
+   record), then run the read-check on every line from `F` to the end of the inbox.
+4. Print **every line appended since `F`**, by line number, `msg_id`, sender and length,
+   each marked "delivered" or "not shown as delivered", and write the same `F` and the
+   undelivered `msg_id`s to the activity log (rule 7). Exit non-zero. The output says
+   that the undelivered lines are still in the inbox, where the agent's
+   `recv_messages` can read them, and that a person can forward them.
+
+The guarantee on abort is therefore: **every line appended after the freeze is either
+shown as delivered in the live session's transcript within `W`, or listed by line number
+and `msg_id` in `create`'s output and the activity log.** It is not guaranteed that the
+live session receives it. A line listed as "not shown as delivered" may still be in a
+turn that has not finished. A later adoption of the same agent would class such a line as
+history if the session went on to receive later mail (it is before that adoption's `S`
+and its high-water mark), and A5's listing names it again. Whether the abort should also
+re-feed these lines, and whether aborting is right at all, is A2.
+
+**If `create` is interrupted.** Before step 3, `create` installs a handler for SIGINT,
+SIGTERM and SIGHUP:
+- **From step 3 until step 5 starts**, any of them runs the abort path and then exits
+  with the signal's status. The session is not left deaf.
+- **From step 5's first SIGTERM to the end of step 6**, the session is already being
+  ended, and an abort cannot undo that. The signal is held, the bounded commit finishes,
+  and `create` then exits with the signal's status (A15).
+- **Before step 3** there is nothing to undo but the record: the handler deletes it
+  under the lock.
+
+**SIGKILL** (or a crash, or the OOM killer) runs no handler. What remains depends on
+where it landed:
+- *Between steps 2 and 5:* the record says `sleeping` with a dead runner, the live session
+  is still running, and, after step 3, its Monitor is still stopped, so **the live
+  session hears nothing**. `adopted.frozen_monitor` names that Monitor by pid and start
+  time. Recommended (A15): the wake path, which every send to the id or name and every
+  `sleeper wake` goes through, recognises this state (an adopted record, `sleeping`, its
+  runner dead, the session in `adopted.from_pid` alive) and **finishes the abort** in
+  place of the orphan report: it resumes the recorded Monitor if its pid and start time
+  still match a stopped process, deletes the record, and lists the lines since `F` as
+  step 4 of the abort path does, with the reason "adoption interrupted: create was
+  killed". `sleeper list` shows the state and says that the next send or `sleeper wake`
+  recovers it. Until one of those runs, the session stays deaf. The send that triggers
+  the recovery is itself appended after `F`, so it is part of the burst.
+- *During steps 5 and 6, with the session gone:* the next mail wakes the sleeper normally
+  from the provisional `read_through`. Mail may be replayed then, but none is lost.
+- *During step 5, with the session still alive* (SIGTERM sent, SIGKILL not yet): the
+  session is exiting. The wake path waits for it as for any orphan, and then the case
+  above applies.
 
 Self-adoption (B) remains possible later as "C, run detached once the current turn
 ends", if the owner wants agents to put themselves to sleep (A1).
@@ -2090,14 +2178,20 @@ so an ending is never silent. That identity is asserted, not proven, like every
   a newer `list` rebuilds from the record. Every spanreed on the host must be upgraded
   before anything is adopted. This is stronger than the existing rule, which only costs
   sleepers their listing.
-- **An older binary rewriting the record** (an older runner) drops `adopted`. That field
-  is informational, so nothing breaks.
+- **An older binary rewriting the record** (an older runner) drops `adopted`. Once the
+  handover is over that field is informational, so nothing breaks. During the handover
+  no runner rewrites the record, because `create` is its runner; but an older spanreed
+  would not recognise an interrupted adoption either, which is one more reason every
+  spanreed on the host must be upgraded first.
 - **Peers** see an unchanged row format.
 
 The record gains one optional field: `adopted`, which holds `at`, `by` (the caller's
 asserted identity), `from_pid`, `from_pid_start`, `inbox_snapshot` (`S`), and
 `read_through_basis` (`transcript`, `conversation_start` or `provisional`). It records
 where the agent came from, who adopted it, and why it starts reading where it does.
+While `create` runs, it also holds `frozen_monitor` (`pid`, `pid_start`, and the freeze
+mark `F`), which is what lets a later command recover from a `create` that was killed
+with the Monitor stopped ("If `create` is interrupted").
 `sleeper list` shows it.
 
 #### Not verified yet (adoption)
@@ -2124,10 +2218,20 @@ Nothing here has been built or run. To measure in the implementation PR:
   without a turn, whether a turn in progress always shows as a final record with no
   answer (a `tool_use` with no `tool_result`, or a user record with no assistant
   reply), and whether a foreground tool call writes nothing while it runs.
-- **The background-work checks of A13**: which descendants a session has when idle (MCP
-  servers, the Monitor, anything else), so that the rest can be read as work.
+- **The descendant-process backstop of A13**: which descendants a session has when idle
+  (MCP servers, the Monitor, anything else), so that the rest can be read as work.
+- **The abort path's wait `W`**: how long a burst's turn takes to show as delivered.
 - **`SIGSTOP` on the Monitor's `tail`**: that Claude Code does not react to a stopped
-  Monitor, and that `SIGCONT` delivers the lines appended meanwhile as ordinary events.
+  Monitor. The reviewer of #129 measured the `tail` side (findings.md): the wrapper
+  does not exit, and `SIGCONT` emits every line appended meanwhile at once. How Claude
+  Code turns that burst into events is assumed to be Test 9's batching and cut, and has
+  not been measured on a resumed Monitor.
+- **The background-work pairing of A13**: whether every kind of background work (a
+  background Bash, a background agent, work a subagent launches, a `Monitor` other than
+  the inbox's) writes a launch record and a `<task-notification>` with a matching
+  `<tool-use-id>`, whether a launch that dies with its process ever gets one, and how
+  to read the process start time against record timestamps. Measured so far on one
+  coordinator transcript only.
 - **`CLAUDE_CODE_SESSION_ID`** beyond the one observation in findings.md, which
   self-adoption (B) would read.
 - **What `claude --resume` does when the conversation is already open in another

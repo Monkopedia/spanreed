@@ -152,7 +152,7 @@ Still open:
 Design in [`architecture.md`](architecture.md#adopting-a-running-agent). The request came from
 the owner on 2026-11-25, as main-coordinator relayed it. It settles three things: the adopted
 conversation is resumed, the bus id is kept (not shown as hex), and the handover has no double run
-and no missed mail. Each question below is open, and each has the author's recommendation. The
+and no missed mail. Each question below (A1–A15) is open, and each has the author's recommendation. The
 design doc is written as if every recommendation is taken.
 
 - **A1. Which handover.** (A) Refuse while the session is live, so someone ends it and then
@@ -171,15 +171,36 @@ design doc is written as if every recommendation is taken.
   *Recommendation:* (1) end it only with `--end-session`, and otherwise refuse while it is
   live. (2) Before anything else, require idle: transcript unwritten for 60 s and its last
   record ending a turn. (3) After writing the record, stop the live Monitor with `SIGSTOP`, so
-  no new mail can start a turn, wait 10 s, and check idle again. (4) **If it is not idle, abort**:
-  `SIGCONT` the Monitor (it then delivers what arrived), delete the record, and exit non-zero.
-  The alternative to (4) is to wait, bounded, for the turn to end and check again; it is more
-  likely to succeed, but leaves the session deaf to mail for as long as it waits. Even with
-  all of this, a turn that runs undetected (a long foreground tool call that writes nothing,
-  or a turn started by a person typing in the pane in the last moment) can still be cut off,
-  so the design claims "no message goes unseen", not "no message is interrupted". SIGTERM
-  mid-turn is unmeasured (Test 8 was at idle). Claude Code's `sessions/<pid>.json` `status`
-  (`busy`/`shell`) might be a better idle signal, but it is undocumented and unmeasured.
+  no new mail can start a turn, wait 10 s, and check idle again. (4) **If it is not idle,
+  abort**: `SIGCONT` the Monitor, delete the record, wait 30 s, then list every line
+  appended since the freeze by line and `msg_id`, marked delivered or not, and exit
+  non-zero.
+  **What aborting costs (corrected; the previous version said nothing was lost).** A
+  stopped `tail` emits everything that arrived during the freeze as one burst when it is
+  resumed (measured by the reviewer of #129). Claude Code merges a burst into one event and
+  cuts it at about 3,000 characters, and the lines past the cut never reach Claude
+  (Test 9). So six or more long messages during a 10–25 s freeze can lose mail to the live
+  session, and the abort path is taken exactly when the agent is busy. The abort can
+  promise only that every such line is shown as delivered or **listed**, never that it
+  reaches the session. Committing has no such cost: the sleeper replays those lines one at
+  a time. The choices for (4):
+  - (a) **abort and list** (recommended for v1): bounded, and the session is deaf only for
+    the freeze. Mail can miss the session, but never silently.
+  - (b) **wait, bounded, for the turn to end, and check again**: more likely to commit, and
+    a commit replays everything. But the session is deaf for as long as it waits, and if the
+    wait runs out the burst it then aborts with is larger.
+  - (c) **abort and re-feed**: as (a), but `create` also re-appends each line not shown as
+    delivered to the inbox, 3 s apart, so the resumed Monitor delivers each as its own
+    event. It is the only option where the session receives the mail, but it writes a
+    second inbox line with the same `msg_id`, where today a `msg_id` names one line
+    (`recv_messages(since_msg_id)` and cursors find a position by it), and it re-sends
+    other agents' mail. That is a wire-format change, so not for v1.
+  Even with all of this, a turn that runs undetected (a long foreground tool call that writes
+  nothing, or a turn started by a person typing in the pane in the last moment) can still be
+  cut off, so the design claims "no message goes unseen" only when the adoption commits, and
+  never "no message is interrupted". SIGTERM mid-turn is unmeasured (Test 8 was at idle).
+  Claude Code's `sessions/<pid>.json` `status` (`busy`/`shell`) might be a better idle
+  signal, but it is undocumented and unmeasured.
 - **A3. CLI shape.** *Recommendation:* both forms. `--session-id`/`--agent-id` (with `--name`
   and `--cwd`) is the primitive. `--adopt AGENT` fills them in from the agent's registry row and
   Claude Code's `~/.claude/sessions/<pid>.json`, used only when `procStart` matches the row's
@@ -238,14 +259,22 @@ design doc is written as if every recommendation is taken.
   background work be stopped only when the agent itself asks to sleep (`request_sleep`); the
   idle timeout never stops anything. Adoption is an outside actor ending the session without
   the agent asking, which is closer to the idle-timeout case, but decision 7 did not consider
-  it. *Recommendation:* wait. Refuse to adopt while background work is seen, and say what was
-  seen. Detection is weak and best-effort: the live session has no `Stop.background_tasks`
-  (its hooks don't report turns), a background shell writes nothing to the transcript until it
-  ends, and subagents write only to `<session>/subagents/agent-*.jsonl`. So `create` looks at
-  the session's descendant processes (anything but its MCP servers and Monitor) and at recent
-  writes to its subagent transcripts. A subagent waiting on a long model call can still look
-  idle. The alternative is a `--stop-background` flag that stops it, as `request_sleep` does,
-  and logs what was stopped.
+  it. **Corrected premise:** the previous version called detection weak, saying a background
+  shell writes nothing to the transcript until it ends. That was wrong. Every background
+  launch is recorded in the session's own transcript ("Async agent launched", "Command
+  running in background with ID: …"), and every completion returns as a
+  `<task-notification>` with the same `<tool-use-id>` and a `<status>`. On the
+  coordinator's transcript the reviewer of #129 counted 104 launches and 101 completions,
+  and the 3 unmatched launches were exactly the 3 tasks in flight. So a launch since the
+  current process started with no completion is a direct "busy" signal; descendant
+  processes stay as a backstop. It is measured on one transcript, and whether every kind of
+  background work leaves both records is still to check. A miss is not safe: step 5 kills
+  the work it missed. *Recommendation (unchanged, now on firmer ground):* wait. Refuse to
+  adopt while any background work is in flight, and name each launch or process found. The
+  alternative is a `--stop-background` flag that stops it, as `request_sleep` does, and
+  logs what was stopped; with the pairing, `create` could now name exactly what it would
+  stop, which makes that alternative more practical than before, but it is still an outside
+  actor stopping work the agent started.
 - **A14. Who may run `--end-session`?** No command today ends another agent's live session.
   With it, the coordinator (or any process running as the user) can end any idle local agent.
   Spanreed cannot enforce who runs a CLI command (decision 7). *Recommendation:* the owner, or
@@ -254,6 +283,22 @@ design doc is written as if every recommendation is taken.
   record and the activity log. It refuses when the caller is inside the target session
   (that is self-adoption, B). Where that rule lives (fleet policy, the coordinator's
   instructions) is for the owner.
+
+- **A15. An interrupted `create`.** Between the freeze and the end of the session, a
+  Ctrl-C, SIGTERM or SIGHUP to `create` runs the abort path, so the session is not left
+  deaf. Two points need a decision. (i) **A signal after step 5 has begun** cannot be
+  undone, because the session is already being ended. *Recommendation:* hold it, finish the
+  bounded commit (about 15 s plus the escalation), then exit with the signal's status. The
+  alternative is to exit at once and leave the record to the orphan rule. (ii) **A
+  `create` killed with SIGKILL** runs no handler, and leaves the live session's Monitor
+  stopped, so it hears nothing. The record names that Monitor (`adopted.frozen_monitor`).
+  *Recommendation:* the wake path, which every send and `sleeper wake` goes through,
+  recognises an adopted record whose runner is dead while the original session is alive,
+  and finishes the abort (resumes the Monitor if its pid and start time still match, deletes
+  the record, lists the lines since the freeze), in place of the orphan report. `sleeper
+  list` shows the state. The session stays deaf until the next send or `sleeper wake`. The
+  alternative is today's orphan report, which says how to `kill -CONT` by hand and changes
+  nothing itself.
 
 ## Out-of-scope (for now)
 

@@ -602,7 +602,8 @@ by simulating the write); `CLAUDE_CONFIG_DIR`; macOS.
 
 Looked at on kaladin, Claude Code 2.1.283, while designing "Adopting a running agent"
 (architecture.md, PR #129). Observations of the live machine, not experiments. Those
-marked *review* were measured by the reviewer of #129 (review 6061036209).
+marked *review* were measured by the reviewer of #129 in review 6061036209, and those marked
+*review 2* in review 6061240029.
 
 - **The pilots.** From the registry and `~/.claude/sessions/<pid>.json`. Each id is
   derived from its cwd, each display name is the directory's basename, and each runs
@@ -624,7 +625,26 @@ marked *review* were measured by the reviewer of #129 (review 6061036209).
 - **Subagent transcripts** go to `~/.claude/projects/<project>/<session-id>/subagents/agent-*.jsonl`,
   not to the session's own transcript (*review*; the directory layout also seen
   here).
-- **A background shell writes nothing to the transcript until it ends** (*review*).
+- **A background shell's output is not in the transcript until it ends** (*review*). Its
+  launch is, though (next point).
+- **Background launches and completions are both in the session's own transcript**
+  (*review 2*). A background agent launch writes a `tool_result` starting "Async agent
+  launched"; a background Bash launch writes "Command running in background with ID: …".
+  Each completion arrives as a `<task-notification>`, in a `user` record or a
+  `queued_command` attachment, carrying the launch's `<tool-use-id>` and a `<status>`. On
+  the coordinating spanreed session's transcript (about 23k lines): 104 background
+  launches, 101 matched by a notification, and 3 unmatched, which were exactly the 3 tasks
+  in flight at the time. One transcript only; not checked for every kind of background
+  work, nor for launches made by subagents.
+- **A stopped `tail -n 0 -F` emits what arrived while stopped as one burst** (*review 2*).
+  Under the same `zsh -c … eval` wrapper the live Monitors use, the `tail` was sent
+  `SIGSTOP` and three lines were appended. The wrapper did not exit and nothing was
+  printed. After `SIGCONT`, all three lines came out at once. Not measured: what Claude
+  Code makes of such a burst from a real Monitor. Test 9 measured that lines arriving
+  together become one event cut at about 3,000 characters.
+- **Every live inbox Monitor is `tail -n 0 -F <absolute inbox path>`** under
+  `claude → zsh`, and every live `~/.claude/sessions/<pid>.json` (21 here) carries
+  `sessionId`, `cwd` and `procStart` (*review 2*).
 
 Not checked: whether a session file is removed at exit, whether its `sessionId` changes
 after `/clear`, and whether its `cwd` follows the session or stays where it started.
