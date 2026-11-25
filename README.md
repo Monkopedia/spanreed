@@ -171,7 +171,7 @@ Check it with `spanreed list`, whose `PEERS` section shows every bridge and when
 
 Prerequisites: `spanreed-bus` ≥ 0.0.4 on both hosts, and key-based non-interactive SSH (it reconnects unattended, so it can't answer a password prompt). Full setup, the most common SSH gotcha (non-default key name), and how to update `spanreed` on a peer host: [`docs/cross-host.md`](docs/cross-host.md). Design in [`docs/architecture.md`](docs/architecture.md#cross-host-the-ssh-bus-bridge).
 
-**Mail does not wait for a bridge that is down.** When the pipe drops, the peer's agents are removed from `list_agents` and a send to an `agent-xxxx@host` address fails until the bridge reconnects and re-syncs ([#34](https://github.com/Monkopedia/spanreed/issues/34)). Mail already accepted while the bridge was up is kept and sent on reconnect.
+**Mail does not wait for a bridge that is down.** When the pipe drops, the peer's agents are removed from `list_agents` and a send to an `agent-xxxx@host` address usually fails until the bridge reconnects and re-syncs ([#34](https://github.com/Monkopedia/spanreed/issues/34)). That holds after a clean teardown; if `conjoin` is killed instead, the peer's rows can linger, and a send to the exact address still queues. Mail already accepted while the bridge was up is kept and sent on reconnect.
 
 Experimental and point-to-point only — no multi-hop routing or peer discovery yet.
 

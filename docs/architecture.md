@@ -1021,8 +1021,13 @@ advertising asleep agents:
    with `append_message`.
 3. That write runs `wake_if_needed`, **on hostB**, where the tmux session, the login
    and the sleeper record all live.
-4. If the link is down, the mail waits on the sending machine, and the reconnect
-   delivers it and wakes the sleeper. That is durable end to end.
+4. Mail queued in step 1 while the link was up survives a drop: the reconnect
+   delivers it and wakes the sleeper. Mail sent *while* the link is down usually
+   does not queue at all. A clean bridge teardown removes the `@hostB` rows, so the
+   send is refused. A killed `conjoin` can leave the rows behind, and then a send to
+   the exact `agent-X@hostB` address still queues. Delivery is therefore not
+   durable end to end across an outage
+   ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
 
 What changes:
 - **Peers must see asleep sleepers**, or no remote agent can address them.
@@ -1286,7 +1291,7 @@ Global identity is `agent-X@homehost`; on its home host the agent is the bare `a
 ### Properties that fall out for free
 
 - **No cross-host heartbeat.** Remote-agent liveness is just "present in the peer's latest registry snapshot," which the peer computes with the local PID + start-time check. The snapshot's *age* is recorded on the peer record, so a caller can see how old that evidence is rather than assuming it is current. The bridge's own PID backs the mirrored entries, so if the pipe dies the remote agents correctly vanish from `list_agents`.
-- **Store-and-forward across disconnects.** If the pipe is down, outbound messages accumulate durably in the `*@peer` inbox files; on reconnect the bridge resumes from its saved cursor (the existing `cursors/` mechanism) and drains the backlog.
+- **Store-and-forward across disconnects, for mail already queued.** A message accepted into a `*@peer` inbox file while the bridge was up survives a drop: the bridge advances its saved cursor (the existing `cursors/` mechanism) only after a confirmed send, so on reconnect it resumes from that cursor and drains what is left. Mail sent *while* the pipe is down is a different matter, and today it usually does not queue. A clean teardown (EOF, watchdog, SIGINT/SIGTERM) runs `clear_remote_agents`, which deletes the `@peer` rows, so `send_message` refuses the address. If `conjoin` is killed instead, the teardown never runs: the rows drop out of `list_agents` (their owner pid is dead) but stay in the registry, and a send to the exact `agent-X@peer` address still succeeds and queues ([protocol.md, "Delivery is not resolution"](protocol.md#delivery-is-not-resolution)). Whether the queue should be writable during an outage is undecided ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
 
 ### Launch and prerequisites (empirically settled)
 

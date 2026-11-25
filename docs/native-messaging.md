@@ -50,8 +50,10 @@ usage like a prompt you typed.)
   running, including a sleeper that is asleep. Across machines the comparison runs
   the other way: a native cross-machine message to a peer listed `offline` *is*
   queued until its machine reconnects, but while a `conjoin` bridge is down the far
-  host's agents drop off spanreed's bus and sends to them fail
-  ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
+  host's agents drop off spanreed's bus and sends to them usually fail
+  ([#34](https://github.com/Monkopedia/spanreed/issues/34)). That holds after a
+  clean teardown; a killed `conjoin` can leave the far host's rows behind, so a send
+  to the exact address still queues.
 - **Fleet state.** `focus`, `status`, and the [activity log](architecture.md#activity-log-presence-history)
   — a pull-based read on what every agent is doing and a history of it. Native's
   closest primitive is a one-shot idle notice.
