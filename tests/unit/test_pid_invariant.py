@@ -32,7 +32,8 @@ from tests.unit.test_codex_worker import MakeWorker
 PARENT = os.getppid()
 """What ``getppid()`` returns for the CLI writers, which run in this process."""
 
-# The anchor states. "Anchored" is a positive decimal integer; everything else is
+# The anchor states. "Anchored" is a positive integer in decimal digits (any
+# Unicode decimal digit, per `str.isdecimal`); everything else is
 # treated as unset (#94). Pid 1 is anchored and recorded, but liveness then reads
 # the row as stale ("Liveness / staleness").
 ANCHORS = {

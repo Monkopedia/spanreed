@@ -569,8 +569,10 @@ def _ensure_registered(store: StateStore, agent_id: str) -> None:
       this session's. It may be another directory's, or our own before anything
       registered it. Stamping ``$CLAUDE_PID`` on a foreign id would never decay:
       ``is_stale`` would confirm it, and the resolver would then find two live
-      entries claiming one pid. A doomed shell pid fails closed instead, and the
-      stub evaporates when the command does.
+      entries claiming one pid. A shell pid fails closed instead: the stub lives
+      as long as the parent shell, which inside a session is the Bash tool's
+      and exits with the tool call. For a human at a terminal it is their
+      interactive shell, so the stub is listed for as long as that shell runs.
     - **``SPANREED_AGENT_NAME`` set**: the override names the id, but child
       processes inherit it and nothing authenticates it, so recording the anchor
       would let a child session stamp its liveness onto the parent's id. Owner

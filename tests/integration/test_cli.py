@@ -779,9 +779,10 @@ class TestRegisterRecordsTheClaudePid:
 
         An earlier revision of this PR switched it to `session_pid()` and this
         test asserted that — encoding the bug. Reaching that path from inside a
-        session means the anchor found nothing, so the id is cwd-derived and by
-        construction not ours. Stamping `$CLAUDE_PID` there attaches our
-        liveness to a foreign entry permanently: it never decays, `is_stale`
+        session means the anchor found nothing, so the id is cwd-derived and
+        not known to be ours (it may be another directory's). Stamping
+        `$CLAUDE_PID` there attaches our liveness to a foreign entry
+        permanently: it never decays, `is_stale`
         confirms it, and the resolver then sees two live entries claiming one
         pid. A doomed shell pid is right because it fails closed.
         """
