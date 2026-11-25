@@ -173,8 +173,11 @@ design doc is written as if every recommendation is taken.
   record ending a turn. (3) After writing the record, stop the live Monitor with `SIGSTOP`, so
   no new mail can start a turn, wait 10 s, and check idle again. (4) **If it is not idle,
   abort**: `SIGCONT` the Monitor, delete the record, wait 30 s, then list every line
-  appended since the freeze by line and `msg_id`, marked delivered or not, and exit
-  non-zero.
+  appended since the inbox snapshot `S` taken when `create` started, up to the moment of
+  listing, by line and `msg_id`, marked delivered or not, and exit non-zero. (It starts
+  at `S`, not at the freeze, because a line appended just before the freeze that `tail`
+  had not yet read also comes out in the burst.) The listing goes to the output, the
+  activity log, and an abort report that `sleeper list` shows.
   **What aborting costs (corrected; the previous version said nothing was lost).** A
   stopped `tail` emits everything that arrived during the freeze as one burst when it is
   resumed (measured by the reviewer of #129). Claude Code merges a burst into one event and
@@ -275,6 +278,22 @@ design doc is written as if every recommendation is taken.
   logs what was stopped; with the pairing, `create` could now name exactly what it would
   stop, which makes that alternative more practical than before, but it is still an outside
   actor stopping work the agent started.
+  Two edges of the detector, each with the author's recommendation (review 6061400830):
+  - *Monitors.* Most Monitor-tool notifications carry no `<tool-use-id>` (19 of 21 on the
+    measured transcript), so pairing them would refuse adoption long after a Monitor
+    ended. *Recommendation:* leave Monitor launches out of the pairing and judge them by
+    the descendant-process backstop, which sees a running Monitor as a process; `create`
+    names it and says to stop it or wait. Alternatives: treat every unpaired Monitor as
+    blocking (fails safe, but can block adoption until a restart), or match Monitors by
+    another key (none is known).
+  - *Work launched before a `/clear`.* The new transcript does not hold it, and a
+    background agent runs inside the `claude` process, so the backstop cannot see it; a
+    miss kills it at step 5 and its result is lost. *Recommendation:* pair launches and
+    notifications across every transcript in the project folder written since the process
+    started (and their subagents), which cannot miss a launch this process made and can
+    only over-refuse. Alternative: refuse whenever the adopted transcript began after the
+    process started, until the session restarts; simpler, but it blocks every agent that
+    has used `/clear`.
 - **A14. Who may run `--end-session`?** No command today ends another agent's live session.
   With it, the coordinator (or any process running as the user) can end any idle local agent.
   Spanreed cannot enforce who runs a CLI command (decision 7). *Recommendation:* the owner, or
@@ -284,21 +303,51 @@ design doc is written as if every recommendation is taken.
   (that is self-adoption, B). Where that rule lives (fleet policy, the coordinator's
   instructions) is for the owner.
 
-- **A15. An interrupted `create`.** Between the freeze and the end of the session, a
-  Ctrl-C, SIGTERM or SIGHUP to `create` runs the abort path, so the session is not left
-  deaf. Two points need a decision. (i) **A signal after step 5 has begun** cannot be
-  undone, because the session is already being ended. *Recommendation:* hold it, finish the
-  bounded commit (about 15 s plus the escalation), then exit with the signal's status. The
-  alternative is to exit at once and leave the record to the orphan rule. (ii) **A
-  `create` killed with SIGKILL** runs no handler, and leaves the live session's Monitor
-  stopped, so it hears nothing. The record names that Monitor (`adopted.frozen_monitor`).
-  *Recommendation:* the wake path, which every send and `sleeper wake` goes through,
-  recognises an adopted record whose runner is dead while the original session is alive,
-  and finishes the abort (resumes the Monitor if its pid and start time still match, deletes
-  the record, lists the lines since the freeze), in place of the orphan report. `sleeper
-  list` shows the state. The session stays deaf until the next send or `sleeper wake`. The
-  alternative is today's orphan report, which says how to `kill -CONT` by hand and changes
-  nothing itself.
+- **A15. An interrupted `create`.** Revised after review 6061400830, which found that the
+  previous recovery could not tell "`create` killed before it began ending the session"
+  from "killed while the session was ending", and prescribed opposite actions for the
+  two; that the `frozen_monitor` write was not ordered before the `SIGSTOP`; and that the
+  recovery ran its 30 s wait inside whichever sender triggered it. The design now:
+  - `create` installs its SIGINT/SIGTERM/SIGHUP handler before it writes the record.
+  - Step 3 writes `adopted.frozen_monitor` (pid, start time, `F`) under the lock and only
+    then sends `SIGSTOP`, so a stopped Monitor is always on record.
+  - Step 5 writes a **phase marker**, `adopted.ending` (time, and the descendants it will
+    signal), under the lock before its first SIGTERM.
+  - A record in `sleeping` at generation 0 with a dead runner is an interrupted adoption,
+    and only that. Its **recovery** branches on the marker. With no marker and the
+    session alive, it aborts: resume the recorded Monitor, delete the record, wait 30 s,
+    list every line since `S`. With the marker, the session is ending: wait for it to exit
+    (SIGKILL it and the recorded descendants if it outlives 15 s), then complete the
+    commit (`read_through`, `asleep`, wake if unread); the record is kept.
+  - The listing of an abort goes to the activity log and an abort report,
+    `sleepers/<name>.adopt-aborted.json`, which `sleeper list` shows until it is dismissed
+    or the next adoption commits; and to the output when there is one.
+
+  Three points need a decision.
+  (i) **A signal after the phase marker** cannot be undone, because the session is
+  already being ended. *Recommendation:* hold it, finish the bounded commit (about 15 s
+  plus the escalation), then exit with the signal's status. The alternative is to exit at
+  once and leave the record to the recovery.
+  (ii) **Who runs the recovery.** It waits up to 30 s plus an exit, and the wake path
+  runs inside every inbox writer (MCP `send_message`, `spanreed send`, a Codex worker's
+  reply, a `conjoin` bridge's frame loop), so it must not run there. Options:
+  (a) the wake path launches `spanreed sleeper adopt --recover NAME` detached, in a new
+  tmux session as a runner is, records it as the record's runner (so later sends do
+  nothing, by the existing rule), and returns at once; it launches at most one per record
+  and falls back to (b) if that one dies;
+  (b) the wake path only records a wake failure and `needs_input` naming `spanreed
+  sleeper adopt --recover NAME`, and a person runs it.
+  *Recommendation:* (a). The harm is a session that hears nothing, and the first mail is
+  when it matters; (b) leaves the session deaf until a person reads the failure. The cost
+  of (a) is a second kind of detached process launched from the wake path, bounded and
+  short-lived. In both, `--recover` can be run by hand, and `sleeper list` shows the
+  interrupted adoption, its phase and how to recover it. Until a recovery runs, a frozen
+  session hears nothing.
+  (iii) **No phase marker, but the session has already exited** (a person ended it
+  after `create` was killed). Nothing `create` started is left to undo, and the
+  conversation is complete. *Recommendation:* commit, as in the marker branch, so the
+  agent becomes a sleeper (this is shape A). The alternative, abort, deletes the record
+  and leaves a stale row whose mail queues with nothing to wake it.
 
 ## Out-of-scope (for now)
 

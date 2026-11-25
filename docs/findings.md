@@ -602,8 +602,8 @@ by simulating the write); `CLAUDE_CONFIG_DIR`; macOS.
 
 Looked at on kaladin, Claude Code 2.1.283, while designing "Adopting a running agent"
 (architecture.md, PR #129). Observations of the live machine, not experiments. Those
-marked *review* were measured by the reviewer of #129 in review 6061036209, and those marked
-*review 2* in review 6061240029.
+marked *review* were measured by the reviewer of #129 in review 6061036209, those marked
+*review 2* in review 6061240029, and those marked *review 3* in review 6061400830.
 
 - **The pilots.** From the registry and `~/.claude/sessions/<pid>.json`. Each id is
   derived from its cwd, each display name is the directory's basename, and each runs
@@ -645,6 +645,14 @@ marked *review* were measured by the reviewer of #129 in review 6061036209, and 
 - **Every live inbox Monitor is `tail -n 0 -F <absolute inbox path>`** under
   `claude → zsh`, and every live `~/.claude/sessions/<pid>.json` (21 here) carries
   `sessionId`, `cwd` and `procStart` (*review 2*).
+- **Which background notifications carry a `<tool-use-id>`** (*review 3*). On the
+  coordinating spanreed session's transcript: all 133 distinct Agent notifications and all
+  8 "Background" (Bash) notifications carry one; **19 of the 21 distinct Monitor-tool
+  notifications carry none**.
+- **Stopped work is notified too** (*review 3*). The `<status>` values across every
+  transcript under `~/.claude/projects`: `completed` 21283, `killed` 1095, `failed` 770,
+  `stopped` 103. A background agent stopped with TaskStop (`a28d631e716ca262c`) got a
+  `killed` notification carrying its `<tool-use-id>`.
 
 Not checked: whether a session file is removed at exit, whether its `sessionId` changes
 after `/clear`, and whether its `cwd` follows the session or stays where it started.
