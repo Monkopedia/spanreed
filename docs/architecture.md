@@ -1606,10 +1606,12 @@ fail with "name already held" and report a failure for something that worked.
 
 **The target trusts nothing the requester checked.** The requester may be older,
 newer or modified, and it skips argparse's checks entirely, since only `args`
-crosses the pipe. Today some of the local checks live only in argparse: the
-permission mode is checked by `choices=PERMISSION_MODES` (`cli.py`) and nowhere in
-`_sleeper_create`. Building this moves every check into the function both paths
-call, so the local and remote paths share one set:
+crosses the pipe. Every check is therefore made in the function both paths call
+(`sleeper_ops.py`), so the local and remote paths share one set. Until #86 stage 1
+the permission mode was checked only by argparse's `choices=PERMISSION_MODES`
+(`cli.py`); argparse still checks it, for its help text, but no longer alone. The
+`name` given to `wake`, `sleep` and `retire` is checked too, since it becomes a
+file name and a local command never needed to check it:
 
 - **`request_id`** becomes a file name on both machines, so it is checked like an
   agent id is (#12): exactly 32 lowercase hex characters. A `sleeper-op` with a bad

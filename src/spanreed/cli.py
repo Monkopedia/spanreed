@@ -19,25 +19,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
-import shutil
 import sys
 import time
-import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from spanreed import sleeper_ops
 from spanreed._fsmode import private_dir, tighten_tree, touch_private, write_private_text
-from spanreed.claude_trust import TrustError, claude_state_file, folder_is_trusted, trust_folder
 from spanreed.codex_approvals import MODES
 from spanreed.identity import derive_agent_identity, session_agent_identity, session_pid
 from spanreed.protocol import Agent, validate_agent_id
 from spanreed.sleeper_runner import (
-    RETIRE_WAIT_S,
     record_activity,
-    request_sleep,
-    wait_until_asleep,
-    wake_if_needed,
 )
 from spanreed.sleeper_runner import run as run_sleeper
 from spanreed.sleepers import (
@@ -46,9 +39,6 @@ from spanreed.sleepers import (
     InboxPosition,
     SleeperError,
     SleeperRecord,
-    check_claude_args,
-    parse_duration,
-    sleeper_agent_id,
 )
 from spanreed.store import (
     StateStore,
@@ -904,135 +894,33 @@ def _cmd_sleeper(args: argparse.Namespace) -> int:
 
 def _sleeper_create(args: argparse.Namespace) -> int:
     """Record a sleeper. It starts asleep; nothing is launched."""
-    name = args.name
-    try:
-        agent_id = validate_agent_id(sleeper_agent_id(name), qualified_ok=False)
-        idle_timeout_s = parse_duration(args.idle_timeout)
-    except ValueError as exc:
-        raise SleeperError(str(exc)) from None
-    cwd = Path(args.cwd).expanduser().resolve()
-    if not cwd.is_dir():
-        raise SleeperError(f"--cwd {args.cwd!r} is not a directory")
-    claude_args = check_claude_args(list(args.claude_args))
-    # Resolved now, from the creator's PATH, and used for every launch: a wake
-    # may be started by a cron job or a conjoin bridge whose PATH finds neither.
-    path_env = os.environ.get("PATH", "")
-    resolved = {tool: shutil.which(tool, path=path_env) for tool in ("claude", "spanreed")}
-    missing = [tool for tool, path in resolved.items() if path is None]
-    if missing:
-        raise SleeperError(
-            f"{' and '.join(missing)} not found on PATH; a sleeper runs both by absolute "
-            f"path, resolved here at create"
-        )
-    if args.trust:
-        # Before the record exists, so a failure leaves nothing half made.
-        try:
-            trust_folder(cwd)
-        except TrustError as exc:
-            raise SleeperError(f"--trust: {exc}") from None
-    record = StateStore().create_sleeper(
-        SleeperRecord(
-            name=name,
-            agent_id=agent_id,
-            cwd=str(cwd),
-            session_id=str(uuid.uuid4()),
+    return sleeper_ops.create(
+        StateStore(),
+        sleeper_ops.CreateArgs(
+            name=args.name,
+            cwd=args.cwd,
             permission_mode=args.permission_mode,
             model=args.model,
-            claude_args=claude_args,
-            idle_timeout_s=idle_timeout_s,
-            claude_path=str(resolved["claude"]),
-            spanreed_path=str(resolved["spanreed"]),
-            path_env=path_env,
-            created_at=datetime.now(UTC),
-        )
-    )
-    print(
-        f"created sleeper {record.name} ({record.agent_id}), ASLEEP\n"
-        f"  cwd:             {record.cwd}\n"
-        f"  session id:      {record.session_id}\n"
-        f"  permission mode: {record.permission_mode}\n"
-        f"  model:           {record.model or '(Claude Code default)'}\n"
-        f"  claude args:     {shlex.join(record.claude_args) or '(none)'}\n"
-        f"  idle timeout:    {record.idle_timeout_s}s\n"
-        f"  inbox read from: line {record.read_through.line + 1} (earlier mail is history)\n"
-        f"It is on the bus now. The first message to it, or `spanreed sleeper wake "
-        f"{record.name}`, launches it."
-    )
-    if args.trust:
-        print(f"Marked {cwd} trusted in {claude_state_file()}, as accepting the dialog would.")
-    else:
-        warning = _trust_warning(record)
-        if warning:
-            print(f"WARNING: {warning}")
-    return 0
-
-
-def _trust_warning(record: SleeperRecord) -> str | None:
-    """Why this sleeper's first launch would stop at the trust dialog, if it would."""
-    trusted = folder_is_trusted(Path(record.cwd))
-    if trusted is True:
-        return None
-    if trusted is None:
-        return (
-            f"could not read {claude_state_file()} to tell whether Claude Code trusts "
-            f"{record.cwd}. If it does not, the first launch stops at its trust dialog."
-        )
-    return (
-        f"Claude Code has not trusted {record.cwd}, so the first launch will stop at its "
-        f'"do you trust this folder?" dialog and the sleeper will not take a turn. '
-        f"Accept it once with `spanreed sleeper attach {record.name}`, or retire and "
-        f"re-create with --trust."
+            idle_timeout=args.idle_timeout,
+            trust=args.trust,
+            claude_args=list(args.claude_args),
+        ),
+        print,
+        path_env=os.environ.get("PATH", ""),
     )
 
 
 def _sleeper_list(args: argparse.Namespace) -> int:
-    records = StateStore().sleepers.records()
+    store = StateStore()
     if args.json:
-        json.dump([r.model_dump(mode="json") for r in records], sys.stdout, indent=2)
+        json.dump(sleeper_ops.list_records(store), sys.stdout, indent=2)
         print()
         return 0
-    if not records:
-        print("no sleepers (create one with `spanreed sleeper create`)")
-        return 0
-    for r in records:
-        state = r.state.upper()
-        if r.state != "asleep" and not runner_is_alive(r):
-            state += " (runner dead)"
-        print(f"{r.name}  {state}  ({r.agent_id})")
-        print(f"  cwd:             {r.cwd}")
-        print(f"  permission mode: {r.permission_mode}")
-        print(f"  model:           {r.model or '(Claude Code default)'}")
-        if r.claude_args:
-            print(f"  claude args:     {shlex.join(r.claude_args)}")
-        print(f"  idle timeout:    {r.idle_timeout_s}s")
-        print(f"  session id:      {r.session_id}  (generation {r.generation})")
-        if r.tmux_session:
-            print(f"  tmux session:    {r.tmux_session}")
-        print(f"  read through:    inbox line {r.read_through.line}")
-        warning = _trust_warning(r)
-        if warning:
-            print(f"  WARNING: {warning}")
-        if r.last_wake_failure:
-            print(
-                f"  LAST WAKE FAILED {format_age(r.last_wake_failure.at)}: "
-                f"{r.last_wake_failure.reason}"
-            )
-        for skipped in r.skipped_lines:
-            print(
-                f"  SKIPPED inbox line {skipped.line} ({skipped.msg_id}) "
-                f"{format_age(skipped.at)}: {skipped.why}"
-            )
-    return 0
+    return sleeper_ops.list_sleepers(store, print)
 
 
 def _sleeper_wake(args: argparse.Namespace) -> int:
-    """Wake by hand: the same path a message takes."""
-    store = StateStore()
-    outcome = wake_if_needed(store, sleeper_agent_id(args.name))
-    if outcome is None:
-        raise SleeperError(f"there is no sleeper named {args.name!r}")
-    print(f"sleeper {args.name}: {outcome.reason}")
-    return 0 if outcome.launched or "already" in outcome.reason else 1
+    return sleeper_ops.wake(StateStore(), args.name, print)
 
 
 def _sleeper_attach(args: argparse.Namespace) -> int:
@@ -1072,27 +960,11 @@ def _sleeper_activity(_args: argparse.Namespace) -> int:
 
 
 def _sleeper_sleep(args: argparse.Namespace) -> int:
-    """By hand, the same as the agent calling ``request_sleep``."""
-    print(f"sleeper {args.name}: {request_sleep(StateStore(), args.name)}")
-    return 0
+    return sleeper_ops.sleep(StateStore(), args.name, print)
 
 
 def _sleeper_retire(args: argparse.Namespace) -> int:
-    store = StateStore()
-    record = store.sleepers.read(args.name)
-    if record is not None and record.state != "asleep" and runner_is_alive(record):
-        print(f"sleeper {args.name} is {record.state}: {request_sleep(store, args.name)}")
-        if not wait_until_asleep(store, args.name, RETIRE_WAIT_S):
-            raise SleeperError(
-                f"{args.name!r} did not go to sleep within {RETIRE_WAIT_S:.0f}s, so it was "
-                f"not retired. It sleeps at the end of its current turn; retire it then."
-            )
-    record = store.retire_sleeper(args.name)
-    print(
-        f"retired sleeper {record.name} ({record.agent_id}). Its inbox is kept as "
-        f"history; mail to it is now refused, as for any unknown agent."
-    )
-    return 0
+    return sleeper_ops.retire(StateStore(), args.name, print)
 
 
 # ---------------------------------------------------------------- argparse
