@@ -41,6 +41,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Generator
 from datetime import UTC, datetime
@@ -74,6 +75,12 @@ class _RegistryDoc(BaseModel):
 
 
 _DEFAULT_POLL_INTERVAL_S = 0.1
+
+# Serializes peer-record writes within one process, so the read-then-write that
+# keeps ``stopping_at`` sticky in ``write_peer_link`` cannot interleave with a
+# bridge's reader thread persisting the same record. The stickiness applies only
+# to a record this process owns, so a process-local lock is enough.
+_PEER_WRITE_LOCK = threading.Lock()
 
 
 def default_state_root() -> Path:
@@ -229,7 +236,8 @@ def peer_link_state(link: PeerLink) -> PeerLinkState:
       stay addressable and mail queues in the outbound inbox until the
       reconnect drains it.
     - ``stopped``: no bridge process for that host is running -- it exited,
-      crashed or was killed. Mail for the peer is refused.
+      crashed or was killed -- or its ``conjoin`` has begun a clean exit
+      (``stopping_at`` set). Mail for the peer is refused.
 
     Liveness is the same PID + start-time test :func:`is_stale` applies to
     agents, because a mirrored ``@host`` row is owned by the bridge's pid: the
@@ -239,7 +247,14 @@ def peer_link_state(link: PeerLink) -> PeerLinkState:
     so it separates attached from reconnecting and nothing more. A ``serve``
     end has no reconnect loop: its process ends with its link, so a detached
     serve link is stopped even in the moment before that process exits.
+
+    ``stopping_at`` is checked first because pid liveness lags a clean exit:
+    ``conjoin`` clears its mirrored rows and exits tens of milliseconds later.
+    It marks the record stopping before that clear, so there is no moment at
+    which its rows are gone and its link still reads as reconnecting.
     """
+    if link.stopping_at is not None:
+        return "stopped"
     if not process_is_alive(link.bridge_pid, link.bridge_pid_start):
         return "stopped"
     if link.detached_at is None:
@@ -585,11 +600,42 @@ class StateStore:
         return self._peers_dir / f"{host}.json"
 
     def write_peer_link(self, link: PeerLink) -> None:
-        """Persist a bridge's view of one peer (atomically). Overwrites by host."""
+        """Persist a bridge's view of one peer (atomically). Overwrites by host.
+
+        ``stopping_at`` is sticky for the process that owns the record: once
+        :meth:`mark_peer_links_stopping` has set it, a later write from that same
+        bridge process (its reader thread can still persist a note after the
+        exit began) carries it forward rather than erasing it. A record owned by
+        another process is overwritten as before.
+        """
         path = self._peer_path(link.host)
-        tmp = path.with_suffix(".json.tmp")
-        write_private_text(tmp, link.model_dump_json(indent=2))
-        tmp.replace(path)
+        with _PEER_WRITE_LOCK:
+            if link.stopping_at is None:
+                on_disk = self.read_peer_link(link.host)
+                if (
+                    on_disk is not None
+                    and on_disk.stopping_at is not None
+                    and (on_disk.bridge_pid, on_disk.bridge_pid_start)
+                    == (link.bridge_pid, link.bridge_pid_start)
+                ):
+                    link = link.model_copy(update={"stopping_at": on_disk.stopping_at})
+            tmp = path.with_suffix(".json.tmp")
+            write_private_text(tmp, link.model_dump_json(indent=2))
+            tmp.replace(path)
+
+    def mark_peer_links_stopping(self, owner_pid: int, owner_pid_start: int | None) -> None:
+        """Mark every peer record one bridge process owns as stopping (``conjoin`` exiting).
+
+        Called before :meth:`clear_agents_owned_by`, so no reader ever sees the
+        rows gone while the record still reads as reconnecting (issue #34).
+        Keyed on the owner for the same reason that method is.
+        """
+        now = datetime.now(UTC)
+        for link in self.list_peer_links():
+            if (link.bridge_pid, link.bridge_pid_start) != (owner_pid, owner_pid_start):
+                continue
+            if link.stopping_at is None:
+                self.write_peer_link(link.model_copy(update={"stopping_at": now}))
 
     def list_peer_links(self) -> list[PeerLink]:
         """Every peer record on this bus, attached or not, sorted by host.
@@ -802,9 +848,14 @@ class StateStore:
             if link.detached_at is not None
             else "it was killed without tearing its link down"
         )
+        ended = (
+            f"shut down cleanly {format_age(link.stopping_at)}"
+            if link.stopping_at is not None
+            else "is no longer running"
+        )
         return (
             f"NO BRIDGE IS RUNNING to {host!r}: the `spanreed conjoin` process that "
-            f"owned it (pid {link.bridge_pid}, role {link.role}) is no longer running. "
+            f"owned it (pid {link.bridge_pid}, role {link.role}) {ended}. "
             f"It last connected {format_age(link.attached_at)}, and {dropped}. "
         )
 
@@ -893,13 +944,21 @@ class StateStore:
                     f"when the reconnect succeeds. Treat it as QUEUED, not delivered, and "
                     f"do not wait on a reply."
                 )
+            # "Was live in the snapshot" is only true when a row says so: with
+            # no row, a fresh snapshot dropped the agent, or this bridge has not
+            # synced yet (#120 review).
+            evidence = (
+                f"The recipient was live in the registry snapshot {host} sent "
+                f"{format_age(link.last_registry_at)}; that snapshot is the only "
+                f"evidence this host has of it"
+                if entry is not None and link.last_registry_at is not None
+                else f"No registry snapshot from {host} currently lists the recipient"
+            )
             return True, (
                 f"Queued for the bridge to {host!r} (conjoin pid {link.bridge_pid}, "
                 f"attached {format_age(link.attached_at)}), which forwards "
-                f"inboxes/{agent_id}.jsonl to {host!r} continuously. The recipient was "
-                f"live in the registry snapshot {host} sent {format_age(link.last_registry_at)}; "
-                f"that snapshot is the only evidence this host has of it, so delivery "
-                f"beyond the bridge is not confirmed here."
+                f"inboxes/{agent_id}.jsonl to {host!r} continuously. {evidence}, so "
+                f"delivery beyond the bridge is not confirmed here."
             )
         assert entry is not None  # a bare id with no row returned above
         if is_stale(entry):

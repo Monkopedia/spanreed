@@ -178,6 +178,8 @@ class Bridge:
         # watchdog and an external stop() name the cause, and the reader's EOF
         # that usually follows them must not overwrite it.
         self._end_reason: str | None = None
+        # Set by stop(final=True): this teardown is the process exiting.
+        self._final = False
 
     # --- framing (only the main thread writes, so no lock needed) ---
 
@@ -191,8 +193,15 @@ class Bridge:
             self._stop.set()
             return False
 
-    def stop(self) -> None:
-        """Signal the bridge to shut down (cleared on the next loop turn)."""
+    def stop(self, *, final: bool = False) -> None:
+        """Signal the bridge to shut down (cleared on the next loop turn).
+
+        ``final`` says the process is exiting, not reconnecting: teardown then
+        writes ``stopping_at`` in the same record write as ``detached_at``, so
+        the link never reads as reconnecting on its way out (#34).
+        """
+        if final:
+            self._final = True
         self._end("shutting down")
         self._stop.set()
 
@@ -554,7 +563,11 @@ class Bridge:
                 # was up and is now gone" is a diagnosis, and removing the file
                 # would make it indistinguishable from "no bridge was ever
                 # configured" — two states with different remedies.
-                self._update_link(detached_at=datetime.now(UTC))
+                now = datetime.now(UTC)
+                if self._final:
+                    self._update_link(detached_at=now, stopping_at=now)
+                else:
+                    self._update_link(detached_at=now)
         return time.monotonic() - started
 
     def _recv_wallclock(self) -> datetime:
@@ -783,7 +796,13 @@ def reconnect_loop(
             waiter(delay)
     finally:
         pid = os.getpid()
-        store.clear_agents_owned_by(pid, pid_start_time(pid))
+        start = pid_start_time(pid)
+        # Order matters (#34): the record must read as stopping before the rows
+        # go, or for the tens of milliseconds until this process exits a send
+        # finds no row, a live pid and a detached link, and is told the
+        # reconnect will forward it.
+        store.mark_peer_links_stopping(pid, start)
+        store.clear_agents_owned_by(pid, start)
     _status("stopped")
     return 0
 
@@ -795,7 +814,7 @@ def _install_signal_handlers(shutdown: threading.Event, holder: list[Bridge | No
         shutdown.set()
         bridge = holder[0]
         if bridge is not None:
-            bridge.stop()
+            bridge.stop(final=True)
 
     try:
         signal.signal(signal.SIGINT, _handler)

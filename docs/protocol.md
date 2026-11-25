@@ -126,6 +126,7 @@ One record per peer host a `spanreed conjoin` bridge has ever attached here. Wri
   "registry_syncs": 1208,
   "registry_requests_sent": 1,
   "detached_at": null,
+  "stopping_at": null,
   "note": null
 }
 ```
@@ -134,11 +135,13 @@ One record per peer host a `spanreed conjoin` bridge has ever attached here. Wri
 
 | state | test | mail for the peer |
 |---|---|---|
-| **attached** | pid live, `detached_at` null | forwarded continuously |
-| **reconnecting** | pid live, `detached_at` set, `role` `connect` | queued; the reconnect drains it |
-| **stopped** | pid dead (or recycled), or a `serve` record with `detached_at` set | refused |
+| **attached** | pid live, `detached_at` null, `stopping_at` null | forwarded continuously |
+| **reconnecting** | pid live, `detached_at` set, `stopping_at` null, `role` `connect` | queued; the reconnect drains it |
+| **stopped** | `stopping_at` set, or pid dead (or recycled), or a `serve` record with `detached_at` set | refused |
 
 `detached_at` records that a **link** dropped, never that a process ended: a bridge killed with `SIGKILL` never writes anything, so `detached_at == null` must never be read as "attached". A serve end has no reconnect loop and exits with its link, so a detached serve record is stopped even in the moment before its process exits.
+
+`stopping_at` records that a `conjoin` has **begun a clean exit**, and it is checked before the pid. A clean exit runs in this order: teardown writes `detached_at`, the reconnect loop clears the process's mirrored rows, and the process exits — measured at 15–30 ms after the clear. Judged by pid alone, that last stretch read as reconnecting with the rows already gone, so a send landing in it was told the reconnect would forward it. `conjoin` therefore writes `stopping_at` **before** it clears any row: a SIGTERM that lands while the link is up writes it in the same record write as `detached_at`, and the reconnect loop's exit path writes it on every record it owns (a stop during backoff, or `--max-reconnects` giving up) before the clear. There is no moment at which the rows are gone and the link reads as reconnecting. The field is never cleared by the process that set it — a later write from the same bridge process carries it forward — and the next `conjoin` writes a fresh record under its own pid. It is absent (`null`) on records written by an older `spanreed`, which then fall back to the pid test alone, as before.
 
 **Records are kept after teardown, never deleted.** "A bridge to this host was up and is now gone" is a diagnosis; deleting the file makes it indistinguishable from "no bridge was ever configured", and those have different remedies.
 
@@ -147,8 +150,8 @@ The field that matters is `last_registry_at`. `null` means this host has **never
 | state | reads as | remedy |
 |---|---|---|
 | no record for the host | no bridge was ever started for it here | `spanreed conjoin <host>` |
-| record present, `bridge_pid` dead | no bridge is running; mail for the host is refused | restart `conjoin` |
-| `connect` record, `detached_at` set, `bridge_pid` live | `conjoin` is reconnecting; mail for the host queues | none needed; check the link if it persists |
+| record present, `bridge_pid` dead or `stopping_at` set | no bridge is running; mail for the host is refused | restart `conjoin` |
+| `connect` record, `detached_at` set, `stopping_at` null, `bridge_pid` live | `conjoin` is reconnecting; mail for the host queues | none needed; check the link if it persists |
 | attached, `last_registry_at` null | the peer is not advertising | check `spanreed list` **on the peer** |
 | attached, `last_registry_agents` 0 | the peer answered and has nothing live | fix the peer's own agents; `peer_registry_rows`/`peer_stale_rows` say whether they exist but fail its liveness check |
 
@@ -198,7 +201,7 @@ Resolution, in order:
 - `true` — a live local session is tailing that inbox, or (for a mirrored `<id>@<host>` inbox) an attached bridge will forward it.
 - `false` — the message is **queued**. The recipient's session has exited, or the `conjoin` for its host is running but reconnecting (`delivery` begins `QUEUED, BRIDGE RECONNECTING` and says when the link dropped and when it last connected). `delivery` explains which.
 
-A send to a host with no `conjoin` running is refused at resolution (above), so it never reaches a verdict. The one exception is a `conjoin` that stops between the append and the verdict. Whether it was killed (its rows linger with a dead owner) or exited cleanly (its exit already removed them), the verdict is judged by the host's bridge, not by the row, and reads `NOT DELIVERED: NO BRIDGE IS RUNNING`: the message waits in the outbound `inboxes/<id>@<host>.jsonl` and goes out when the next `conjoin` to that host attaches, because a bridge forwards every `*@<host>` inbox whether or not a registry row names it ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
+A send to a host with no `conjoin` running is refused at resolution (above), so it never reaches a verdict. The one exception is a `conjoin` that stops between the append and the verdict. If it was killed, its rows linger with a dead owner. If it exited cleanly, it marked its record `stopping_at`, then cleared its rows, then exited; a verdict taken after the mark reads its link as stopped even while its pid is still alive, and one taken before the mark finds the row and a link still attached or reconnecting, which was true when it was taken. Either way the verdict is judged by the host's bridge, not by the row, and once the stop is visible it reads `NOT DELIVERED: NO BRIDGE IS RUNNING`: the message waits in the outbound `inboxes/<id>@<host>.jsonl` and goes out when the next `conjoin` to that host attaches, because a bridge forwards every `*@<host>` inbox whether or not a registry row names it ([#34](https://github.com/Monkopedia/spanreed/issues/34)).
 
 Queuing rather than refusing is deliberate: a restarting session picks its mail up. Reporting that as plain success is not — the CLI exits **3** for it (`spanreed send`), and the MCP tool's docstring directs the agent to check the flag and say "queued" rather than "sent".
 

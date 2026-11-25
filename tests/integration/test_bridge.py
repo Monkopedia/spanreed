@@ -28,8 +28,9 @@ import pytest
 
 from spanreed import bridge
 from spanreed.bridge import Bridge, reconnect_loop
+from spanreed.protocol import PeerLink
 from spanreed.sleepers import SleeperRecord
-from spanreed.store import StateStore
+from spanreed.store import StateStore, peer_link_state, pid_start_time
 
 # Aliased once so the private stays private — same pattern as test_cli.py's
 # `_parse_since`: one alias costs a single ignore instead of one per call site.
@@ -1780,3 +1781,148 @@ class TestSendsWhileTheBridgeIsDown:
         assert "NO BRIDGE IS RUNNING to 'hostB'" in text
         assert f"process that owned it (pid {conjoin.pid}, role connect)" in text
         assert not store_a.inbox_path("agent-bob@hostB").exists()
+
+    def test_a_clean_exit_reads_as_stopped_before_the_process_is_gone(self, tmp_path: Path) -> None:
+        """PR #120 second review: a real `spanreed conjoin`, stopped with SIGTERM.
+
+        Its exit clears the mirrored rows and the process lives on for tens of
+        milliseconds. A verdict taken the moment the row disappears used to
+        land in that window and read QUEUED, BRIDGE RECONNECTING, promising a
+        reconnect that was never coming. The record is now marked stopping
+        before the rows go, so the verdict does not depend on when it is taken.
+        """
+        root_a, root_b = tmp_path / "a", tmp_path / "b"
+        store_a, store_b = StateStore(root=root_a), StateStore(root=root_b)
+        _register_live(store_a, "agent-alice", "alice")
+        _register_live(store_b, "agent-bob", "bob")
+        cli = f"{shlex.quote(sys.executable)} -m spanreed.cli"
+        serve = (
+            f"SPANREED_STATE_ROOT={shlex.quote(str(root_b))} {cli} conjoin --serve --label hostB"
+        )
+        argv = [sys.executable, "-m", "spanreed.cli", "conjoin", "hostB", "--label", "hostA"]
+        conjoin = subprocess.Popen(
+            [*argv, "--exec", serve],
+            env={**os.environ, "SPANREED_STATE_ROOT": str(root_a)},
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        def row_present() -> bool:
+            return any(
+                a.agent_id == "agent-bob@hostB" for a in store_a.list_agents(include_stale=True)
+            )
+
+        try:
+            _wait(lambda: _synced(store_a, "hostB"), timeout=30)
+            os.kill(conjoin.pid, signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while row_present() and time.monotonic() < deadline:
+                pass  # no sleep: the verdict must race the exit, as a send would
+            live, why = store_a.delivery_verdict("agent-bob@hostB")
+            conjoin.wait(timeout=10)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(conjoin.pid, signal.SIGKILL)
+
+        assert not row_present()
+        assert not live
+        assert why.startswith("NOT DELIVERED: NO BRIDGE IS RUNNING to 'hostB'"), why
+
+    def test_reconnect_loop_marks_its_records_stopping_before_it_clears_rows(
+        self, tmp_path: Path
+    ) -> None:
+        """The ordering itself, observed at the moment the rows are cleared."""
+        store = StateStore(root=tmp_path)
+        me = os.getpid()
+        me_start = pid_start_time(me)
+        shutdown = threading.Event()
+        seen: list[str] = []
+
+        def run_once(
+            proc: subprocess.Popen[bytes],
+            label: str,
+            store_: StateStore,
+            holder: list[Bridge | None],
+        ) -> float:
+            store_.write_peer_link(
+                PeerLink(
+                    host="hostB",
+                    role="connect",
+                    bridge_pid=me,
+                    bridge_pid_start=me_start,
+                    attached_at=datetime.now(UTC),
+                    detached_at=datetime.now(UTC),
+                )
+            )
+            shutdown.set()
+            return 0.0
+
+        real_clear = store.clear_agents_owned_by
+
+        def spy_clear(owner_pid: int, owner_pid_start: int | None) -> None:
+            link = store.read_peer_link("hostB")
+            assert link is not None
+            seen.append(peer_link_state(link))
+            real_clear(owner_pid, owner_pid_start)
+
+        store.clear_agents_owned_by = spy_clear  # type: ignore[method-assign]
+        reconnect_loop(
+            ["peer"],
+            "hostA",
+            store,
+            install_signals=False,
+            shutdown=shutdown,
+            spawn=lambda _argv: _fake_proc(),  # pyright: ignore[reportUnknownLambdaType]
+            run_once=run_once,
+        )
+        assert seen == ["stopped"]
+
+    def test_a_final_stop_writes_stopping_with_the_detach(self, tmp_path: Path) -> None:
+        """SIGTERM mid-link: one record write carries both, so no reader sees
+        the detached link as reconnecting on the way out."""
+        store_a, store_b, bridge_a, bridge_b = _pair(tmp_path)
+        _register_live(store_b, "agent-bob", "bob")
+        ta = threading.Thread(target=bridge_a.run, daemon=True)
+        tb = threading.Thread(target=bridge_b.run, daemon=True)
+        ta.start()
+        tb.start()
+        try:
+            _wait(lambda: _synced(store_a, "hostB"))
+            bridge_a.stop(final=True)
+            ta.join(timeout=3)
+        finally:
+            bridge_a.stop()
+            bridge_b.stop()
+            tb.join(timeout=3)
+        link = store_a.read_peer_link("hostB")
+        assert link is not None
+        assert link.detached_at is not None
+        assert link.stopping_at == link.detached_at
+        assert peer_link_state(link) == "stopped"
+
+    def test_a_plain_stop_is_a_dropped_link_not_an_exit(self, tmp_path: Path) -> None:
+        store_a, store_b, bridge_a, bridge_b = _pair(tmp_path)
+        _register_live(store_b, "agent-bob", "bob")
+        with _running(bridge_a, bridge_b):
+            _wait(lambda: _synced(store_a, "hostB"))
+        link = store_a.read_peer_link("hostB")
+        assert link is not None
+        assert link.detached_at is not None
+        assert link.stopping_at is None
+
+    def test_the_signal_handler_stops_the_bridge_as_final(self) -> None:
+        shutdown = threading.Event()
+        live_bridge = MagicMock()
+        holder: list[Bridge | None] = [cast("Bridge", live_bridge)]
+        previous_term = signal.getsignal(signal.SIGTERM)
+        previous_int = signal.getsignal(signal.SIGINT)
+        try:
+            bridge._install_signal_handlers(shutdown, holder)  # pyright: ignore[reportPrivateUsage]
+            handler = signal.getsignal(signal.SIGTERM)
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
+        assert shutdown.is_set()
+        live_bridge.stop.assert_called_once_with(final=True)

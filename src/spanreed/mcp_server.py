@@ -163,9 +163,12 @@ def list_peers() -> list[dict[str, object]]:
     Read it as:
 
     - no record for a host → no bridge was ever started for it here.
-    - record present, ``bridge_pid`` dead → no bridge is running, and mail
-      for that host is refused; restart ``spanreed conjoin <host>``.
-    - ``role`` connect, ``detached_at`` set, ``bridge_pid`` alive → ``conjoin``
+    - record present, ``bridge_pid`` dead or ``stopping_at`` set → no bridge
+      is running (``stopping_at`` is a ``conjoin`` that has begun a clean
+      exit), and mail for that host is refused; restart ``spanreed conjoin
+      <host>``.
+    - ``role`` connect, ``detached_at`` set, ``stopping_at`` null,
+      ``bridge_pid`` alive → ``conjoin``
       is running and reconnecting. The peer's agents stay addressable and mail
       for them queues until the reconnect delivers it.
     - attached, ``last_registry_at`` null → the peer is not advertising; check
