@@ -1092,6 +1092,27 @@ class TestDeliveryVerdict:
         assert f"(pid {me}, role connect) shut down cleanly" in str(excinfo.value)
         assert store.recv_messages("agent-r@adolin") == []
 
+    def test_a_row_another_live_bridge_owns_is_accepted_while_the_record_stops(
+        self, store: StateStore
+    ) -> None:
+        """#127 review: with conjoin running both ways, this host's connect
+        bridge and the peer's serve bridge share ``peers/adolin.json``. The
+        record's connect owner exiting must not refuse rows the live serve
+        bridge mirrored, which it forwards."""
+        me, me_start = os.getpid(), store_module.pid_start_time(os.getpid())
+        serve = subprocess.Popen(["sleep", "30"])
+        try:
+            serve_start = store_module.pid_start_time(serve.pid)
+            store.write_peer_link(_peer_link("adolin", bridge_pid=me, bridge_pid_start=me_start))
+            _mirror(store, "adolin", serve.pid, serve_start)
+            store.mark_peer_links_stopping(me, me_start)
+            store.clear_agents_owned_by(me, me_start)
+            msg = store.send_message(from_agent="agent-x", to_agent="agent-r@adolin", body="hi")
+        finally:
+            serve.kill()
+            serve.wait()
+        assert [m.msg_id for m in store.recv_messages("agent-r@adolin")] == [msg.msg_id]
+
     def test_an_attached_bridge_with_no_row_does_not_claim_the_recipient_was_live(
         self, store: StateStore
     ) -> None:
