@@ -257,7 +257,16 @@ class TestProcessAndTransport:
         (reply,) = replies(store)
         assert reply.body == "child replied", "the turn must complete, not time out"
         assert elapsed < 20.0, f"the turn took {elapsed:.1f}s; the drain is not keeping up"
+        # The turn ends on the socket and the noise drains through the pipe, on
+        # another thread: the child's last write can still be in the 64KB pipe
+        # when `turn/completed` arrives. Give the drain a moment to catch up; a
+        # drain that had stopped never would, because the child would be
+        # blocked and the turn would not have finished.
+        deadline = time.monotonic() + 10.0
         captured = worker.client.server_log()
+        while len(captured) < noise and time.monotonic() < deadline:
+            time.sleep(0.01)
+            captured = worker.client.server_log()
         assert len(captured) >= noise, (
             f"captured {len(captured)} of {noise} bytes the child wrote — a short capture is "
             f"what a pipe that stopped being read looks like"
