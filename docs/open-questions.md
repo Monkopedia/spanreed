@@ -168,6 +168,234 @@ Still open:
   shipped and been used. Turning it on by default would also turn on what "What turning it on
   grants" describes, for every user who runs `conjoin`.
 
+## Adopting a running agent as a sleeper (designed, not built)
+
+Design in [`architecture.md`](architecture.md#adopting-a-running-agent). The request came from
+the owner on 2026-11-25, as main-coordinator relayed it. It settles three things: the adopted
+conversation is resumed, the bus id is kept (not shown as hex), and the handover has no double run
+and no missed mail. Each question below (A1–A15) is open, and each has the author's recommendation. The
+design doc is written as if every recommendation is taken.
+
+- **A1. Which handover.** (A) Refuse while the session is live, so someone ends it and then
+  adopts. (B) The session adopts itself, and a waiter at generation 0 takes over when it exits.
+  (C) `create` ends the live session itself and commits, in one bounded call. *Recommendation:*
+  C for v1 and the pilots. No mail goes unseen and there is no double run, and no process
+  outlives the command. It does not fully rule out ending a turn that is handling mail: see
+  A2. A is the same command when the session has already exited. B can come later as
+  "C, run detached once the current turn ends", if agents should put themselves to sleep. B
+  needs its own marker, because the orphan rule as built reports every send as a wake failure.
+  It also has no way to see the live session's turns, because its hooks don't report them.
+- **A2. Ending a live session: opt-in, only when idle, and what to do if it stops being
+  idle.** The live Monitor keeps delivering mail during the handover, so a single idle check
+  at the start can pass and a turn can then start and be cut off by SIGTERM. If that turn
+  already has an assistant record, its message counts as read and is not replayed.
+  *Recommendation:* (1) end it only with `--end-session`, and otherwise refuse while it is
+  live. (2) Before anything else, require idle: transcript unwritten for 60 s and its last
+  record ending a turn. (3) After writing the record, stop the live Monitor with `SIGSTOP`, so
+  no new mail can start a turn, wait 10 s, and check idle again. (4) **If it is not idle,
+  abort**: `SIGCONT` the Monitor, delete the record, wait 30 s, then list every line
+  appended since the inbox snapshot `S` taken when `create` started, up to the moment of
+  listing, by line and `msg_id`, marked delivered or not, and exit non-zero. (It starts
+  at `S`, not at the freeze, because a line appended just before the freeze that `tail`
+  had not yet read also comes out in the burst.) The listing goes to the output, the
+  activity log, and an abort report that `sleeper list` shows.
+  **What aborting costs (corrected; the previous version said nothing was lost).** A
+  stopped `tail` emits everything that arrived during the freeze as one burst when it is
+  resumed (measured by the reviewer of #129). Claude Code merges a burst into one event and
+  cuts it at about 3,000 characters, and the lines past the cut never reach Claude
+  (Test 9). So six or more long messages during a 10–25 s freeze can lose mail to the live
+  session, and the abort path is taken exactly when the agent is busy. The abort can
+  promise only that every such line is shown as delivered or **listed**, never that it
+  reaches the session. Committing has no such cost: the sleeper replays those lines one at
+  a time. The choices for (4):
+  - (a) **abort and list** (recommended for v1): bounded, and the session is deaf only for
+    the freeze. Mail can miss the session, but never silently.
+  - (b) **wait, bounded, for the turn to end, and check again**: more likely to commit, and
+    a commit replays everything. But the session is deaf for as long as it waits, and if the
+    wait runs out the burst it then aborts with is larger.
+  - (c) **abort and re-feed**: as (a), but `create` also re-appends each line not shown as
+    delivered to the inbox, 3 s apart, so the resumed Monitor delivers each as its own
+    event. It is the only option where the session receives the mail, but it writes a
+    second inbox line with the same `msg_id`, where today a `msg_id` names one line
+    (`recv_messages(since_msg_id)` and cursors find a position by it), and it re-sends
+    other agents' mail. That is a wire-format change, so not for v1.
+  Even with all of this, a turn that runs undetected (a long foreground tool call that writes
+  nothing, or a turn started by a person typing in the pane in the last moment) can still be
+  cut off, so the design claims "no message goes unseen" only when the adoption commits, and
+  never "no message is interrupted". SIGTERM mid-turn is unmeasured (Test 8 was at idle).
+  Claude Code's `sessions/<pid>.json` `status` (`busy`/`shell`) might be a better idle
+  signal, but it is undocumented and unmeasured.
+- **A3. CLI shape.** *Recommendation:* both forms. `--session-id`/`--agent-id` (with `--name`
+  and `--cwd`) is the primitive. `--adopt AGENT` fills them in from the agent's registry row and
+  Claude Code's `~/.claude/sessions/<pid>.json`, used only when `procStart` matches the row's
+  `pid_start`. If that doesn't work, it refuses and asks for the explicit flags. It never copies
+  the permission mode (decision 2), the model or `claude_args`, and it prints what it took.
+- **A4. `read_through` when the transcript shows no delivery at all**, for example a
+  conversation just after `/clear`. *Recommendation:* start after the last inbox line, up to the
+  snapshot `S` (A5), that was stamped on this host and whose `ts` is older than the
+  transcript's first record. Mail from before the conversation is history, and mail during it
+  without a delivery is replayed. Lines relayed from a peer carry the sending machine's clock,
+  so their `ts` is never compared; they are placed by their position in the file. The
+  alternative, the end of the inbox, could lose mail that arrived during the handover.
+- **A5. Undelivered lines before the high-water mark.** These are mail the live session missed
+  while awake, mostly to the Monitor's ~3 KB batch cut. The request does not address this;
+  the recommendation is the author's. *Recommendation:* treat them as history, and have
+  `create` list them by line and `msg_id` so a person can forward them. Replaying them would
+  also bring back mail from earlier conversations under the same id. **This applies only up
+  to the inbox snapshot `S` taken when `create` starts.** A line that arrives after `S` is
+  never history, even if a later line was delivered, so mail dropped during the handover is
+  replayed rather than buried.
+- **A6. Waking at adoption.** `create` launches nothing today (a stage-1 call by the author).
+  *Recommendation:* an adoption that finds unread mail after `read_through` wakes the sleeper
+  straight away, through the ordinary wake path. Otherwise mail from the handover waits for the
+  next send.
+- **A7. How a woken adopted sleeper knows its id.** *Recommendation:* the runner sets a new
+  `SPANREED_AGENT_ID`, which outranks `SPANREED_AGENT_NAME` when an identity is minted. It is
+  validated, unqualified, and set on every launch; for a record whose id is `agent-<name>` it
+  equals what is minted today. The alternative is to read the id from the record whenever
+  `SPANREED_SLEEPER=1`. That would make minting depend on shared state. Either way it grants
+  nothing new: `SPANREED_AGENT_NAME` can already mint any `agent-<x>`.
+- **A8. A new session in the sleeper's directory takes its id.** All three pilots have ids
+  derived from their cwd, so plain `claude` in `~/git/hauler` mints `agent-eac78acd`. The
+  SessionStart upsert puts it on the sleeper's row, and two conversations then answer the same
+  mail. This exists for every sleeper today, but it is hard to reach. *Recommendation:*
+  `session-start` and `inbox-watch`, in a session without `SPANREED_SLEEPER`, refuse an id that a
+  local sleeper record holds. The session stays off the bus, and its context says why and how to
+  join under another name.
+- **A9. A hand-run `claude --resume` of a sleeper's conversation.** *Recommendation:* before
+  every launch, also refuse when a live pid's `~/.claude/sessions/<pid>.json` names the record's
+  session id, the same way the orphan rule refuses. This applies to all sleepers. It is
+  best-effort, because the file is internal, and it is never the only guard. Adoption runs it
+  too, together with a check that no other process is tailing the id's inbox (and, for a
+  cwd-derived id, that no other live session has that cwd). That covers a second session that
+  is already running when the agent is adopted, which A8 does not.
+- **A10. The adopted agent loses its shell environment**, `SSH_AUTH_SOCK` included. That is the
+  sleeper allowlist ("Environment"), and the gap is already known. But a repo agent that used to
+  push over ssh stops being able to. *Recommendation:* accept it for the pilots and check first
+  whether hauler, sdbus-kotlin and lsp-kotlin push over ssh. A per-sleeper environment
+  passthrough would be a separate decision.
+- **A11. Adopting over `conjoin`.** *Recommendation:* refuse the adopt flags with `--host` in
+  v1. Remote management (#86) is not built, and ending a session on another machine is a step
+  past what decision 4 of #86 covered.
+- **A12. What the replaced row keeps (minor).** *Recommendation:* keep the display name (from the
+  record) and the focus, and clear the status, as any re-registration does.
+- **A13. May adoption stop background work, or must it wait for it?** Decision 7 lets
+  background work be stopped only when the agent itself asks to sleep (`request_sleep`); the
+  idle timeout never stops anything. Adoption is an outside actor ending the session without
+  the agent asking, which is closer to the idle-timeout case, but decision 7 did not consider
+  it. **Corrected premise:** the previous version called detection weak, saying a background
+  shell writes nothing to the transcript until it ends. That was wrong. Every background
+  launch is recorded in the session's own transcript ("Async agent launched", "Command
+  running in background with ID: …"), and every completion returns as a
+  `<task-notification>` with the same `<tool-use-id>` and a `<status>`. On the
+  coordinator's transcript the reviewer of #129 counted 104 launches and 101 completions,
+  and the 3 unmatched launches were exactly the 3 tasks in flight. So a launch since the
+  current process started with no completion is a direct "busy" signal; descendant
+  processes stay as a backstop. It is measured on one transcript, and whether every kind of
+  background work leaves both records is still to check. A miss is not safe: step 5 kills
+  the work it missed. *Recommendation (unchanged, now on firmer ground):* wait. Refuse to
+  adopt while any background work is in flight, and name each launch or process found. The
+  alternative is a `--stop-background` flag that stops it, as `request_sleep` does, and
+  logs what was stopped; with the pairing, `create` could now name exactly what it would
+  stop, which makes that alternative more practical than before, but it is still an outside
+  actor stopping work the agent started.
+  Two edges of the detector, each with the author's recommendation (review 6061400830):
+  - *Monitors.* Most Monitor-tool notifications carry no `<tool-use-id>` (19 of 21 on the
+    measured transcript), so pairing them would refuse adoption long after a Monitor
+    ended. *Recommendation:* leave Monitor launches out of the pairing and judge them by
+    the descendant-process backstop, which sees a running Monitor as a process; `create`
+    names it and says to stop it or wait. Alternatives: treat every unpaired Monitor as
+    blocking (fails safe, but can block adoption until a restart), or match Monitors by
+    another key (none is known).
+  - *Work launched before a `/clear`.* The new transcript does not hold it, and a
+    background agent runs inside the `claude` process, so the backstop cannot see it; a
+    miss kills it at step 5 and its result is lost. *Recommendation:* pair launches and
+    notifications across every transcript in the project folder written since the process
+    started (and their subagents), which cannot miss a launch this process made and can
+    only over-refuse. Alternative: refuse whenever the adopted transcript began after the
+    process started, until the session restarts; simpler, but it blocks every agent that
+    has used `/clear`.
+- **A14. Who may run `--end-session`?** No command today ends another agent's live session.
+  With it, the coordinator (or any process running as the user) can end any idle local agent.
+  Spanreed cannot enforce who runs a CLI command (decision 7). *Recommendation:* the owner, or
+  an agent acting on the owner's instruction that names the target agent; the coordinator does
+  not adopt on its own initiative. `create` records the caller's asserted identity in the
+  record and the activity log. It refuses when the caller is inside the target session
+  (that is self-adoption, B). Where that rule lives (fleet policy, the coordinator's
+  instructions) is for the owner.
+
+- **A15. An interrupted `create`.** Revised after review 6061400830, which found that the
+  previous recovery could not tell "`create` killed before it began ending the session"
+  from "killed while the session was ending", and prescribed opposite actions for the
+  two; that the `frozen_monitor` write was not ordered before the `SIGSTOP`; and that the
+  recovery ran its 30 s wait inside whichever sender triggered it. Revised again after
+  review 6061584298, which found that a handler taking the sleeper lock could fire while
+  `create` already held it and wait on itself forever. Revised again after review
+  6061710901, which found that the abort deleted the record before writing its report,
+  so a death in the 30 s wait left nothing naming the unchecked lines. The design now:
+  - `create` installs its SIGINT/SIGTERM/SIGHUP handler before it writes the record. The
+    handler only records the signal; `create` acts on it at fixed checkpoints, all
+    outside the lock (after step 2's release, before step 3 takes the lock, after step
+    3's release, throughout step 4, and just before step 5's marker write).
+  - Step 3 writes `adopted.frozen_monitor` (pid, start time, `F`) under the lock and only
+    then sends `SIGSTOP`, so a stopped Monitor is always on record.
+  - Step 5 writes a **phase marker**, `adopted.ending` (time, and the descendants it will
+    signal), under the lock before its first SIGTERM.
+  - A record in `sleeping` at generation 0 with a dead runner is an interrupted adoption,
+    and only that. Its **recovery** branches on the marker. With no marker and the
+    session alive, it aborts: resume the recorded Monitor, delete the record, wait 30 s,
+    list every line since `S`. With the marker, the session is ending: send it SIGTERM
+    (the recovery cannot tell whether `create` had), SIGKILL it if it outlives 15 s from
+    that SIGTERM, SIGKILL the recorded descendants and stopped Monitor whatever the
+    session's state, then complete the commit
+    (`read_through`, `asleep`, wake if unread); the record is kept.
+  - The listing of an abort goes to the activity log and an abort report,
+    `sleepers/<name>.adopt-aborted.json`, which `sleeper list` shows until it is dismissed
+    or the next adoption commits; and to the output when there is one. The report is
+    written as `listing: pending` before the record is deleted and completed after the
+    wait, so a death in the wait leaves it pending, and `sleeper list` or `--recover`
+    finishes it; a pending report is never dismissed. The recovery uses the same
+    record-only signal handler, acting on a signal only before it changes anything.
+
+  Four points need a decision.
+  (i) **A signal after the phase marker** cannot be undone, because the session is
+  already being ended. *Recommendation:* leave it recorded (from the marker write on,
+  `create` reaches no checkpoint that acts on it), finish the bounded commit (about 15 s
+  plus the escalation), then exit with the signal's status. The alternative is to exit
+  at once, at a check after the marker write, and leave the record to the recovery.
+  (ii) **Who runs the recovery.** It waits up to 30 s plus an exit, and the wake path
+  runs inside every inbox writer (MCP `send_message`, `spanreed send`, a Codex worker's
+  reply, a `conjoin` bridge's frame loop), so it must not run there. Options:
+  (a) the wake path launches `spanreed sleeper adopt --recover NAME` detached, in a new
+  tmux session as a runner is, records it as the record's runner (so later sends do
+  nothing, by the existing rule), and returns at once; it launches at most one per record
+  and falls back to (b) if that one dies;
+  (b) the wake path only records a wake failure and `needs_input` naming `spanreed
+  sleeper adopt --recover NAME`, and a person runs it.
+  *Recommendation:* (a). The harm is a session that hears nothing, and the first mail is
+  when it matters; (b) leaves the session deaf until a person reads the failure. The cost
+  of (a) is a second kind of detached process launched from the wake path, bounded and
+  short-lived. In both, `--recover` can be run by hand, and `sleeper list` shows the
+  interrupted adoption, its phase and how to recover it. Until a recovery runs, a frozen
+  session hears nothing.
+  (iii) **No phase marker, but the session has already exited** (a person ended it
+  after `create` was killed). Nothing `create` started is left to undo, and the
+  conversation is complete. *Recommendation:* commit, as in the marker branch, so the
+  agent becomes a sleeper (this is shape A), first killing the recorded Monitor if it is
+  still there and stopped. The alternative, abort, deletes the record
+  and leaves a stale row whose mail queues with nothing to wake it.
+  (iv) **An old phase marker with the session still alive.** If `create` died between
+  the marker write and its first SIGTERM, the session was never signalled, and the
+  recovery may run hours later, on the next mail, while a person is using the pane (the
+  pilots run in the owner's own tmux panes). The recovery always sends SIGTERM first
+  with the full 15 s grace. The open part is whether it re-checks idleness first when
+  the marker is older than 15 s plus the escalation. *Recommendation:* re-run step 4's
+  idle and background-work checks (no transcript write since the marker's time); if the
+  session is busy, run the abort path instead of ending it (the session was almost
+  certainly never signalled, since Claude Code exits on SIGTERM, Test 8). The
+  alternative is to end it regardless, which is simpler but can cut off a person's turn
+  long after the session was judged idle.
+
 ## Out-of-scope (for now)
 
 - Persistence across machine reboots

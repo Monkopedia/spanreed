@@ -597,3 +597,68 @@ For `sleeper create --trust`. Claude Code 2.1.283, kaladin.
 Not measured: a session rewriting the file at the same moment (unit-tested only,
 by simulating the write); `CLAUDE_CONFIG_DIR`; macOS.
 
+
+## Observations for adopting a running agent (2026-11-25)
+
+Looked at on kaladin, Claude Code 2.1.283, while designing "Adopting a running agent"
+(architecture.md, PR #129). Observations of the live machine, not experiments. Those
+marked *review* were measured by the reviewer of #129 in review 6061036209, those marked
+*review 2* in review 6061240029, those marked *review 3* in review 6061400830, and
+those marked *review 4* in review 6061584298.
+
+- **The pilots.** From the registry and `~/.claude/sessions/<pid>.json`. Each id is
+  derived from its cwd, each display name is the directory's basename, and each runs
+  interactively in a pane of the owner's own `claude` tmux session. Each had exactly one
+  live session file (*review*).
+
+  | agent | id | cwd |
+  |---|---|---|
+  | hauler | `agent-eac78acd` | `~/git/hauler` |
+  | sdbus-kotlin | `agent-f65be093` | `~/git/sdbus-kotlin` |
+  | lsp-kotlin | `agent-eccec404` | `~/git/lsp-kotlin` |
+
+- **`~/.claude/sessions/<pid>.json`**, one per running `claude`, is not documented. Its
+  fields include `sessionId`, `cwd`, `procStart` and `status`. `procStart` equals
+  `/proc/<pid>/stat` field 22, and so equals a registry row's `pid_start` for the same pid.
+  `status` was seen as `busy` and `shell`; what each means was not checked.
+- **`CLAUDE_CODE_SESSION_ID`** is set in the Bash tool's environment, and a subagent sees
+  its parent's.
+- **Subagent transcripts** go to `~/.claude/projects/<project>/<session-id>/subagents/agent-*.jsonl`,
+  not to the session's own transcript (*review*; the directory layout also seen
+  here).
+- **A background shell's output is not in the transcript until it ends** (*review*). Its
+  launch is, though (next point).
+- **Background launches and completions are both in the session's own transcript**
+  (*review 2*). A background agent launch writes a `tool_result` starting "Async agent
+  launched"; a background Bash launch writes "Command running in background with ID: …".
+  Each completion arrives as a `<task-notification>`, in a `user` record or a
+  `queued_command` attachment, carrying the launch's `<tool-use-id>` and a `<status>`. On
+  the coordinating spanreed session's transcript (about 23k lines): 104 background
+  launches, 101 matched by a notification, and 3 unmatched, which were exactly the 3 tasks
+  in flight at the time. One transcript only; not checked for every kind of background
+  work, nor for launches made by subagents.
+- **A stopped `tail -n 0 -F` emits what arrived while stopped as one burst** (*review 2*).
+  Under the same `zsh -c … eval` wrapper the live Monitors use, the `tail` was sent
+  `SIGSTOP` and three lines were appended. The wrapper did not exit and nothing was
+  printed. After `SIGCONT`, all three lines came out at once. Not measured: what Claude
+  Code makes of such a burst from a real Monitor. Test 9 measured that lines arriving
+  together become one event cut at about 3,000 characters.
+- **Every live inbox Monitor is `tail -n 0 -F <absolute inbox path>`** under
+  `claude → zsh`, and every live `~/.claude/sessions/<pid>.json` (21 here) carries
+  `sessionId`, `cwd` and `procStart` (*review 2*).
+- **Which background notifications carry a `<tool-use-id>`** (*review 3*). On the
+  coordinating spanreed session's transcript: all 133 distinct Agent notifications and all
+  8 "Background" (Bash) notifications carry one; **19 of the 21 distinct Monitor-tool
+  notifications carry none**.
+- **Stopped work is notified too** (*review 3*). The `<status>` values across every
+  transcript under `~/.claude/projects`: `completed` 21283, `killed` 1095, `failed` 770,
+  `stopped` 103. A background agent stopped with TaskStop (`a28d631e716ca262c`) got a
+  `killed` notification carrying its `<tool-use-id>`.
+- **The sleeper lock is not re-entrant within a process** (*review 4*).
+  `sleepers.lock()` opens a new fd and `flock`s it on each call. With one fd of the
+  lock file held under `LOCK_EX`, a second `flock(LOCK_EX | LOCK_NB)` from the same
+  process on a fresh fd of the same file returned `EWOULDBLOCK`, so the blocking call
+  the lock uses would wait forever.
+
+Not checked: whether a session file is removed at exit, whether its `sessionId` changes
+after `/clear`, and whether its `cwd` follows the session or stays where it started.
