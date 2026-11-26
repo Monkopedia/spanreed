@@ -257,6 +257,18 @@ class TestProcessAndTransport:
         (reply,) = replies(store)
         assert reply.body == "child replied", "the turn must complete, not time out"
         assert elapsed < 20.0, f"the turn took {elapsed:.1f}s; the drain is not keeping up"
+        # The turn ends on the socket and the noise drains through the pipe, on
+        # another thread: the child's last write can still be in the 64KB pipe
+        # when `turn/completed` arrives. The drain thread leaves its loop only at
+        # EOF, after reading everything left in the pipe, so closing the client
+        # and joining that thread is the signal that the capture is complete.
+        # `close()` joins for only 1s and then drops its reference, so hold our
+        # own. The fixture's `worker.close()` at teardown is then a no-op.
+        reader = worker.client._reader  # pyright: ignore[reportPrivateUsage]
+        assert reader is not None
+        worker.client.close()
+        reader.join(timeout=30.0)
+        assert not reader.is_alive(), "the drain thread never reached EOF after close()"
         captured = worker.client.server_log()
         assert len(captured) >= noise, (
             f"captured {len(captured)} of {noise} bytes the child wrote — a short capture is "
